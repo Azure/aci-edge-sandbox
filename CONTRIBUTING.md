@@ -12,3 +12,20 @@ instructions provided by the bot. You will only need to do this once across all 
 This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
 For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/)
 or contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+
+## Development
+
+Build and test the crate from the `aci-edge-sandbox` directory:
+
+```bash
+cargo fmt --all -- --check
+NVX_BUNDLE=skip ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo clippy --all-targets --all-features -- -D warnings
+NVX_BUNDLE=skip ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo test --all-features
+```
+
+Start every new source file with the MIT license header, for example in Rust:
+
+```rust
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+```
