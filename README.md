@@ -2,6 +2,21 @@
 
 ACI Edge Sandbox is a Rust SDK for creating and managing isolated sandboxes on edge devices.
 
+## Getting started
+
+The SDK is the `aci_edge_sandboxes` Rust crate in [`aci-edge-sandbox/`](aci-edge-sandbox/). Its
+[README](aci-edge-sandbox/README.md) describes the API, backends, and configuration.
+
+Building it needs Rust 1.89 or later and Git:
+
+```bash
+cd aci-edge-sandbox
+cargo build
+ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo test --all-features
+```
+
+The `skip` variable keeps `--all-features` builds from downloading the edge agent bundle.
+
 ## Code of Conduct
 
 This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
