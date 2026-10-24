@@ -347,26 +347,24 @@ let client = AciEdgeSandbox::agent(AgentConfig::bundled("C:\\nvx-edge-state")?)?
 `BundledAgent::discover` returns the bundle's directory, runtime, library, and digests, for a
 setup of one's own: `bundle.config(bundle.setup(state_root).with_cpu_profile(...))`.
 
-By default the build script downloads the `aci-edge-sandboxes.zip` asset of the release of the
-commit being built, `v<VERSION>-dev.<first 12 hex digits>`, where `<VERSION>` is what that
-commit's `VERSION` file holds. Releases do not publish the bundle for every commit, so when that
-release has none, the build uses the release of the nearest first-parent ancestor that does,
-named with the ancestor's own `VERSION`, searching at most 32 commits, and warns which one it
-used. It fails if none has one or if the commit cannot be told (no git checkout or no `git` on
-`PATH`).
+By default the build script downloads the release asset that
+[`agent-bundle.json`](agent-bundle.json) pins: the release tag (`release`), the asset's file name
+(`asset`), and its SHA-256 (`sha256`). It downloads
+`https://github.com/Azure/aci-edge-sandbox/releases/download/<release>/<asset>` and refuses the
+ZIP unless its SHA-256 is the pinned one. To move to another bundle, publish it as a release asset
+and update all three fields of `agent-bundle.json` together.
 Releases publish no bundle for Linux, so a Linux build needs one of the variables below. Other
 targets, where the agent library cannot run, stage nothing. The build script
-runs again when `HEAD` moves to another commit or a variable below changes; run
-`cargo clean -p aci_edge_sandboxes` to pick up a bundle published later for the same commit. It
+runs again when `agent-bundle.json` or a variable below changes. It
 also runs again when the copy beside the executables (see below) is replaced, changed, or
 removed, for example by a build of another feature configuration that uses a different bundle,
 and restores the bundle that the configuration being built pins.
 
 | Build variable | Effect |
 | --- | --- |
-| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL` | Downloads this bundle ZIP instead, from any URL that `curl` reads, such as a mirror; a `file://` URL names a ZIP on the build host |
+| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL` | Downloads this bundle ZIP instead of the pinned one, from any URL that `curl` reads, such as a mirror; a `file://` URL names a ZIP on the build host |
 | `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR` | Stages this extracted bundle instead, for offline builds or locally built bundles |
-| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256` | Requires the ZIP to have this SHA-256 |
+| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256` | Requires the ZIP that `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL` names to have this SHA-256; without that variable, it must equal the pinned SHA-256 |
 | `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` | Stages nothing, as when the feature is disabled; `BundledAgent::discover` then fails with `backend_unavailable`. CI sets it for `--all-features` builds |
 
 The build fails unless every file that `SHA256SUMS` lists matches it, the bundle holds no links,
@@ -374,10 +372,10 @@ The build fails unless every file that `SHA256SUMS` lists matches it, the bundle
 `bin/openvmm[.exe]`, `guest/vmlinux`, `guest/initramfs-edge.cpio.gz`,
 `bin/direct-images[.exe]`, and the library, `bundle-manifest.json` describes a complete bundle
 whose consumer section names that manifest and an agent library for the target platform with
-the digests found, and the library speaks this crate's sandbox ABI. It warns when the bundle
-records an NVX commit other than the one it should come from. These checks prove that the bundle
-is intact, not that it is authorized: the trust comes from the download source, which
-`ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256` can pin.
+the digests found, and the library speaks this crate's sandbox ABI. These checks prove that the
+bundle is intact, not that it is authorized: the trust comes from the pinned SHA-256, or, for a
+bundle named by `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL`, from its source and
+`ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256`.
 Extracting the ZIP needs bsdtar (Windows' own `tar`) or `unzip` on the build host.
 
 The build script stages the bundle in its output directory, which the build scripts of

@@ -3,12 +3,10 @@
 
 //! Stages the edge agent bundle when the `agent-bundled` feature is enabled.
 //!
-//! The bundle is the `aci-edge-sandboxes.zip` asset of an NVX release: the agent library, OpenVMM,
-//! the edge guest kernel and initramfs, the image tool, `SOURCE-MANIFEST.json`,
-//! `bundle-manifest.json`, and `SHA256SUMS`. By default the build script downloads it from the
-//! release of the commit being built (`v<VERSION>-dev.<12 hex digits>`, with the version in that
-//! commit's `VERSION` file) or, if that release has none, from the release of the nearest of the
-//! commit's first-parent ancestors that has one, searching a bounded number of commits.
+//! The bundle is a ZIP release asset of this repository: the agent library, OpenVMM, the edge
+//! guest kernel and initramfs, the image tool, `SOURCE-MANIFEST.json`, `bundle-manifest.json`,
+//! and `SHA256SUMS`. By default the build script downloads the asset that `agent-bundle.json`
+//! pins, by release tag and file name, and refuses it unless its SHA-256 is the pinned one.
 //!
 //! The bundle is verified and staged in `OUT_DIR/aci-edge-sandboxes`, which dependent build
 //! scripts read as `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`, and copied to an
@@ -20,11 +18,12 @@
 //!
 //! Environment variables, which `bundle_contract` names:
 //!
-//! - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL`: a bundle ZIP to download instead of the release's; a
+//! - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL`: a bundle ZIP to download instead of the pinned one; a
 //!   `file://` URL names a ZIP on the build host.
 //! - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`: an extracted bundle to stage instead of downloading
 //!   one, for offline builds or locally built bundles.
-//! - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256`: the approved SHA-256 of the ZIP.
+//! - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256`: the approved SHA-256 of the ZIP that
+//!   `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL` names; without that variable, it must equal the pin.
 //! - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`: stages nothing, as when the feature is disabled.
 //!
 //! Targets other than Linux and Windows, where the agent library cannot run, stage nothing.
@@ -50,16 +49,25 @@ use crate::bundle_contract::{
 };
 
 /// Where this repository's releases are downloaded from.
-const RELEASES: &str = "https://github.com/microsoft/nvx/releases/download";
-/// The release asset that holds the bundle.
-const ASSET: &str = "aci-edge-sandboxes.zip";
-/// How many first-parent commits, counting the one being built, may be searched for a release
-/// that has the bundle.
-const SEARCH_DEPTH: usize = 32;
+const RELEASES: &str = "https://github.com/Azure/aci-edge-sandbox/releases/download";
+/// The file in this crate's directory that pins the release asset that holds the bundle.
+const PIN: &str = "agent-bundle.json";
+/// The name of the downloaded archive in `OUT_DIR`.
+const ARCHIVE: &str = "aci-edge-sandboxes.zip";
 /// The file in `OUT_DIR` that records which bundle this feature configuration installed.
 const RECORD: &str = "installed-agent-bundle";
 const CHECKSUMS: &str = "SHA256SUMS";
 const BUNDLE_MANIFEST: &str = "bundle-manifest.json";
+
+/// The release asset that `agent-bundle.json` pins.
+struct Pin {
+    /// The tag of the release.
+    release: String,
+    /// The file name of the asset.
+    asset: String,
+    /// SHA-256 of the asset, in lowercase hexadecimal digits.
+    sha256: String,
+}
 
 /// What the crate learns about a verified bundle.
 struct Bundle {
@@ -73,8 +81,6 @@ struct Bundle {
     library_sha256: String,
     /// Version of the sandbox ABI that the library speaks.
     sandbox_abi: u64,
-    /// The NVX commit that the bundle was built from, if the bundle records it.
-    revision: Option<String>,
 }
 
 /// Stages the bundle that the environment selects, if this build stages one, and writes the pins
@@ -106,12 +112,6 @@ fn stage(out_dir: &Path) -> Option<Bundle> {
     }
     let downloads = out_dir.join("agent-bundle-download");
     let staged = out_dir.join(DIRECTORY);
-    let checkout = Checkout::find();
-    // The commit that the bundle should come from: the one being built, unless the bundle of
-    // an ancestor's release is used.
-    let mut expected = checkout
-        .as_ref()
-        .map(|checkout| checkout.commits[0].clone());
     match (variable(DIR), variable(URL)) {
         (Some(_), Some(_)) => fail(format!("set {DIR} or {URL}, not both")),
         (Some(path), None) => {
@@ -147,39 +147,37 @@ fn stage(out_dir: &Path) -> Option<Bundle> {
                     )),
                 }
                 println!("cargo::rerun-if-changed={}", archive.display());
-                unpack(&archive, &staged);
+                unpack(&archive, &staged, variable(ARCHIVE_SHA256).as_deref());
             }
-            None => unpack(&download(&url, &downloads), &staged),
+            None => {
+                let approved = variable(ARCHIVE_SHA256);
+                let archive = download(&url, &downloads, approved.as_deref());
+                unpack(&archive, &staged, approved.as_deref());
+            }
         },
         (None, None) => {
             if target_os != "windows" {
                 fail(format!(
-                    "releases publish {ASSET} for Windows only; set {URL} or {DIR} to a \
-                     bundle for {target_os}"
+                    "the pinned release publishes a bundle for Windows only; set {URL} or {DIR} \
+                     to a bundle for {target_os}"
                 ));
             }
-            let checkout = checkout.as_ref().unwrap_or_else(|| {
+            let pin = pin();
+            if let Some(approved) = variable(ARCHIVE_SHA256)
+                && !approved.eq_ignore_ascii_case(&pin.sha256)
+            {
                 fail(format!(
-                    "cannot tell which commit is being built: build a git checkout with git \
-                     on PATH, or set {URL} or {DIR}"
-                ))
-            });
-            checkout.watch();
-            let (url, commit) = release(checkout, &downloads);
-            expected = Some(commit);
-            unpack(&download(&url, &downloads), &staged);
+                    "{ARCHIVE_SHA256} is {approved}, but {PIN} pins {}; set {URL} to use \
+                     another bundle",
+                    pin.sha256
+                ));
+            }
+            let url = format!("{RELEASES}/{}/{}", pin.release, pin.asset);
+            let archive = download(&url, &downloads, Some(&pin.sha256));
+            unpack(&archive, &staged, Some(&pin.sha256));
         }
     }
     let bundle = verify(&staged, &target_os);
-    if let (Some(expected), Some(revision)) = (&expected, &bundle.revision)
-        && !revision.eq_ignore_ascii_case(expected)
-    {
-        warn(format!(
-            "the bundle was built from NVX {}, not {}",
-            short(revision),
-            short(expected)
-        ));
-    }
     install(&staged, out_dir, &bundle, started);
     println!("cargo::metadata=agent_artifacts_dir={}", staged.display());
     Some(bundle)
@@ -214,162 +212,50 @@ fn digest_bytes(digest: &str) -> String {
     format!("{bytes:?}")
 }
 
-/// The git checkout that is being built.
-struct Checkout {
-    /// This crate's directory.
-    directory: PathBuf,
-    /// The commit being built, then its first-parent ancestors.
-    commits: Vec<String>,
-}
-
-impl Checkout {
-    fn find() -> Option<Self> {
-        let directory = cargo_path("CARGO_MANIFEST_DIR");
-        let depth = format!("--max-count={SEARCH_DEPTH}");
-        let commits: Vec<String> =
-            git(&directory, &["rev-list", "--first-parent", &depth, "HEAD"])?
-                .lines()
-                .map(str::to_owned)
-                .collect();
-        if commits.is_empty() {
-            return None;
-        }
-        Some(Self { directory, commits })
-    }
-
-    /// Returns the NVX version that `commit` records in the repository's `VERSION` file, which
-    /// the tag of its release carries, or `None` if it records none.
-    fn version_at(&self, commit: &str) -> Option<String> {
-        let blob = format!("{commit}:VERSION");
-        git(&self.directory, &["cat-file", "blob", &blob]).filter(|version| !version.is_empty())
-    }
-
-    /// Runs the build script again when HEAD moves to another commit.
-    fn watch(&self) {
-        // HEAD's reflog records every move. Without reflogs, the loose branch ref and
-        // `packed-refs` do, and the reftable format has its own table list.
-        let branch = git(&self.directory, &["symbolic-ref", "--quiet", "HEAD"]);
-        let mut references = ["HEAD", "logs/HEAD", "packed-refs", "reftable/tables.list"]
+/// Reads the release asset that `agent-bundle.json` pins, and runs this script again when the
+/// pin changes.
+fn pin() -> Pin {
+    let path = cargo_path("CARGO_MANIFEST_DIR").join(PIN);
+    println!("cargo::rerun-if-changed={}", path.display());
+    let value = read_json(&path);
+    let text = |field: &str| {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
             .map(str::to_owned)
-            .to_vec();
-        references.extend(branch.clone());
-        for reference in references {
-            let Some(path) = self.git_path(&reference) else {
-                continue;
-            };
-            // Cargo runs a build script on every build while a watched path is missing.
-            if path.is_file() {
-                println!("cargo::rerun-if-changed={}", path.display());
-            } else if branch.as_ref() == Some(&reference)
-                && let Some(heads) = self.git_path("refs/heads")
-                && let Some(directory) = path
-                    .ancestors()
-                    .skip(1)
-                    .take_while(|directory| directory.starts_with(&heads))
-                    .find(|directory| directory.is_dir())
-            {
-                // A branch that only `packed-refs` holds gets a loose ref on its next commit,
-                // which, without a reflog, changes no watched file. Cargo notices a new file in
-                // a watched directory.
-                println!("cargo::rerun-if-changed={}", directory.display());
-            }
-        }
-    }
-
-    /// Returns the path of `name` in the git directory.
-    fn git_path(&self, name: &str) -> Option<PathBuf> {
-        git(&self.directory, &["rev-parse", "--git-path", name])
-            .map(|path| self.directory.join(path))
-    }
-}
-
-/// Returns the trimmed standard output of a successful git command run in `directory`, or `None`
-/// if the command fails, as it does outside a checkout. Warns if git cannot run at all.
-fn git(directory: &Path, arguments: &[&str]) -> Option<String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(directory).args(arguments);
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(error) => {
-            warn(format!("cannot run {command:?}: {error}"));
-            return None;
-        }
+            .unwrap_or_else(|| fail(format!("{PIN} lacks {field}")))
     };
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-/// Returns the URL of the bundle that the release of the commit being built has or, failing
-/// that, the release of its nearest first-parent ancestor, and that commit.
-fn release(checkout: &Checkout, downloads: &Path) -> (String, String) {
-    create_dir(downloads);
-    let headers = downloads.join("probe");
-    let head = short(&checkout.commits[0]);
-    let mut versioned = 0;
-    for (distance, commit) in checkout.commits.iter().enumerate() {
-        // A release's tag carries the version of its own commit, which can differ from the
-        // version of the commit being built.
-        let Some(version) = checkout.version_at(commit) else {
-            continue;
-        };
-        versioned += 1;
-        let url = format!("{RELEASES}/v{version}-dev.{}/{ASSET}", short(commit));
-        if exists(&url, &headers) {
-            if distance > 0 {
-                warn(format!(
-                    "{head} has no released bundle; using the one released for {}, \
-                     {distance} first-parent commit(s) earlier",
-                    short(commit)
-                ));
-            }
-            return (url, commit.clone());
+    let pin = Pin {
+        release: text("release"),
+        asset: text("asset"),
+        sha256: text("sha256").to_ascii_lowercase(),
+    };
+    // Each name becomes one segment of the download URL.
+    for (field, name) in [("release", &pin.release), ("asset", &pin.asset)] {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._+".contains(&byte))
+        {
+            fail(format!(
+                "{PIN} names the {field} {name:?}, which is not a plain name"
+            ));
         }
     }
-    if versioned == 0 {
+    if aci_edge_sandboxes_model::hex::decode_sha256(&pin.sha256).is_none() {
         fail(format!(
-            "cannot name the releases of {head} and the {} first-parent commit(s) before it, \
-             which have no VERSION file; set {URL} or {DIR}",
-            checkout.commits.len() - 1
+            "{PIN} pins {}, which is not a SHA-256 digest",
+            pin.sha256
         ));
     }
-    fail(format!(
-        "no release of {head} or of the {} first-parent commit(s) before it has {ASSET}; \
-         publish one, or set {URL} or {DIR}",
-        checkout.commits.len() - 1
-    ))
+    pin
 }
-
-/// Returns whether `url` exists, writing the response headers to `headers`.
-fn exists(url: &str, headers: &Path) -> bool {
-    let mut command = Command::new("curl");
-    command
-        .args(["--silent", "--show-error", "--location", "--head"])
-        .args(["--retry", "3", "--retry-delay", "2"])
-        .args(["--write-out", "%{http_code}", "--output"])
-        .arg(headers)
-        .arg(url);
-    let output = command
-        .output()
-        .unwrap_or_else(|error| fail(format!("cannot run {command:?}: {error}")));
-    match String::from_utf8_lossy(&output.stdout).trim() {
-        "200" => true,
-        "404" => false,
-        status => fail(format!(
-            "cannot check {url} (HTTP status {status}): {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-    }
-}
-
 /// Downloads `url` into `downloads` and returns the archive, reusing the archive of an
-/// earlier run that downloaded the same URL.
-fn download(url: &str, downloads: &Path) -> PathBuf {
+/// earlier run that downloaded the same URL and, if a digest is `approved`, has it.
+fn download(url: &str, downloads: &Path, approved: Option<&str>) -> PathBuf {
     create_dir(downloads);
-    let archive = downloads.join(ASSET);
-    let record = downloads.join(format!("{ASSET}.url"));
-    let approved = variable(ARCHIVE_SHA256);
+    let archive = downloads.join(ARCHIVE);
+    let record = downloads.join(format!("{ARCHIVE}.url"));
     let cached = match fs::read_to_string(&record) {
         Ok(cached) => cached == url,
         Err(error) if error.kind() == ErrorKind::NotFound => false,
@@ -383,13 +269,11 @@ fn download(url: &str, downloads: &Path) -> PathBuf {
     };
     if cached
         && archive.is_file()
-        && approved
-            .as_ref()
-            .is_none_or(|digest| digest.eq_ignore_ascii_case(&sha256(&archive)))
+        && approved.is_none_or(|digest| digest.eq_ignore_ascii_case(&sha256(&archive)))
     {
         return archive;
     }
-    let partial = downloads.join(format!("{ASSET}.part"));
+    let partial = downloads.join(format!("{ARCHIVE}.part"));
     execute(
         Command::new("curl")
             .args(["--fail", "--silent", "--show-error", "--location"])
@@ -409,12 +293,12 @@ fn download(url: &str, downloads: &Path) -> PathBuf {
     archive
 }
 
-/// Checks `archive` against the approved digest, if one is set, and extracts it into a new
+/// Checks `archive` against the `approved` digest, if there is one, and extracts it into a new
 /// `staged` directory.
-fn unpack(archive: &Path, staged: &Path) {
-    if let Some(approved) = variable(ARCHIVE_SHA256) {
+fn unpack(archive: &Path, staged: &Path, approved: Option<&str>) {
+    if let Some(approved) = approved {
         let actual = sha256(archive);
-        if !actual.eq_ignore_ascii_case(&approved) {
+        if !actual.eq_ignore_ascii_case(approved) {
             fail(format!(
                 "SHA-256 mismatch for {}: expected {approved}, found {actual}",
                 archive.display()
@@ -604,17 +488,12 @@ fn verify(directory: &Path, target_os: &str) -> Bundle {
              speaks {expected_abi}"
         ));
     }
-    let revision = manifest
-        .pointer("/sources/nvx/revision")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
     Bundle {
         files,
         manifest_sha256,
         library,
         library_sha256,
         sandbox_abi,
-        revision,
     }
 }
 
@@ -1005,11 +884,6 @@ fn local_path(url: &str) -> Option<PathBuf> {
         [b'/', drive, b':', ..] if cfg!(windows) && drive.is_ascii_alphabetic() => &path[1..],
         _ => &path[..],
     }))
-}
-
-/// Returns the abbreviated form of a commit hash that release tags use.
-fn short(commit: &str) -> &str {
-    commit.get(..12).unwrap_or(commit)
 }
 
 fn recreate(directory: &Path) {

@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 //! Stages the edge agent bundle when the `agent-bundled` feature is enabled: the agent library,
-//! OpenVMM, the edge guest, and the image tool. See `build/agent_bundle.rs`.
+//! OpenVMM, the edge guest, and the image tool, from the release asset that `agent-bundle.json`
+//! pins. See `build/agent_bundle.rs`.
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");

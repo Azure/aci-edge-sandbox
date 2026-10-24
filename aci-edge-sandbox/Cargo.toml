@@ -27,8 +27,8 @@ async = ["dep:tokio"]
 agent = ["dep:libloading", "dep:sha2", "nvx/host"]
 # Downloads and verifies the edge agent bundle at build time and stages it beside the
 # executables, so that `agent::AgentConfig::bundled` needs no paths or digests. The build script
-# downloads `aci-edge-sandboxes.zip` from the release of the commit being built, or of its nearest
-# first-parent ancestor that has one; see `agent::BundledAgent`.
+# downloads the release asset that `agent-bundle.json` pins by tag, file name, and SHA-256; see
+# `agent::BundledAgent`.
 agent-bundled = [
     "agent",
     "dep:serde_json",
