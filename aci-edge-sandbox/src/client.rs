@@ -41,12 +41,6 @@ impl AciEdgeSandbox {
         Self { backend }
     }
 
-    /// Creates a client for the default backend, which drives the `openvmm` binary directly.
-    #[cfg(feature = "openvmm")]
-    pub fn openvmm(config: crate::openvmm::OpenVmmConfig) -> Result<Self> {
-        Ok(Self::new(crate::openvmm::OpenVmmBackend::new(config)?))
-    }
-
     /// Creates a sandbox client over a separately supplied agent library, `aci_edge_agent`.
     #[cfg(feature = "agent")]
     pub fn agent(config: crate::agent::AgentConfig) -> Result<Self> {

@@ -14,8 +14,9 @@
 //! | [`AciEdgeSandbox::deprovision`] | provisioned → (none) | optional metadata; the ID becomes stale |
 //!
 //! Every operation is implemented by a pluggable [`Backend`]. The default backend,
-//! [`openvmm::OpenVmmBackend`], drives the `openvmm` binary directly through the [`nvx`] crate,
-//! which this crate re-exports. [`AciEdgeSandbox`] validates each
+//! [`agent::AgentBackend`], forwards the lifecycle to a separately supplied native library,
+//! `aci_edge_agent`, which drives OpenVMM and an image-backed guest. [`AciEdgeSandbox`]
+//! validates each
 //! request in a fixed order before the backend acts on it: structural errors
 //! ([`ErrorCode::MalformedRequest`], [`ErrorCode::MalformedId`]) come first, then requests the
 //! backend cannot honor ([`ErrorCode::PolicyValidation`]), then backend-specific failures.
@@ -24,44 +25,35 @@
 //! # Example
 //!
 //! ```no_run
-//! # #[cfg(feature = "openvmm")]
+//! # #[cfg(feature = "agent-bundled")]
 //! # fn main() -> aci_edge_sandboxes::Result<()> {
-//! use aci_edge_sandboxes::openvmm::OpenVmmConfig;
-//! use aci_edge_sandboxes::{AciEdgeSandbox, ExecRequest, ProvisionRequest};
+//! use aci_edge_sandboxes::AciEdgeSandbox;
+//! use aci_edge_sandboxes::agent::AgentConfig;
 //!
-//! // Locates OpenVMM, the guest kernel, and the Alpine initramfs; see `nvx::Artifacts`.
-//! let client = AciEdgeSandbox::openvmm(OpenVmmConfig::discover()?)?;
-//! let sandbox = client.provision(&ProvisionRequest::new())?.sandbox_id;
-//! client.start(&sandbox)?;
-//! let output = client
-//!     .exec(&sandbox, &ExecRequest::command_line("echo hello"))?
-//!     .wait_with_output()?;
-//! assert_eq!(output.stdout, b"hello\n");
-//! client.stop(&sandbox)?;
-//! client.deprovision(&sandbox)?;
+//! // Opens a host through the edge agent bundle that the build staged beside the executable.
+//! let client = AciEdgeSandbox::agent(AgentConfig::bundled("state-root")?)?;
+//! client.probe()?;
 //! # Ok(())
 //! # }
-//! # #[cfg(not(feature = "openvmm"))]
+//! # #[cfg(not(feature = "agent-bundled"))]
 //! # fn main() {}
 //! ```
 //!
+//! `examples/agent_lifecycle.rs` runs the whole lifecycle against a guest image.
+//!
 //! # Features
 //!
-//! - `openvmm` (default): the [`openvmm`] backend, and the host side of [`nvx`].
-//! - `bundled`: stages the OpenVMM executable, guest kernel, and control initramfs at build time;
-//!   see `nvx::Artifacts::bundled`.
-//! - `async`: Tokio wrappers ([`AsyncAciEdgeSandbox`], [`AsyncExecution`]) around the synchronous core.
-//! - `agent`: the [`agent`] backend, a thin client of a separately supplied native library
-//!   that owns the sandbox lifecycle.
+//! - `agent` (default): the [`agent`] backend, a thin client of a separately supplied native
+//!   library that owns the sandbox lifecycle, and the host side of [`nvx`].
 //! - `agent-bundled`: `agent`, with an edge agent bundle that the build script downloads and
 //!   stages beside the executables; see `agent::BundledAgent`.
-//! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests, and the fake
-//!   OpenVMM of `nvx::testing`.
+//! - `async`: Tokio wrappers ([`AsyncAciEdgeSandbox`], [`AsyncExecution`]) around the synchronous core.
+//! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests.
 
 // The data model lives in `aci_edge_sandboxes_model`; these keep its modules at their crate paths.
 pub(crate) use aci_edge_sandboxes_model::{capabilities, error, id, model, spec, validate};
-/// The NVX mechanics that the `openvmm` backend builds on: artifact discovery, hypervisors,
-/// guest paths, the control protocol, and the supervision of VM instances.
+/// The NVX crate: the data model takes its hypervisors, CIDRs, and hostname and guest-network rules
+/// from it, and its `resolve_guest_path` gives the guest paths of mapped host paths.
 pub use nvx;
 
 mod backend;
@@ -74,8 +66,6 @@ mod stream;
 pub mod agent;
 #[cfg(feature = "async")]
 mod async_api;
-#[cfg(feature = "openvmm")]
-pub mod openvmm;
 #[cfg(feature = "testing")]
 pub mod testing;
 

@@ -2,49 +2,18 @@
 
 `aci_edge_sandboxes` is the Rust interface to the ACI Edge Sandboxes lifecycle.
 It exposes provision, start, exec, stop, and deprovision through a pluggable
-backend. The default backend drives the `openvmm` binary directly; no daemon or
-Python tooling is involved at runtime. The optional `agent` backend uses a
-separately supplied native library, `aci_edge_agent`, and a different, image-backed guest.
-
-By default, each sandbox is a microVM that runs the NVX guest's Alpine Linux
-userland directly from its initramfs. That backend has no image layers, scratch
-disks, or container namespaces; workloads run as a non-root user in the guest
-itself, and guest state lives in memory until the sandbox stops. The opt-in
-native backend instead runs commands against a caller-supplied, read-only GPT
+backend. The default backend, `agent`, uses a separately supplied native library,
+`aci_edge_agent`, which runs commands against a caller-supplied, read-only GPT
 image with a RAM overlay.
 
-The Cargo package, library, and directory are named `aci_edge_sandboxes`.
+The Cargo package and library are named `aci_edge_sandboxes`; the crate lives in the
+repository's `aci-edge-sandbox` directory.
 
 ## Quick start
 
-```rust,no_run
-use aci_edge_sandboxes::nvx::Hypervisor;
-use aci_edge_sandboxes::openvmm::OpenVmmConfig;
-use aci_edge_sandboxes::{ExecRequest, NetworkPolicy, AciEdgeSandbox, ProvisionRequest};
-
-fn main() -> aci_edge_sandboxes::Result<()> {
-    let config = OpenVmmConfig::from_release_dir(
-        "/opt/nvx",              // An extracted NVX release archive.
-        Hypervisor::Kvm,         // Hypervisor::Whp on Windows.
-        OpenVmmConfig::default_state_root()?,
-    )?;
-    let client = AciEdgeSandbox::openvmm(config)?; // Or OpenVmmConfig::discover().
-
-    let request = ProvisionRequest::new().with_network(NetworkPolicy::deny_all());
-    let sandbox = client.provision(&request)?.sandbox_id;
-
-    client.start(&sandbox)?;
-    let output = client
-        .exec(&sandbox, &ExecRequest::command_line("echo hello"))?
-        .wait_with_output()?;
-    println!("{:?}: {}", output.outcome, String::from_utf8_lossy(&output.stdout));
-    client.stop(&sandbox)?;
-    client.deprovision(&sandbox)?;
-    Ok(())
-}
-```
-
-[`examples/lifecycle.rs`](examples/lifecycle.rs) is a runnable version with
+Create a client over the agent library with `AciEdgeSandbox::agent`, then provision, start,
+exec, stop, and deprovision; see [Agent backend](#agent-backend).
+[`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) is a runnable version with
 command-line arguments.
 
 ## Lifecycle
@@ -71,17 +40,11 @@ milliseconds, about 49.7 days, and refuse a negative or larger one. The wire
 envelope (`version`, `phase`, and `containment`) belongs to the caller.
 
 ## Architecture
-
-- The NVX mechanics live in the [`nvx` crate](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/nvx-rs/README.md): the
-  OpenVMM control protocol, artifact discovery, OpenVMM's command
-  line, the lowering of network and filesystem policies, process and platform
-  primitives, the supervision of VM instances, and the fake OpenVMM. This crate
-  re-exports it as `aci_edge_sandboxes::nvx`. It keeps the ACI Edge Sandboxes
-  contract: the facade, `Backend`, the data model and its validation, the error
+- The NVX mechanics live in the [`nvx` crate](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/nvx-rs/README.md),
+  which this crate re-exports as `aci_edge_sandboxes::nvx`. This crate keeps the ACI Edge
+  Sandboxes contract: the facade, `Backend`, the data model and its validation, the error
   codes, `SandboxId`, the execution and stream plumbing, and the asynchronous
-  and mock APIs. Its `openvmm` backend only converts the contract's requests
-  into `nvx` calls and maps `nvx` errors onto the contract's error codes; see
-  [Error mapping](#error-mapping).
+  and mock APIs; see [Error mapping](#error-mapping).
 - `AciEdgeSandbox` is the entry point. It validates every request in the order the
   contract requires, then calls a backend:
   1. structural checks, reported as `malformed_request` or `malformed_id`;
@@ -109,9 +72,7 @@ envelope (`version`, `phase`, and `containment`) belongs to the caller.
   input workers before reporting completion. Synchronous callers still receive
   the original OS-pipe writer; writes fail once the backend has closed input.
 - Backends in this crate:
-  - `openvmm::OpenVmmBackend` (feature `openvmm`, default) drives the `openvmm`
-    executable through `nvx`.
-  - `agent::AgentBackend` (feature `agent`) forwards the lifecycle to a separately
+  - `agent::AgentBackend` (feature `agent`, default) forwards the lifecycle to a separately
     supplied native library, which drives OpenVMM and an image-backed guest.
   - `testing::MockBackend` (feature `testing`) implements the state machine in
     memory for consumers' unit tests.
@@ -119,8 +80,8 @@ envelope (`version`, `phase`, and `containment`) belongs to the caller.
   the blocking pool, and output arrives as `AsyncRead` streams. A call keeps
   running when its future is dropped. A dropped `exec` requests the
   cancellation of its workload as soon as the workload starts, but only
-  backends whose `capabilities().exec.cancel` is true, such as the OpenVMM and
-  agent backends, honor the request; with other backends, the workload
+  backends whose `capabilities().exec.cancel` is true, such as the
+  agent backend, honor the request; with other backends, the workload
   runs until it ends. The other calls complete, so the sandbox's state shows
   their effects.
 
@@ -128,13 +89,12 @@ To add a backend, implement `Backend`. Declare only the capabilities it can
 enforce, and report state-machine violations with the codes listed in the
 [error mapping](#error-mapping).
 
-## Agent backend (opt-in)
+## Agent backend
 
-Enable `agent` to use `AciEdgeSandbox::agent(AgentConfig)`. This backend is a thin client of a
+The `agent` feature (on by default) provides `AciEdgeSandbox::agent(AgentConfig)`. This backend is a thin client of a
 separately supplied native library, `aci_edge_agent.dll` (`libaci_edge_agent.so` on Linux),
 which owns the whole sandbox lifecycle: the state root and its records, the OpenVMM processes
-and their boot consoles, the guest sessions, and the guest images. The default direct-OpenVMM
-backend and its Alpine guest are unchanged. The crate does **not** build or publish the library,
+and their boot consoles, the guest sessions, and the guest images. The crate does **not** build or publish the library,
 and it downloads one only with the `agent-bundled` feature; see
 [Bundled agent](#bundled-agent-agent-bundled).
 
@@ -395,7 +355,7 @@ named with the ancestor's own `VERSION`, searching at most 32 commits, and warns
 used. It fails if none has one or if the commit cannot be told (no git checkout or no `git` on
 `PATH`).
 Releases publish no bundle for Linux, so a Linux build needs one of the variables below. Other
-targets, where the agent library cannot run, stage nothing, as `bundled` does. The build script
+targets, where the agent library cannot run, stage nothing. The build script
 runs again when `HEAD` moves to another commit or a variable below changes; run
 `cargo clean -p aci_edge_sandboxes` to pick up a bundle published later for the same commit. It
 also runs again when the copy beside the executables (see below) is replaced, changed, or
@@ -452,10 +412,9 @@ the executable, boots `mcr.microsoft.com/azurelinux/base/core:3.0`, and runs
 
 ### Native host paths and network
 
-The native backend accepts the same `filesystem` and `network` policies as the direct
-backend: it maps host paths to the same guest paths and expands network rules the same way;
-see [Host paths](#host-paths) and [Network rules](#network-rules). Unlike the direct backend,
-it exports one directory for all mapped paths, under the rules below. It also
+The native backend maps host paths to guest paths and reads network rules as described in
+[Host paths](#host-paths) and [Network rules](#network-rules). It
+exports one directory for all mapped paths, under the rules below. It also
 refuses mappings that would show workloads its state root, described below. Its workloads run
 as the guest's root. The library plans the policies at provision: it resolves the mapped and
 denied paths, chooses the export, pins the objects inside read-write mappings, and expands the
@@ -500,9 +459,8 @@ provisioned again to accept the change.
   behind the gateway's counterpart, such as `fd00::a00:1`. The guest names the gateway as its
   DNS server in `/etc/resolv.conf` when the policy allows TCP or UDP port 53 to it, and
   otherwise the gateway's IPv6 address when the policy allows DNS to that one. Choose a guest
-  network that contains no address the guest must reach. Unlike with the
-  [OpenVMM backend](#network-rules), ingress must be `deny`; host-loopback access may be allowed
-  independently, as described next.
+  network that contains no address the guest must reach. Ingress must be `deny`; host-loopback
+  access may be allowed independently, as described next.
 
 ### Native proxy and host loopback
 
@@ -542,8 +500,8 @@ case, fails with `policy_validation`, with or without a proxy.
 
 ### Native working directories and environments
 
-`process.cwd` must be an absolute guest path without `..` of at most 4095 bytes, as with the
-direct backend; `nvx::resolve_guest_path` gives the guest path of a mapped host path. A
+`process.cwd` must be an absolute guest path without `..` of at most 4095 bytes;
+`nvx::resolve_guest_path` gives the guest path of a mapped host path. A
 directory that the workload cannot enter ends the command with exit code 126 and an
 `NVX-EDGE-STAGE-ERROR` line on standard error. The guest's default environment holds only
 `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) and the proxy
@@ -556,269 +514,7 @@ The caller must independently approve and protect the native asset. Checking a c
 digest does not make a writable path or a self-declared digest trustworthy; use this profile
 only with an immutable, externally authorized library installation.
 
-## OpenVMM backend
-
-### Configuration
-
-`OpenVmmConfig` names the artifacts, the hypervisor, and a state root:
-
-| Constructor | Artifacts |
-| --- | --- |
-| `OpenVmmConfig::discover` | located by `nvx::Artifacts::discover`; the hypervisor comes from `NVX_HYPERVISOR` or the platform default, and the state root is the default one |
-| `OpenVmmConfig::from_artifacts` | an `nvx::Artifacts` value |
-| `OpenVmmConfig::from_release_dir` | `bin/openvmm[.exe]`, `guest/vmlinux`, and `guest/initramfs.cpio.gz` of an extracted release |
-| `OpenVmmConfig::from_repo_layout` | `openvmm/target/release/openvmm[.exe]`, `build/vmlinux`, and `build/initramfs.cpio.gz` of a checkout |
-| `OpenVmmConfig::new` | Explicit paths |
-
-The release and repository constructors require the `SOURCE-MANIFEST.json`
-control contract `nvx-microvm-v2-control-v2`. The initramfs is the Alpine
-image: its userland is the workloads' environment, and its managed agent
-serves the control console.
-
-### Artifacts
-
-`nvx::Artifacts` holds the OpenVMM executable, the guest kernel, and the Alpine
-initramfs.
-
-`nvx::Artifacts::discover` takes the first source that is present:
-
-1. `NVX_OPENVMM`, `NVX_KERNEL`, and `NVX_INITRD`, which must be set together.
-2. `NVX_ARTIFACTS_DIR`, naming an extracted release or a repository checkout.
-   A directory that contains a release's `bin/openvmm[.exe]`, `guest/vmlinux`,
-   or `guest/initramfs.cpio.gz` is a release; any other directory is a
-   checkout, whose `guest/` directory holds sources only.
-3. An `nvx/` directory in the release layout next to the current executable.
-4. The bundle staged at build time by the `bundled` feature.
-
-The `bundled` feature enables the `bundled` feature of `nvx`, whose build
-script stages `bin/`, `guest/`, `SOURCE-MANIFEST.json`, and `SHA256SUMS` in its
-output directory, and `nvx::Artifacts::bundled` returns them. The bundle comes
-from one of two sources:
-
-- `NVX_BUNDLE_DIR` names an extracted release, for offline builds or locally
-  built artifacts.
-- Otherwise, the build script downloads the release package pinned in
-  [`nvx-rs/artifacts.json`](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/nvx-rs/artifacts.json) with `curl` and extracts
-  it with `tar`. The Windows package is a ZIP archive, which GNU tar cannot
-  read, so building for Windows needs bsdtar (Windows' own `tar`) or `unzip` on
-  the build host. `NVX_BUNDLE_HYPERVISOR=mshv` selects the Linux MSHV package
-  instead of KVM.
-
-Every staged file must match the source's `SHA256SUMS`, and a download must
-match its pinned digest. The staged directory is in Cargo's build output, so it
-serves development and tests on the build machine. To deploy, copy it next to
-your executable as `nvx/`. The build scripts of crates that depend on this one
-receive its path as `DEP_ACI_EDGE_SANDBOXES_ARTIFACTS_DIR`, which this crate's
-build script passes on from `nvx`; crates that depend on `nvx` directly
-receive it as `DEP_NVX_ARTIFACTS_DIR`. `NVX_BUNDLE=skip` turns staging off,
-which CI uses for `--all-features` builds.
-
-> The OpenVMM backend requires a compatible NVX guest image. `start` rejects an
-> incompatible image with `backend_unavailable` rather than running without the
-> requested policy guarantees.
->
-> The build script stages only a release whose `SOURCE-MANIFEST.json` declares
-> the control contract of `nvx-rs`. After a contract change, `bundled` builds
-> that download the pinned release fail until
-> [`nvx-rs/artifacts.json`](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/nvx-rs/artifacts.json) names a release with the
-> new contract, so repin it as soon as one is published. Until then, stage a
-> current build with `NVX_BUNDLE_DIR`.
-
-Defaults:
-
-| Field | Default |
-| --- | --- |
-| `memory_mib` | 256 (a provision request can override it with `microvm.provision.memoryMib`) |
-| `workload_uid`, `workload_gid` | 65534, Alpine's `nobody` |
-| `hostname` | `nvx-sandbox`, set through the kernel's `hostname=` parameter |
-| `guest_network` | `10.0.0.2/24` |
-| `start_timeout`, `control_timeout` | 60 s |
-| `stop_timeout`, `exec_response_grace` | 30 s |
-| `runtime_identity` | none: the install metadata of the artifacts' release or checkout names it; see [Runtime identity](#runtime-identity) |
-
-Each timeout must be at most 30 days (`OpenVmmConfig::MAX_TIMEOUT`), and all
-but `exec_response_grace` must be positive. `guest_network` must be an address
-that OpenVMM accepts: a /1 to /30 prefix, and neither the network's own address,
-its broadcast address, nor its first address, which is the gateway.
-
-Choose a `state_root` that only the current user can access.
-`OpenVmmConfig::default_state_root` returns `%LOCALAPPDATA%\nvx\sandboxes` on
-Windows and `$XDG_STATE_HOME/nvx/sandboxes` (default
-`~/.local/state/nvx/sandboxes`) elsewhere.
-
-### Runtime identity
-
-Each sandbox's state directory is the `nvx::host::store` of its VM, which
-records the runtime identity of the VM's start: the identities of its
-OpenVMM, kernel, and initramfs, and the boot contract, control contract, and
-control session versions of the build that started it, which `nvx::contract`
-defines. Every operation finds the sandbox's VM under the
-backend's runtime identity, so a backend never drives a VM that another NVX
-build, or other artifacts, started.
-
-- Artifacts located in a release or a repository checkout, by
-  `OpenVmmConfig::discover` from `NVX_ARTIFACTS_DIR`, an `nvx/` directory, or
-  the bundle, by `from_release_dir` or `from_repo_layout`, or by
-  `from_artifacts` with artifacts that `nvx::Artifacts` located, take their
-  identity from the directory's install metadata: the digests that a
-  release's `SHA256SUMS` lists, or the build provenance that `nvx.py` records
-  beside a checkout's guest artifacts. Nothing reads or hashes an artifact.
-  Pointing `openvmm`, `kernel`, or `initrd` of such a configuration at other
-  files leaves it without an identity.
-- Artifacts named by path, by `OpenVmmConfig::new` or by `discover` from
-  `NVX_OPENVMM`, `NVX_KERNEL`, and `NVX_INITRD`, have no install metadata. Set
-  `OpenVmmConfig::runtime_identity` to the identity that the deployment
-  records for them; it also replaces the identity of located artifacts.
-
-Without a runtime identity, `probe`, `provision`, and `start` fail with
-`backend_unavailable`, as does any operation on a sandbox whose store records a
-VM. A sandbox whose VM runs under another runtime identity, such as one that the
-build before an upgrade started, is never driven, since its guest might speak
-other contracts. `stop` terminates its OpenVMM through its verified process
-identity, without a control session, and reports `forced`, but no summary of
-OpenVMM's outcome report, which follows that runtime's contracts. Every other
-operation fails with `backend_error`, naming the parts that differ and
-OpenVMM's process ID, and leaves the VM running.
-
-### How it runs OpenVMM
-
-- **Provision** validates the request and records it in
-  `<state_root>/<token>/sandbox.json`. No VM runs.
-- **Start** launches OpenVMM with the managed lifecycle (`--microvm-lifecycle
-  managed`), the workload identity, and an authenticated control console, but
-  no sandbox blocks. The guest init therefore stays in its Alpine root file
-  system and starts the managed agent directly.
-  - A fresh 32-byte capability travels through OpenVMM's standard-input pipe,
-    which is closed before OpenVMM starts.
-  - Before launching OpenVMM, start records the control endpoint and
-    OpenVMM's log in the store's launch journal, `launch.json`, and then
-    OpenVMM's process identity. If the caller dies before the VM is ready, the
-    next operation on the sandbox terminates the VM, through its process
-    identity, or through the endpoint's server if that process holds the log,
-    so no VM is left untracked.
-  - OpenVMM runs detached from the caller: in a new session on Linux, and
-    without the caller's console on Windows. It inherits no handle of the
-    caller except its standard input and log, so a caller whose own output is
-    a pipe, such as a process that runs a single lifecycle phase, still reaches end-of-file when it
-    exits.
-  - Start returns once the guest agent answers on the control console,
-    advertises the control features this backend needs, and has mounted every
-    mapped host path. A guest that lacks any of the features is terminated,
-    and start fails with `backend_unavailable`.
-- **Exec** connects to the control console, authenticates, and streams the
-  workload's output live. The agent runs the workload through `setpriv` as the
-  workload identity, with no capabilities and `no_new_privs`, in a cgroup of
-  its own. Each execution gets its own [working directory](#working-directories)
-  and [environment](#environment). When the workload's first process exits, the
-  agent kills whatever it left behind, including processes in other sessions,
-  so no workload process outlives its exec.
-- **Stop** asks the guest to shut down. If the guest does not finish within
-  `stop_timeout`, OpenVMM is terminated. The OpenVMM of a VM of another
-  [runtime identity](#runtime-identity) is terminated without a shutdown
-  request, and the stop waits up to `stop_timeout` for it to exit. Everything
-  the workloads wrote is discarded, because the root file system lives in guest
-  memory.
-- **Deprovision** deletes the state directory. It refuses to remove a directory
-  that contains unexpected files.
-
-Before every operation, the backend reattaches to the VM that the sandbox's
-store records, as NVX's supervisor does after a restart: it checks that
-OpenVMM's process still runs, verifying the process rather than trusting its
-ID, under the backend's [runtime identity](#runtime-identity). A sandbox whose
-VM died is provisioned again. Operations can therefore run safely from
-different caller processes, one after another or after a caller restarts,
-without forgetting a live VM. On Windows, set
-`breakaway_from_job` if the caller runs inside a job object that would otherwise
-terminate the VM when the caller exits.
-
-### Policy honor matrix
-
-| Field | provision | exec |
-| --- | --- | --- |
-| `filesystem.readonlyPaths`, `readwritePaths` | mapped into the guest; see [Host paths](#host-paths) | n/a |
-| `filesystem.deniedPaths` | hidden inside mapped paths | n/a |
-| `network.egress.default` | applied (`allow` or `deny`) | n/a |
-| `network.egress.allow`, `deny` | applied; see [Network rules](#network-rules) | n/a |
-| `network.ingress.default` | applied (`allow` or `deny`); see [Network rules](#network-rules) | n/a |
-| `network.ingress.hostLoopback` | applied (`allow` or `deny`, `deny` when omitted); see [Network rules](#network-rules) | n/a |
-| `spec.hostLoopbackForwards` (ACI Edge Sandboxes extension) | applied; see [Network rules](#network-rules) | n/a |
-| `microvm.provision.memoryMib` | applied | n/a |
-| `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`; at most 4096 bytes |
-| `process.argv` (ACI Edge Sandboxes extension) | n/a | applied; absolute program, up to 64 arguments of 4096 bytes |
-| `process.cwd` | n/a | applied; an absolute guest path of at most 4095 bytes, `/` when omitted; see [Working directories](#working-directories) |
-| `process.timeout` | n/a | applied, up to 4,294,967,295 ms (about 49.7 days), the most that the contract allows; `0` disables it |
-| `process.env`, `inheritDefaultEnv` | n/a | applied per execution; see [Environment](#environment) |
-| Piped standard input | n/a | rejected; the workload reads end-of-file |
-
-Workloads run as the configured non-root identity and may write at most 1 MiB
-of combined output. Larger output ends with `Failed(OutputLimitExceeded)`.
-
-### Working directories
-
-Each execution starts in the working directory that it requests, and nothing
-carries over from an earlier execution.
-
-- Without `process.cwd`, the workload starts in the guest's root directory,
-  `/`.
-- `process.cwd` must be an absolute guest path of at most 4095 bytes. A
-  relative path is rejected with `policy_validation` before anything runs;
-  `nvx::resolve_guest_path` turns a mapped host path into a guest path.
-- The guest agent enters the directory with the workload's own identity,
-  before the workload starts, and, unless `process.env` replaces the
-  environment, points `PWD` at it. For a path with empty, `.`, or `..`
-  components, `PWD` names the directory's physical path instead.
-- A directory that does not exist, is not a directory, or that the workload
-  cannot search fails the launch, and the backend never falls back to another
-  directory. Nothing runs, the workload's standard error receives a diagnostic
-  such as `nvx-managed-agent: cannot enter working directory /work: No such
-  file or directory`, and the execution ends with `Failed(WorkingDirectory)`.
-- Start refuses a guest image whose agent cannot refuse an unusable working
-  directory this way with `backend_unavailable`.
-
-### Environment
-
-Each execution starts from its own environment, so nothing carries over from an
-earlier one. `process.env` and `process.inheritDefaultEnv` follow the contract's schema:
-
-| `process.env` | `inheritDefaultEnv` | The workload gets |
-| --- | --- | --- |
-| omitted | ignored | the default environment |
-| `[]` | `false` (default) | an empty environment |
-| `[]` | `true` | the default environment |
-| `["FOO=bar", "EMPTY="]` | `false` (default) | exactly `FOO=bar` and `EMPTY=` |
-| `["FOO=bar"]` | `true` | the default environment plus `FOO`; an entry replaces the default of the same name |
-
-The default environment is the guest's own and never holds host variables:
-`PATH=/usr/sbin:/usr/bin:/sbin:/bin`, `TERM=linux`, the `HOME`, `USER`, and
-`LOGNAME` of the workload identity, and `PWD`, which names the working
-directory, plus a few variables that the guest's boot leaves behind (`SHLVL`
-and kernel parameters such as `nvx_lifecycle`), which workloads should not
-rely on.
-
-In Rust, `ProcessSpec::env` is `None` when `process.env` is omitted and `Some`
-of an empty list for `[]`; `"env": null` does not deserialize, because the contract's
-schema allows only an array. `ExecRequest::with_env` adds an entry,
-`ExecRequest::with_envs` sets the list, and
-`ExecRequest::with_inherit_default_env` sets the flag.
-
-- Entries are `KEY=VALUE` strings. A value may hold anything but NUL, such as
-  spaces, quotes, newlines, `=`, or nothing at all, and the workload receives it
-  as written, without shell interpretation. An entry without `=` or with an
-  empty name is `malformed_request`.
-- The exec request carries the entries in a field of their own, next to the
-  arguments and the working directory, so they leave the argument limits
-  untouched. It takes at most 256 entries with unique names, each at most 4096
-  bytes, in a request of at most 64 KiB. A repeated name, or more or longer
-  entries, is `policy_validation`, before anything runs.
-- The guest agent enters the working directory with the workload's identity
-  and applies the entries after it has dropped the workload's privileges, just
-  before it starts the program. The workload therefore keeps its identity, no
-  capabilities, and `no_new_privs`, and a `process.argv` program receives
-  exactly the requested environment, also in a working directory. Run
-  `/usr/bin/env` through `process.argv` to see it.
-- A `process.commandLine` runs in `/bin/sh`, and that shell is the workload, so
-  it exports variables of its own: BusyBox's `sh` sets `SHLVL` and `PWD`,
-  replacing entries with those names, as it does for any script.
+## Policies and errors
 
 ### Host paths
 
@@ -832,88 +528,9 @@ paths for one object. `nvx::resolve_guest_path` performs the same
 translation, for example to turn a host working directory into a
 `process.cwd`; `nvx::guest_path` translates a path as written.
 
-- OpenVMM offers one virtio-fs device, which the backend attaches as an
-  aggregate: a synthetic, read-only root that lists one exported host
-  directory or file per child, mounted at `/run/nvx/hostfs/root`, a guest
-  directory that only the guest's root can enter. The children are the
-  outermost mapped directories and the mapped files outside them, so mapped
-  paths may lie anywhere, on any volume. The guest agent then bind-mounts
-  each mapped path at its guest path, read-only or read-write, so workloads
-  see only the mapped paths.
-- The host enforces each mapping's access. A child is read-write only if it
-  holds a read-write mapping, and OpenVMM then limits writes to its
-  read-write mappings. OpenVMM cannot keep a path read-only inside a writable
-  one, so a read-only path inside a read-write directory is refused rather
-  than left to the guest's bind mount. OpenVMM exports a mapped file alone:
-  the guest reaches neither its siblings nor its directory, which it cannot
-  list, inspect, or change, so a read-write file can be rewritten in place
-  but not replaced, renamed, or removed. OpenVMM follows the file's name, so
-  the guest sees the file that a host program, such as an editor, saves over
-  it, and the file's accesses fail with `EACCES` while anything but a
-  regular file holds the name. Start refuses to run a sandbox whose mapped
-  file a directory replaced, or whose mapped directory a file replaced, and
-  OpenVMM refuses such a child too, so a file grant never becomes a
-  directory grant. Mapping a whole volume (`/` or `C:\`) is refused; map
-  directories inside it.
-- Denied paths inside an exported directory are hidden by OpenVMM itself: they
-  are absent from listings and inaccessible through any name, except a host
-  hard link to a file inside a denied directory, which OpenVMM cannot tell
-  from any other file. Below its exported directory, a path that OpenVMM hides
-  or singles out, such as a read-write path inside a read-only one, must not
-  contain colons, backslashes, links, or whitespace other than spaces, and no
-  name in it may begin or end with a space.
-- Mapped paths must exist and be directories or regular files. On Windows, a
-  mapped or denied path that only a verbatim `\\?\` path names, such as that
-  of a directory whose name ends in a period or a space, is refused, since the
-  path without the prefix would name another object, or none. A path listed
-  both read-only and read-write is mapped read-only. A read-only path,
-  directory or file, must not resolve to a path inside a read-write
-  directory, but a read-write path may lie inside a read-only directory.
-  Start refuses a sandbox that an earlier version provisioned with such a
-  path. A denied path must not contain a mapped path, and a denied path that
-  does not exist yet must not lie inside a mapped path, because nothing could
-  hide it once a workload creates it. Mapping over the guest's own system
-  directories (`/usr`, `/etc`, and so on) is refused. Violations are reported
-  as `policy_validation`.
-- A sandbox maps at most 4096 paths through at most 256 children. A policy
-  whose mapped directories, and mapped files outside them, would need more
-  children is refused rather than served through the directories that hold
-  its files, which would grant more than the files; map directories that
-  contain the files instead. OpenVMM hides at most 128 denied paths, and
-  singles out at most 128 read-write paths inside read-only ones, in each
-  exported directory.
-- OpenVMM's command line must fit the 32,767 characters of a Windows process
-  command line, with 1,024 held in reserve, on every host, which typically
-  leaves room for several hundred paths. Provision rejects a policy beyond
-  these limits with `policy_validation`, as it does one whose children would
-  export one object twice, such as two mapped host hard links to one file.
-  The reserve absorbs configured paths that grow after provision; start
-  refuses with `policy_validation` a command line that no longer fits at all.
-- Provision records the identity of every mapped and denied object inside a
-  read-write mapping, and start refuses to run if one changed, so a workload
-  cannot rename a denied or mapped object and leave a decoy at its path for
-  the next start. Objects outside read-write mappings are not pinned, so host
-  edits that replace them do not block a restart.
-- Start hands the guest agent the mapping table over the control channel, in
-  requests that each fit one 64 KiB control record; the kernel command line
-  carries only the number of entries. The agent refuses workloads until it has
-  mounted every entry, and start fails if it cannot mount one. Guest images
-  that predate the mapping table do not advertise its control feature, so
-  start refuses them.
-- On Windows hosts, mapped files appear owned by root with mode `0777`, so the
-  workload identity can read and, for read-write paths, write them. On Linux
-  hosts virtio-fs shows host owners and modes unchanged; with
-  `map_host_identity` (the default), sandboxes that map host paths run their
-  workloads under the calling user's IDs, and the guest creates an account for
-  them.
-
-To keep part of a directory read-only while workloads write the rest, map the
-directory read-only and the paths in it that they write read-write: OpenVMM
-then limits writes to those paths.
-
 ### Network rules
 
-OpenVMM's portable network profile enforces an egress default plus IPv4 and
+A network policy is an egress default plus IPv4 and
 IPv6 allow and deny rules; deny rules take precedence, and a rule matches only
 destinations of its networks' family, so a denied default blocks the other
 family. Each rule lists destination networks (`to`, each a CIDR with optional
@@ -926,173 +543,45 @@ through `endPort`, an `icmp` entry matches ICMP alone, or ICMPv6 for IPv6
 networks, and `any` matches every protocol or, with a port or a port range,
 TCP and UDP on those ports.
 
-Rules are lowered into OpenVMM rules exactly, by the lowering that compiles
-NVX's egress policy files
-([`nvx::host::network::policy`](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/nvx-rs/src/host/network/policy/mod.rs)):
-exceptions are subtracted from their networks, protocol `any` with a port or a
-port range becomes a TCP and a UDP rule, the destinations of each action merge
-into the fewest networks that cover them, a rule for every port of a protocol,
-or for every protocol, subsumes the narrower rules that it covers, and
-overlapping and adjacent port ranges of a network merge into one range rule.
-The rules of each action are passed in order of family, address, prefix length,
-protocol, and ports, and an action that still needs more than 256 OpenVMM rules
-is rejected. Networks are read as policy files read them, so host bits are
-cleared and IPv4 netmasks such as `/255.255.0.0` are accepted, but request
-validation still refuses both before the backend sees them. Egress
-denied without allow rules, with ingress and host loopback denied, attaches no
-network device;
-otherwise the guest gets `10.0.0.2/24` behind the profile's NAT gateway
-`10.0.0.1`, which also serves DNS, and `fd00::a00:2/120` behind the gateway's
-IPv6 address `fd00::a00:1`.
-
-With `network.ingress.default: allow`, OpenVMM listens on every host address at
-each TCP and UDP port on which the workload listens, within about a second of
-the workload starting to listen, and relays clients on the host's private
-networks, whose addresses are not globally reachable, to the guest. It refuses
-other clients, clients inside the guest network, which the guest would take for
-its neighbors, IPv6 link-local clients, and the host itself unless
-`network.ingress.hostLoopback` is `allow`. Replies to admitted clients pass
-whatever the egress policy. A port that a host process already holds is not
-published, and clients on other hosts need the host's firewall to admit them to
-OpenVMM; see [Private-network ingress](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/doc/run.md#private-network-ingress).
-
-With `network.ingress.hostLoopback: allow`, access between the workload and
-host loopback is bidirectional: the workload reaches host loopback services
-through its gateway, such as `10.0.0.1:8080` for a host service on
-`127.0.0.1:8080`, subject to the egress policy, and the host reaches the
-workload. Without ingress allowed, OpenVMM listens on host IPv4 and IPv6
-loopback alone at each TCP and UDP port on which the workload listens on a
-non-loopback address, admits only the host, and lets replies to it pass
-whatever the egress policy; a workload listener on guest loopback stays
-private, and a port that a host process already holds is not published.
-Host-loopback access needs a `guest_network` of `/29` or larger, since OpenVMM
-presents host peers to the workload at an address of that network, and a
-policy that allows it for a `/30` fails with `policy_validation`. The
-sandbox spec's `hostLoopbackForwards` (`SandboxSpec::with_host_loopback_forward`,
-passed to `AciEdgeSandbox::provision_with`) publish up to 64 further host
-loopback ports at guest ports of their choice, one forward per protocol and
-guest port. They need host-loopback access allowed. OpenVMM lets the
-workload's replies on a forwarded TCP connection through whatever the egress
-policy, but filters its UDP replies, which go to addresses that OpenVMM assigns
-inside the guest network, so UDP forwards also need an egress default of
-`allow` and no deny rule that covers the guest network; see
-[Host-loopback access](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/doc/run.md#host-loopback-access).
-
-### Idempotence and concurrency
-
-- Every provision creates a new sandbox.
-- `start` on a running sandbox fails with `already_started`, and `stop` on a
-  stopped sandbox fails with `already_stopped`.
-- Deprovisioning a running sandbox fails with `already_started`; stop it first.
-  After deprovision, every call fails with `stale_id` without writing any
-  state, as do calls with IDs that were never provisioned.
-- Deprovision removes the sandbox's files, its record last, and then its state
-  directory. Files in that directory that are not the backend's stay: the
-  deprovision fails with `backend_error`, naming them, and the ID is stale
-  from then on.
-- Lifecycle transitions of one sandbox are serialized by a lock file.
-- Executions run one at a time: a concurrent exec waits up to
-  `control_timeout` for the running one to finish.
-- `stop` waits for a running exec until `stop_timeout`, then terminates the VM;
-  that exec then fails.
-- `Canceller::cancel` sends `CANCEL` to the guest within 20 ms. The agent kills
-  every process in the workload's cgroup, and the execution ends with
-  `Cancelled`. Cancelling an execution that already finished does nothing.
-  Once cancellation is sent, a missing response fails with `backend_error`
-  within `control_timeout`, or an earlier workload-response deadline, even
-  when the workload has no timeout.
 ### Error mapping
 
 | Condition | `ErrorCode` | Wire code |
 | --- | --- | --- |
 | Invalid request shape, relative or non-UTF-8 path, zero `memoryMib`, `process.timeout` above 4,294,967,295 ms | `MalformedRequest` | `malformed_request` |
 | ID without the `aci-edge-sandboxes:` prefix or a 32-digit lowercase hexadecimal token | `MalformedId` | `malformed_id` |
-| No state directory for the ID (never provisioned, or deprovisioned) | `StaleId` | `stale_id` |
+| The ID no longer refers to a provisioned sandbox (never provisioned, or deprovisioned) | `StaleId` | `stale_id` |
 | `exec` on a stopped sandbox, or a VM that died | `NotStarted` | `not_started` |
 | `start` or `deprovision` on a running sandbox | `AlreadyStarted` | `already_started` |
 | `stop` on a stopped sandbox | `AlreadyStopped` | `already_stopped` |
 | Unsupported policy or exec feature, oversized command, relative or oversized `process.cwd` | `PolicyValidation` | `policy_validation` |
-| Missing OpenVMM artifacts, inaccessible hypervisor, incompatible release or guest image, no [runtime identity](#runtime-identity), unsupported host | `BackendUnavailable` | `backend_unavailable` |
-| OpenVMM launch failure, boot timeout, control-session failure, a VM of another runtime identity, I/O errors | `BackendError` | `backend_error` |
+| A runtime dependency of the backend is missing or unusable | `BackendUnavailable` | `backend_unavailable` |
+| The backend does not implement the requested operation | `Unsupported` | `backend_error` (the wire model has no separate code) |
+| Any other backend failure | `BackendError` | `backend_error` |
 
-Start failures name the OpenVMM log, `OpenVmmBackend::log_path`.
-
-The backend keeps the messages of `nvx` errors and maps their kinds onto these
-codes: `Unavailable` becomes `backend_unavailable`, `Unsupported` becomes
-`policy_validation`, `Exited` becomes `not_started` when an exec finds the
-sandbox's VM gone, and every other kind becomes `backend_error`. The same
-conversion, without the exec case, turns any `nvx::Error` into an `Error`.
-`Error::nvx_code` keeps the error's
+Any `nvx::Error` converts into an `Error` with the same message: `Unavailable`
+becomes `backend_unavailable`, `Unsupported` becomes `policy_validation`, and
+every other kind becomes `backend_error`. `Error::nvx_code` keeps the error's
 [`nvx::ErrorCode`](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/nvx-rs/README.md#error-codes), which tells apart the
-failures that share an `ErrorCode`, such as a runtime record of another format
-(`format-unsupported`) and a VM of another runtime identity
-(`runtime-mismatch`). Callers match these codes rather than messages, whose
+failures that share an `ErrorCode`. Callers match these codes rather than messages, whose
 wording may change. The wire body carries the `ErrorCode` alone.
-
-### Metadata
-
-| Operation | Fields |
-| --- | --- |
-| provision | none |
-| start | `bootMilliseconds`: time from launch to guest readiness |
-| stop | `forced`: whether OpenVMM had to be terminated; `vmOutcome`, `vmStatusCode`, `teardownComplete`: summary of OpenVMM's outcome report, for a VM of the backend's runtime identity |
-| deprovision | none |
-
-### Security notes
-
-- The capability never appears in arguments, environment variables, logs, or
-  endpoint names. It is stored in an owner-only file only while the VM starts
-  or runs.
-- The client only talks to the OpenVMM process it launched:
-  - On Linux, the Unix socket lives in the owner-only state directory, and its
-    peer must be that process (`SO_PEERCRED`).
-  - On Windows, the named-pipe server must be that process
-    (`GetNamedPipeServerProcessId`), and the pipe is opened with SQOS
-    identification so the server cannot impersonate the client.
-- The client validates every guest record and enforces the output limit itself.
-- Termination never signals a reused process ID: Linux pins the process with a
-  pidfd (Linux 5.3 or later is required to force a stop), and Windows holds a
-  process handle.
-- `WinHvPlatform.dll` is loaded dynamically, so the crate loads on hosts
-  without the Windows Hypervisor Platform.
 
 ## Testing
 
 ```bash
-cargo test --all-features   # unit, mock, and fake-OpenVMM tests; no hypervisor needed
+ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo test --all-features   # unit, mock, and model tests; no hypervisor needed
 ```
 
-Set `NVX_BUNDLE=skip` and `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` for `--all-features` builds
-that should not download the pinned release or the edge agent bundle.
-The agent-bundle staging tests and the real-VM tests are driven by `scripts/nvx.py` in the
-[`microsoft/nvx`](https://github.com/microsoft/nvx) repository
-(`nvx.py test-agent-bundling` and `nvx.py test-aci-edge-sandboxes --backend kvm`).
-`nvx.py test-agent-bundling` stages a synthetic agent bundle through
-`ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, which the
-bundled-agent tests must find, and checks that the build rejects broken copies of it; it needs
-neither a hypervisor nor an agent library that runs. The NVX
-mechanics are tested in [`nvx-rs`](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/nvx-rs/README.md)
-as well, with their own unit tests, protocol conformance vectors, and a
-fake-OpenVMM lifecycle test.
+Set `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` for `--all-features` builds that should not
+download the edge agent bundle.
 
 - `testing::MockBackend` scripts executions for consumers' unit tests.
-- The `aci-edge-sandboxes-fake-openvmm` binary (feature `testing`) emulates the OpenVMM
-  control console. It runs the fake OpenVMM of `nvx::testing::fake_openvmm`, which
-  `nvx` also builds as `nvx-fake-openvmm`; the binary stays in this package
-  because `CARGO_BIN_EXE_*` names only binaries of the package under test. It lets the real OpenVMM backend run end to end on hosts
-  without a hypervisor: detached launch, reconnection from a new process,
-  crash recovery, interrupted-start recovery, forced stop, cancellation,
-  working directories, host path mapping tables, refusal of guest images that
-  lack required features, and failure injection.
-- `cargo run --example lifecycle -- <command>` runs one command with
-  discovered artifacts.
-- `nvx.py test-aci-edge-sandboxes` runs the ignored `openvmm_e2e` tests against a real
-  hypervisor with the repository's kernel and Alpine initramfs: the lifecycle,
-  reattachment and the termination of a VM of another runtime identity,
-  working directories, host path mapping, network rules, private-network
-  ingress, bidirectional host-loopback access, and exec environments.
-  The NVX repository's CI runs them on
-  Linux/KVM, Linux/MSHV, and Windows/WHP.
+- The ignored `agent_guest` tests run the agent backend against a real hypervisor; they need an
+  approved agent library, the edge guest, a GPT image, and a hypervisor host.
+- The agent-bundle staging tests are driven by `scripts/nvx.py test-agent-bundling` in the
+  [`microsoft/nvx`](https://github.com/microsoft/nvx) repository. It stages a synthetic agent
+  bundle through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, which the bundled-agent tests must find,
+  and checks that the build rejects broken copies of it; it needs neither a hypervisor nor an
+  agent library that runs.
 
 ## Dependency on `nvx`
 
@@ -1104,82 +593,18 @@ The dependency moves to the crates.io release of `nvx` once it is published.
 
 ## Breaking changes
 
-The NVX mechanics moved to the [`nvx` crate](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/nvx-rs/README.md). Requests, results,
-wire formats, error codes and messages, and on-disk sandbox state are
-unchanged; sandboxes provisioned before the move keep working. These changes
-affect Rust callers and builds:
+The direct OpenVMM backend of earlier versions has been removed; use the agent backend. These
+changes affect Rust callers and builds:
 
-- `Artifacts`, `Hypervisor`, `guest_path`, and `resolve_guest_path` moved from
-  `aci_edge_sandboxes::openvmm` to `nvx`, which this crate re-exports as
-  `aci_edge_sandboxes::nvx`: use `aci_edge_sandboxes::nvx::Hypervisor` and so
-  on. `OpenVmmConfig` and `OpenVmmBackend` stay in `aci_edge_sandboxes::openvmm`.
-- `Hypervisor`'s `FromStr` implementation and `Hypervisor::from_env_or_default`
-  fail with `nvx::Error` instead of `aci_edge_sandboxes::Error`. Both are
-  `ErrorKind::Unavailable` errors with the same messages, and `?` or `Into`
-  converts them into `backend_unavailable` errors.
-- `aci_edge_sandboxes_model` depends on `nvx`, without its host side, for
-  `Cidr`, `Hypervisor`, and the hostname and guest-network rules, so a consumer
-  that vendors this crate or its model also vendors `nvx-rs/`.
-  `aci_edge_sandboxes_model::cidr`, `aci_edge_sandboxes_model::setup::Hypervisor`,
-  and `aci_edge_sandboxes_model::spec::{is_valid_hostname, is_valid_guest_network}`
-  keep their paths, and `SetupConfig` keeps its JSON.
-- The package of the `nvx` crate, which was called `nvx-rs`, now has its
-  library's name; it stays in `nvx-rs/`. A crate that depends on it directly
-  declares the dependency as `nvx`, enables its features as `nvx/FEATURE`, and
-  keeps its `nvx::` paths.
-- The build variables `ACI_EDGE_SANDBOXES_BUNDLE`,
-  `ACI_EDGE_SANDBOXES_BUNDLE_DIR`, and `ACI_EDGE_SANDBOXES_BUNDLE_HYPERVISOR`
-  became `NVX_BUNDLE`, `NVX_BUNDLE_DIR`, and `NVX_BUNDLE_HYPERVISOR`, and the
-  release that `bundled` downloads is pinned in `nvx-rs/artifacts.json`.
-  Dependents still receive the staged directory as
-  `DEP_ACI_EDGE_SANDBOXES_ARTIFACTS_DIR`.
-- A relative `process.cwd` is still rejected with `policy_validation`, and the
-  message now points at `nvx::guest_path`.
-
-The OpenVMM backend lowers egress rules with the lowering that compiles NVX's
-egress policy files
-([`nvx::host::network::policy`](https://github.com/microsoft/nvx/blob/ffb03cdea271dc2f49e19f2af842a9240a5327ee/nvx-rs/src/host/network/policy/mod.rs)),
-instead of expanding each rule on its own. What the rules match is unchanged,
-and so are the error codes, but these change:
-
-- **Rule order.** The `--network-egress-allow` and `--network-egress-deny`
-  values follow family, address, prefix length, protocol, and ports, instead of
-  string order: `::/0` precedes `2001:db8::/32`, and `tcp:80` precedes
-  `tcp:443`. OpenVMM's matching does not depend on the order.
-- **Rule count.** Each action's destinations merge into the fewest networks, a
-  rule for every port of a protocol, or for every protocol, subsumes the
-  narrower rules that it covers, and overlapping and adjacent port ranges of a
-  network merge. Policies usually need fewer OpenVMM rules, so some that
-  exceeded the limit of 256 are now accepted: 256 adjacent `/24` destinations
-  become one `/16` rule. Port ranges that overlap only partly across networks
-  can need a rule for their union, so a policy near the limit can also need
-  more rules than before.
-- **Messages.** The backend's own rule checks, which `Backend` callers reach
-  without the request validation of `AciEdgeSandbox`, report the policy
-  compiler's messages, which name the field:
-  - `network.egress.allow[0].ports[0]: ICMP has no ports` became
-    `network.egress.allow[0].ports[0].port is not supported with icmp`;
-  - `....endPort must not be below port` became `....endPort 80 cannot be
-    below port 90`, and ports outside 1 through 65535 report `....port must be
-    between 1 and 65535`;
-  - `...to[0]: the destination is not a network` and `...to[0].except: an
-    exception is not a network within the destination` became
-    `...to[0].cidr is not a valid IPv4 or IPv6 CIDR: VALUE`,
-    `...to[0].cidr must not name an IPv6 scope: VALUE`, and
-    `...to[0].except[1] must be contained in NETWORK`; and
-  - `network.egress.allow expands to 300 OpenVMM rules; the openvmm backend
-    accepts at most 256`, and the rule-level `expands to more than 256 OpenVMM
-    rules` and `covers more than 256 networks after removing its exceptions`,
-    became `network.egress.allow emits at most 256 native rules`. This is the
-    one message that requests through `AciEdgeSandbox` can also reach.
-- **Accepted rules.** Without request validation, the backend now reads a
-  network as policy files do: host bits are cleared and IPv4 netmasks are
-  accepted, so `10.0.0.7/24` is `10.0.0.0/24`, while port 0, which the backend
-  passed to OpenVMM before, is refused. Request validation still refuses such
-  networks with `malformed_request` first. A deny rule that covers the guest
-  network of host-loopback forwards is detected after the same normalization.
+- The `openvmm` module (`OpenVmmConfig`, `OpenVmmBackend`) and `AciEdgeSandbox::openvmm` are
+  gone.
+- The `openvmm` and `bundled` features are gone, and the default features are now `agent`. The
+  `agent` feature enables the host side of `nvx`, so `nvx::resolve_guest_path` stays available.
+- The `testing` feature no longer builds the `aci-edge-sandboxes-fake-openvmm` binary.
+- The build script no longer passes on `DEP_ACI_EDGE_SANDBOXES_ARTIFACTS_DIR`;
+  `agent-bundled` still exports `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`.
+- Requests, results, wire formats, error codes, and `SandboxId` are unchanged.
 
 ## Limitations
 
-Live standard input requires guest control-protocol work and is rejected today.
 Guest state does not survive a stop.

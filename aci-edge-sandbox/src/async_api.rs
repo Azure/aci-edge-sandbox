@@ -35,11 +35,11 @@ use crate::stream::{self, QueueReader, QueueWriter};
 ///
 /// Tokio cannot interrupt work on its blocking pool, so every call keeps running after its future
 /// is dropped. When the future of [`exec`](Self::exec) is dropped before it resolves, nothing else
-/// can reach the workload that the call starts, which could then run indefinitely and, with the
-/// OpenVMM backend, keep later executions waiting for the sandbox. The call therefore requests the
+/// can reach the workload that the call starts, which could then run indefinitely and keep
+/// later executions waiting for the sandbox. The call therefore requests the
 /// workload's cancellation as soon as the backend starts it, as [`Canceller::cancel`] would. Only
 /// backends whose [`ExecCapabilities::cancel`](crate::ExecCapabilities::cancel) is true, such as
-/// the OpenVMM backend, honor the request; with other backends, the workload runs until it ends
+/// the agent backend, honor the request; with other backends, the workload runs until it ends
 /// on its own, so check [`capabilities`](Self::capabilities) before relying on a dropped future
 /// to stop a workload. The other calls run to completion, and the sandbox's state reflects their
 /// effects: a dropped `start` or `stop` may still start or stop the sandbox, a dropped

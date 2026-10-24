@@ -13,22 +13,18 @@ readme = "README.md"
 keywords = ["sandbox", "microvm", "openvmm", "virtualization"]
 categories = ["virtualization", "api-bindings"]
 publish = false
-# Lets the build scripts of dependents read the bundle that `nvx` staged as
-# `DEP_ACI_EDGE_SANDBOXES_ARTIFACTS_DIR`.
+# Lets the build scripts of dependents read the agent bundle that `agent-bundled` staged as
+# `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`.
 links = "aci_edge_sandboxes"
 
 [features]
-default = ["openvmm"]
-# The default backend, which drives the `openvmm` binary directly through `nvx`.
-openvmm = ["nvx/host"]
-# Stages the OpenVMM executable, guest kernel, and control initramfs at build time; see
-# `nvx::Artifacts::bundled`. The build script of `nvx` downloads the release pinned in its
-# `artifacts.json`, or copies the release directory named by `NVX_BUNDLE_DIR`.
-bundled = ["openvmm", "nvx/bundled"]
+default = ["agent"]
 # Tokio-based asynchronous wrappers around the synchronous core.
 async = ["dep:tokio"]
 # A thin client of an explicitly supplied native agent library that owns the sandbox lifecycle.
-agent = ["dep:libloading", "dep:sha2"]
+# It enables the host side of `nvx`, whose `resolve_guest_path` gives the guest paths of mapped
+# host paths.
+agent = ["dep:libloading", "dep:sha2", "nvx/host"]
 # Downloads and verifies the edge agent bundle at build time and stages it beside the
 # executables, so that `agent::AgentConfig::bundled` needs no paths or digests. The build script
 # downloads `aci-edge-sandboxes.zip` from the release of the commit being built, or of its nearest
@@ -40,8 +36,8 @@ agent-bundled = [
     "dep:aci_edge_sandboxes_model",
     "dep:static_assertions",
 ]
-# Test doubles: an in-memory `MockBackend` and the `aci-edge-sandboxes-fake-openvmm` binary.
-testing = ["nvx/testing"]
+# Test doubles: an in-memory `MockBackend` for consumers' unit tests.
+testing = []
 
 [dependencies]
 aci_edge_sandboxes_model = { path = "model", version = "0.1.0" }
@@ -79,16 +75,6 @@ sha2 = { version = "0.10", optional = true }
 [dev-dependencies]
 tempfile = "3.10"
 tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "io-util", "time"] }
-
-[[bin]]
-name = "aci-edge-sandboxes-fake-openvmm"
-path = "src/bin/aci-edge-sandboxes-fake-openvmm.rs"
-required-features = ["testing", "openvmm"]
-doc = false
-
-[[example]]
-name = "lifecycle"
-required-features = ["openvmm"]
 
 [[example]]
 name = "agent_lifecycle"

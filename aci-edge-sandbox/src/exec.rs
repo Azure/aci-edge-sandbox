@@ -4,7 +4,7 @@
 use std::fmt;
 use std::io::{self, PipeReader, PipeWriter, Read};
 use std::sync::Arc;
-#[cfg(any(feature = "openvmm", feature = "agent", feature = "testing"))]
+#[cfg(any(feature = "agent", feature = "testing"))]
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
 #[cfg(feature = "agent")]
@@ -13,7 +13,7 @@ use std::time::Instant;
 use crate::backend::ExecControl;
 use crate::error::{Error, Result};
 
-#[cfg(any(feature = "openvmm", feature = "agent", feature = "testing"))]
+#[cfg(any(feature = "agent", feature = "testing"))]
 #[derive(Default)]
 enum CompletionState {
     #[default]
@@ -22,14 +22,14 @@ enum CompletionState {
     Collected,
 }
 
-#[cfg(any(feature = "openvmm", feature = "agent", feature = "testing"))]
+#[cfg(any(feature = "agent", feature = "testing"))]
 #[derive(Default)]
 pub(crate) struct Completion {
     state: Mutex<CompletionState>,
     finished: Condvar,
 }
 
-#[cfg(any(feature = "openvmm", feature = "agent", feature = "testing"))]
+#[cfg(any(feature = "agent", feature = "testing"))]
 impl Completion {
     pub(crate) fn finish(&self, outcome: Result<ExecOutcome>) {
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) =

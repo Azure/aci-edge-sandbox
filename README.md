@@ -12,10 +12,10 @@ Building it needs Rust 1.89 or later and Git:
 ```bash
 cd aci-edge-sandbox
 cargo build
-NVX_BUNDLE=skip ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo test --all-features
+ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo test --all-features
 ```
 
-The `skip` variables keep `--all-features` builds from downloading release bundles.
+The `skip` variable keeps `--all-features` builds from downloading the edge agent bundle.
 
 ## Code of Conduct
 
