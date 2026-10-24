@@ -353,6 +353,10 @@ By default the build script downloads the release asset that
 `https://github.com/Azure/aci-edge-sandbox/releases/download/<release>/<asset>` and refuses the
 ZIP unless its SHA-256 is the pinned one. To move to another bundle, publish it as a release asset
 and update all three fields of `agent-bundle.json` together.
+
+> **Note:** The default build and unit tests pass. The currently pinned bundle provides sandbox
+> ABI 1, while this crate requires ABI 2. Consequently, `agent-bundled` builds and runtime use
+> with that bundle fail the compatibility check. A compatible bundle and pin update are pending.
 Releases publish no bundle for Linux, so a Linux build needs one of the variables below. Other
 targets, where the agent library cannot run, stage nothing. The build script
 runs again when `agent-bundle.json` or a variable below changes. It
