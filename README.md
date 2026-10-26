@@ -1,6 +1,11 @@
 # ACI Edge Sandbox
 
-ACI Edge Sandbox is a Rust SDK for creating and managing isolated sandboxes on edge devices.
+ACI Edge Sandbox is a Rust SDK for creating and managing ACI isolated sandboxes on edge devices
+and in on-premises environments, without requiring the Azure control plane, giving you guarantees
+that your application is as isolated in a container as it would be in a VM.
+
+ACI Edge Sandbox can use traditional Hyper-V-isolated ACI backends, as well as nvx, a novel
+cross-platform, OpenVMM-based micro-VM sandbox specialized for agentic workloads.
 
 ## Getting started
 
