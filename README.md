@@ -7,6 +7,9 @@ that your application is as isolated in a container as it would be in a VM.
 ACI Edge Sandbox can use traditional Hyper-V-isolated ACI backends, as well as nvx, a novel
 cross-platform, OpenVMM-based micro-VM sandbox specialized for agentic workloads.
 
+The current bundle includes only nvx as its micro-VM sandbox backend. Additional backends
+will be added in the future.
+
 ## Getting started
 
 The SDK is the `aci_edge_sandboxes` Rust crate in [`aci-edge-sandbox/`](aci-edge-sandbox/). Its
