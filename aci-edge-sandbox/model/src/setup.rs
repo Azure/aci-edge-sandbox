@@ -444,9 +444,20 @@ pub struct ImageSettings {
     /// How a host that pulls registry references materializes them.
     #[serde(default, skip_serializing_if = "ReferenceSettings::is_default")]
     pub references: ReferenceSettings,
+    /// Maximum combined length of retained VHDs in the managed image cache, in bytes.
+    /// Temporary conversion data is excluded. Omission or `None` leaves the cache unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cache_capacity_bytes: Option<u64>,
 }
 
 impl ImageSettings {
+    /// Sets the maximum combined length of retained image-cache VHDs, in bytes.
+    #[must_use]
+    pub fn with_max_cache_capacity_bytes(mut self, max_cache_capacity_bytes: u64) -> Self {
+        self.max_cache_capacity_bytes = Some(max_cache_capacity_bytes);
+        self
+    }
+
     /// Sets how the host materializes registry references.
     #[must_use]
     pub fn with_references(mut self, references: ReferenceSettings) -> Self {
@@ -455,6 +466,12 @@ impl ImageSettings {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.max_cache_capacity_bytes == Some(0) {
+            return Err(Error::malformed_request(
+                "setup images.maxCacheCapacityBytes must be greater than zero",
+            ));
+        }
+
         for (index, image) in self.prefetch.iter().enumerate() {
             image.validate(&format!("setup images.prefetch[{index}]"))?;
         }
@@ -632,12 +649,67 @@ mod tests {
         assert_eq!(config.defaults, SandboxDefaults::default());
         assert_eq!(config.exec, ExecSettings::default());
         assert_eq!(config.images, ImageSettings::default());
+        assert_eq!(config.images.max_cache_capacity_bytes, None);
         assert_eq!(
             config.images.references.pull_timeout_ms,
             DEFAULT_PULL_TIMEOUT_MS
         );
         assert!(config.images.references.auth_file.is_none());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn image_cache_capacity_defaults_for_omitted_settings_and_null() {
+        for json in [
+            "{}",
+            r#"{"references":{}}"#,
+            r#"{"maxCacheCapacityBytes":null}"#,
+        ] {
+            let images: ImageSettings = serde_json::from_str(json).unwrap();
+            assert_eq!(images.max_cache_capacity_bytes, None);
+            let config = SetupConfig::new("/var/lib/nvx", files()).with_images(images);
+            config.validate().unwrap();
+            let encoded = serde_json::to_string(&config).unwrap();
+            assert!(!encoded.contains("maxCacheCapacityBytes"), "{encoded}");
+            assert_eq!(
+                serde_json::from_str::<SetupConfig>(&encoded).unwrap(),
+                config
+            );
+        }
+    }
+
+    #[test]
+    fn image_cache_capacity_builder_and_json_round_trip() {
+        for capacity in [1, 10 * 1024 * 1024 * 1024, u64::MAX] {
+            let config = SetupConfig::new("/var/lib/nvx", files()).with_images(
+                ImageSettings::default()
+                    .with_max_cache_capacity_bytes(capacity)
+                    .with_references(ReferenceSettings::default().with_pull_timeout_ms(60_000)),
+            );
+            config.validate().unwrap();
+            assert_eq!(config.images.max_cache_capacity_bytes, Some(capacity));
+            let json = serde_json::to_value(&config).unwrap();
+            assert_eq!(json["images"]["maxCacheCapacityBytes"], capacity);
+            assert_eq!(json["images"]["references"]["pullTimeoutMs"], 60_000);
+            assert_eq!(serde_json::from_value::<SetupConfig>(json).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn image_cache_capacity_rejects_zero_and_invalid_json_types() {
+        let config = SetupConfig::new("/var/lib/nvx", files())
+            .with_images(ImageSettings::default().with_max_cache_capacity_bytes(0));
+        let error = config.validate().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::MalformedRequest);
+        assert!(error.message().contains("images.maxCacheCapacityBytes"));
+
+        for value in ["-1", "1.5", r#""1024""#, "true", "18446744073709551616"] {
+            let json = format!(r#"{{"maxCacheCapacityBytes":{value}}}"#);
+            assert!(
+                serde_json::from_str::<ImageSettings>(&json).is_err(),
+                "{json}"
+            );
+        }
     }
 
     #[test]
