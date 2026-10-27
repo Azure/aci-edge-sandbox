@@ -13,9 +13,8 @@ publish = false
 
 [dependencies]
 getrandom = "0.4"
-# `Cidr` and `Hypervisor` come from NVX, without its host side. Pinned to the same NVX commit as the
-# parent crate until `nvx` 0.1.0-alpha.3 is published to crates.io.
-nvx = { git = "https://github.com/microsoft/nvx", rev = "ffb03cdea271dc2f49e19f2af842a9240a5327ee", version = "0.1.0-alpha.3", default-features = false, features = ["serde"] }
+# `Cidr` and `Hypervisor` come from NVX, without its host side.
+nvx = { version = "0.1.0-alpha.3", default-features = false, features = ["serde"] }
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.120"
 thiserror = "2"
