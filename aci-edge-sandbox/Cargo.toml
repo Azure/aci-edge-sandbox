@@ -41,8 +41,7 @@ testing = []
 
 [dependencies]
 aci_edge_sandboxes_model = { path = "model", version = "0.1.0" }
-# Pinned to a commit of the public NVX repository until `nvx` 0.1.0-alpha.3 is published to crates.io.
-nvx = { git = "https://github.com/microsoft/nvx", rev = "ffb03cdea271dc2f49e19f2af842a9240a5327ee", version = "0.1.0-alpha.3", default-features = false }
+nvx = { version = "0.1.0-alpha.3", default-features = false }
 libloading = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }
 serde = { version = "1.0.200", features = ["derive"] }
