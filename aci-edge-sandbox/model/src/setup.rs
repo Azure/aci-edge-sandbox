@@ -569,8 +569,8 @@ pub struct ExecSettings {
 }
 
 /// Most frames that one execution may have in flight in both directions. The transport buffers at
-/// most 12 frames per stream, and three more are reserved for the start, terminal, and close
-/// frames.
+/// most 13 frames per stream, and four more are reserved for the start, input-closed, terminal,
+/// and close frames.
 pub const MAX_EXEC_WINDOW_FRAMES: u32 = 9;
 
 fn default_output_window_frames() -> u32 {
