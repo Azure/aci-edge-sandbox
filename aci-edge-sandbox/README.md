@@ -435,9 +435,13 @@ provisioned again to accept the change.
 - OpenVMM exports the deepest directory that contains every mapped path through one
   virtio-fs device, read-only unless a path is read-write, and hides the denied paths. The
   guest mounts the export where workloads cannot reach it and bind-mounts each mapped path
-  into the RAM overlay at its guest path, read-only where requested. The bind mounts travel on
-  the guest's 1024-byte kernel command line, which leaves room for roughly a dozen typical
-  paths; provision rejects a policy whose mounts do not fit with `policy_validation`.
+  into the RAM overlay at its guest path, read-only where requested. The guest's kernel command
+  line announces only how many paths are mapped: the guest receives the bind mounts in one
+  request of at most 256 KiB once it is ready, and the start completes once it has bound them.
+  OpenVMM's command line names the exported, hidden, and writable paths, and every host keeps
+  it, with the network rules, within the 32,767 characters that Windows allows a process, less
+  room for the rest of the launch. That leaves room for over a hundred long paths; provision
+  rejects a policy that does not fit with `policy_validation`.
 - Denied paths stay hidden through their aliases: `..`, host symbolic links and junctions,
   links that workloads create, and other names of a denied object, such as a host hard link to
   a denied file. OpenVMM never follows a link on the host, so the guest resolves every link
