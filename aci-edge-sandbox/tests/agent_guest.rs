@@ -1308,8 +1308,15 @@ fn executions_run_concurrently_without_stalling_each_other() {
          memory grew {} MiB",
         grown >> 20
     );
+    // Windows timers tick every 15.6 ms and round the waits of an execution up to whole ticks, so
+    // there a sample can take a tick more without anything stalling it.
+    let tick = if cfg!(windows) {
+        Duration::from_micros(15_625)
+    } else {
+        Duration::ZERO
+    };
     assert!(
-        beside <= alone * 2 + Duration::from_millis(2),
+        beside <= alone * 2 + Duration::from_millis(2) + tick,
         "a stalled reader slowed other executions from {alone:?} to {beside:?}"
     );
     assert!(
