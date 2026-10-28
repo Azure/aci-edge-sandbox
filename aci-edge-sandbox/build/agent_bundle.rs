@@ -26,10 +26,12 @@
 //!   `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL` names; without that variable, it must equal the pin.
 //! - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`: stages nothing, as when the feature is disabled.
 //!
-//! Targets other than Linux and Windows, where the agent library cannot run, stage nothing.
-//! Every staged file must match the bundle's `SHA256SUMS`, the bundle may hold no links, and the
-//! manifests must agree with the files and name an agent library for the target platform. A
-//! bundle whose library speaks another sandbox ABI fails the crate's build.
+//! Targets other than Linux and Windows, where the agent library cannot run, stage nothing, and
+//! so do Windows targets other than x86_64 without one of the variables, because the pinned
+//! release holds an x86_64 library. Every staged file must match the bundle's `SHA256SUMS`, the
+//! bundle may hold no links, and the manifests must agree with the files and name an agent
+//! library for the target operating system and architecture. A bundle whose library speaks
+//! another sandbox ABI fails the crate's build.
 
 use std::collections::BTreeMap;
 use std::env::{self, VarError};
@@ -110,6 +112,7 @@ fn stage(out_dir: &Path) -> Option<Bundle> {
         // The agent library runs on Linux and Windows hosts only.
         return None;
     }
+    let target_arch = cargo_variable("CARGO_CFG_TARGET_ARCH");
     let downloads = out_dir.join("agent-bundle-download");
     let staged = out_dir.join(DIRECTORY);
     match (variable(DIR), variable(URL)) {
@@ -162,6 +165,16 @@ fn stage(out_dir: &Path) -> Option<Bundle> {
                      to a bundle for {target_os}"
                 ));
             }
+            if target_arch != "x86_64" {
+                // An x86_64 library cannot load into this process, so none is staged as usable;
+                // `BundledAgent::discover` then reports `backend_unavailable`.
+                warn(format!(
+                    "the pinned release holds an x86_64 agent library, which cannot run on \
+                     {target_arch}; staging no bundle. Set {URL} or {DIR} to a bundle for \
+                     {target_arch}"
+                ));
+                return None;
+            }
             let pin = pin();
             if let Some(approved) = variable(ARCHIVE_SHA256)
                 && !approved.eq_ignore_ascii_case(&pin.sha256)
@@ -177,7 +190,7 @@ fn stage(out_dir: &Path) -> Option<Bundle> {
             unpack(&archive, &staged, Some(&pin.sha256));
         }
     }
-    let bundle = verify(&staged, &target_os);
+    let bundle = verify(&staged, &target_os, &target_arch);
     install(&staged, out_dir, &bundle, started);
     println!("cargo::metadata=agent_artifacts_dir={}", staged.display());
     Some(bundle)
@@ -363,7 +376,7 @@ fn copy_listed(source: &Path, staged: &Path) {
 
 /// Checks the bundle in `directory` and removes the files that its `SHA256SUMS` does not
 /// list.
-fn verify(directory: &Path, target_os: &str) -> Bundle {
+fn verify(directory: &Path, target_os: &str, target_arch: &str) -> Bundle {
     reject_links(directory);
     let files = read_checksums(&directory.join(CHECKSUMS));
     for (name, expected) in &files {
@@ -446,6 +459,7 @@ fn verify(directory: &Path, target_os: &str) -> Bundle {
             "the bundle's agent library, {library}, does not run on {target_os}"
         ));
     }
+    check_machine(&inside(directory, &library), target_os, target_arch);
     // The files of the format-2 edge layout, each of which the host checks against its pin.
     let executable = if target_os == "windows" { ".exe" } else { "" };
     for (pin, name) in [
@@ -494,6 +508,62 @@ fn verify(directory: &Path, target_os: &str) -> Bundle {
         library,
         library_sha256,
         sandbox_abi,
+    }
+}
+
+/// Fails unless the agent library at `path` is built for `target_arch`: a process loads only a
+/// library of its own architecture. Reads the machine field of the PE or ELF header.
+fn check_machine(path: &Path, target_os: &str, target_arch: &str) {
+    // PE `IMAGE_FILE_MACHINE_*` and ELF `EM_*` values.
+    let expected: u16 = match (target_os, target_arch) {
+        ("windows", "x86_64") => 0x8664,
+        ("windows", "aarch64") => 0xaa64,
+        ("linux", "x86_64") => 62,
+        ("linux", "aarch64") => 183,
+        _ => fail(format!(
+            "the agent library does not run on {target_arch} {target_os}"
+        )),
+    };
+    let mut header = vec![0; 4096];
+    let read = File::open(path)
+        .and_then(|mut file| file.read(&mut header))
+        .unwrap_or_else(|error| fail(format!("cannot read {}: {error}", path.display())));
+    header.truncate(read);
+    let u16_at = |offset: usize| {
+        header
+            .get(offset..offset + 2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    let machine = if target_os == "windows" {
+        // The DOS header's `e_lfanew` locates the `PE\0\0` signature, which the machine follows.
+        Some(&header)
+            .filter(|header| header.starts_with(b"MZ"))
+            .and_then(|header| header.get(0x3c..0x40))
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+            .filter(|&pe| header.get(pe..pe + 4) == Some(b"PE\0\0".as_slice()))
+            .and_then(|pe| u16_at(pe + 4))
+    } else {
+        // A little-endian ELF file, whose `e_machine` is at offset 18.
+        Some(&header)
+            .filter(|header| header.starts_with(b"\x7fELF") && header.get(5) == Some(&1))
+            .and_then(|_| u16_at(18))
+    };
+    match machine {
+        Some(machine) if machine == expected => {}
+        Some(machine) => fail(format!(
+            "the bundle's agent library, {}, is built for machine {machine:#06x}, not for \
+             {target_arch} ({expected:#06x})",
+            path.display()
+        )),
+        None => fail(format!(
+            "the bundle's agent library, {}, is not a {} library",
+            path.display(),
+            if target_os == "windows" {
+                "PE"
+            } else {
+                "little-endian ELF"
+            }
+        )),
     }
 }
 

@@ -12,10 +12,16 @@ repository = "https://github.com/Azure/aci-edge-sandbox"
 readme = "README.md"
 keywords = ["sandbox", "microvm", "openvmm", "virtualization"]
 categories = ["virtualization", "api-bindings"]
-publish = false
+publish = ["crates-io"]
 # Lets the build scripts of dependents read the agent bundle that `agent-bundled` staged as
 # `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`.
 links = "aci_edge_sandboxes"
+
+# docs.rs builds without network access, so its documentation leaves out `agent-bundled`, whose
+# build script downloads the pinned bundle.
+[package.metadata.docs.rs]
+features = ["async", "testing"]
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 
 [features]
 default = ["agent"]
@@ -40,8 +46,10 @@ agent-bundled = [
 testing = []
 
 [dependencies]
-aci_edge_sandboxes_model = { path = "model", version = "0.1.0" }
-nvx = { version = "0.1.0-alpha.6", default-features = false }
+# The model and this crate are released together at the same version, and `nvx`, whose API this
+# crate re-exports, is a preview whose API can change in any release: both are pinned exactly.
+aci_edge_sandboxes_model = { path = "model", version = "=0.1.0" }
+nvx = { version = "=0.1.0-alpha.6", default-features = false }
 libloading = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }
 serde = { version = "1.0.200", features = ["derive"] }
@@ -67,7 +75,7 @@ windows-sys = { version = "0.61", features = [
 [build-dependencies]
 # Only the `agent-bundled` build script reads the bundle's manifests and digests, and it checks the
 # bundle's sandbox ABI against the model's before installing the bundle.
-aci_edge_sandboxes_model = { path = "model", version = "0.1.0", optional = true }
+aci_edge_sandboxes_model = { path = "model", version = "=0.1.0", optional = true }
 serde_json = { version = "1.0.120", optional = true }
 sha2 = { version = "0.10", optional = true }
 

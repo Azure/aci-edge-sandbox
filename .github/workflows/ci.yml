@@ -1,0 +1,74 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  # The crate's rust-version.
+  RUST_MSRV: '1.89'
+
+jobs:
+  check:
+    name: Check / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: aci-edge-sandbox
+    env:
+      # Stage no bundle for --all-features builds: scripts/test-agent-bundling.ps1 checks staging.
+      ACI_EDGE_SANDBOXES_AGENT_BUNDLE: skip
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --component clippy,rustfmt
+          rustup toolchain install $env:RUST_MSRV --profile minimal
+      - run: cargo +$env:RUST_TOOLCHAIN fmt --all -- --check
+      - run: cargo +$env:RUST_TOOLCHAIN clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo +$env:RUST_TOOLCHAIN test --locked --workspace --all-features
+      - run: cargo +$env:RUST_TOOLCHAIN doc --locked --workspace --no-deps --all-features
+      - run: cargo +$env:RUST_MSRV check --locked --workspace --all-targets --all-features
+      - name: Check agent bundle staging
+        working-directory: .
+        env:
+          ACI_EDGE_SANDBOXES_AGENT_BUNDLE: ''
+        run: ./scripts/test-agent-bundling.ps1 -Toolchain $env:RUST_TOOLCHAIN -WorkDir $env:RUNNER_TEMP/agent-bundling
+
+  package:
+    name: Package for crates.io
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+      # One joint dry run for crates.io; it uploads nothing.
+      - run: ./scripts/release/Invoke-CratePackage.ps1 -OutDir $env:RUNNER_TEMP/crates -Toolchain $env:RUST_TOOLCHAIN
+      # A consumer of the archives outside the repository, with a synthetic bundle until the
+      # pinned bundle speaks this crate's sandbox ABI.
+      - name: Check an SDK-like consumer of the archives
+        run: |
+          ./scripts/test-agent-bundling.ps1 -Toolchain $env:RUST_TOOLCHAIN -WorkDir $env:RUNNER_TEMP/fixtures
+          $env:ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR = "$env:RUNNER_TEMP/fixtures/good"
+          ./scripts/release/Test-CrateConsumer.ps1 -ArchiveDir $env:RUNNER_TEMP/crates -WorkDir $env:RUNNER_TEMP/consumer -Toolchain $env:RUST_TOOLCHAIN
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crates
+          path: ${{ runner.temp }}/crates

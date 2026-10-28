@@ -423,7 +423,10 @@ and update all three fields of `agent-bundle.json` together.
 > ABI 1, while this crate requires ABI 3. Consequently, `agent-bundled` builds and runtime use
 > with that bundle fail the compatibility check. A compatible bundle and pin update are pending.
 
-Releases publish no bundle for Linux, so a Linux build needs one of the variables below. Other
+Releases publish no bundle for Linux, so a Linux build needs one of the variables below. The pinned
+release holds an x86_64 Windows library, so a Windows build for another architecture, such as
+`aarch64-pc-windows-msvc`, stages no bundle unless one of the variables names a bundle for it;
+`BundledAgent::discover` then fails with `backend_unavailable`. Other
 targets, where the agent library cannot run, stage nothing. The build script
 runs again when `agent-bundle.json` or a variable below changes. It
 also runs again when the copy beside the executables (see below) is replaced, changed, or
@@ -442,7 +445,8 @@ The build fails unless every file that `SHA256SUMS` lists matches it, the bundle
 `bin/openvmm[.exe]`, `guest/vmlinux`, `guest/initramfs-edge.cpio.gz`,
 `bin/direct-images[.exe]`, and the library, `bundle-manifest.json` describes a complete bundle
 whose consumer section names that manifest and an agent library for the target platform with
-the digests found, and the library speaks this crate's sandbox ABI. These checks prove that the
+the digests found, the library's PE or ELF header names the target architecture, and the library
+speaks this crate's sandbox ABI. These checks prove that the
 bundle is intact, not that it is authorized: the trust comes from the pinned SHA-256, or, for a
 bundle named by `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL`, from its source and
 `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256`.
@@ -650,18 +654,23 @@ download the edge agent bundle.
 - `testing::MockBackend` scripts executions for consumers' unit tests.
 - The ignored `agent_guest` tests run the agent backend against a real hypervisor; they need an
   approved agent library, the edge guest, a GPT image, and a hypervisor host.
-- The agent-bundle staging tests are driven by `scripts/nvx.py test-agent-bundling` in the
-  [`microsoft/nvx`](https://github.com/microsoft/nvx) repository. It stages a synthetic agent
-  bundle through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, which the bundled-agent tests must find,
-  and checks that the build rejects broken copies of it; it needs neither a hypervisor nor an
-  agent library that runs.
+- The agent-bundle staging checks are driven by
+  [`scripts/test-agent-bundling.ps1`](https://github.com/Azure/aci-edge-sandbox/blob/main/scripts/test-agent-bundling.ps1).
+  It stages synthetic agent bundles through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR` and
+  `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL`, checks that the bundled-agent tests find them, and checks
+  that the build rejects broken copies; it needs neither a hypervisor nor an agent library that
+  runs.
 
 ## Dependency on `nvx`
 
-The crate is not published to a registry. It and its data model depend on the
+`aci_edge_sandboxes` and `aci_edge_sandboxes_model` are released to crates.io together, at the
+same version; see
+[`RELEASING.md`](https://github.com/Azure/aci-edge-sandbox/blob/main/RELEASING.md). Both depend
+on exactly version 0.1.0-alpha.6 of the
 [`nvx` crate](https://github.com/microsoft/nvx/blob/6b485c82c9fdf4f592e1221efc7d6d41ab9bc66c/nvx-rs/README.md)
-0.1.0-alpha.6 from crates.io, which was published from commit `6b485c82` of the public
-`microsoft/nvx` repository.
+from crates.io, which was published from commit `6b485c82` of the public `microsoft/nvx`
+repository. The pin is exact because `nvx` is a preview whose API can change in any release, and
+this crate re-exports it.
 
 ## Breaking changes
 

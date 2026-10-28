@@ -9,13 +9,16 @@ rust-version = "1.89"
 description = "Serializable data model of the edge sandbox lifecycle"
 license = "MIT"
 repository = "https://github.com/Azure/aci-edge-sandbox"
-publish = false
+keywords = ["sandbox", "microvm", "openvmm", "virtualization"]
+categories = ["virtualization"]
+publish = ["crates-io"]
 
 [dependencies]
 getrandom = "0.4"
 humantime = "2.4"
-# `Cidr` and `Hypervisor` come from NVX, without its host side.
-nvx = { version = "0.1.0-alpha.6", default-features = false, features = ["serde"] }
+# `Cidr` and `Hypervisor` come from NVX, without its host side. Pinned exactly, as in
+# `aci_edge_sandboxes`.
+nvx = { version = "=0.1.0-alpha.6", default-features = false, features = ["serde"] }
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.120"
 thiserror = "2"
