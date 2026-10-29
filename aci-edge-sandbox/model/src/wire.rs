@@ -385,10 +385,17 @@ mod tests {
             "disabledReason",
             "image-too-long".into(),
         );
+        refused(
+            "/platformSnapshots",
+            "disabledReason",
+            serde_json::json!({"guest-debug": null}),
+        );
         let template = "/platformSnapshots/templates/0";
         refused(template, "eligible", true.into());
         refused(template, "class", "no-nic".into());
+        refused(template, "class", serde_json::json!({"noNic": null}));
         refused(template, "state", "capturing".into());
+        refused(template, "state", serde_json::json!({"ready": null}));
         refused(template, "key", "CD".repeat(32).into());
         refused(template, "generation", (-1).into());
         refused(template, "capturedAt", "2026-10-29T07:00:00+00:00".into());

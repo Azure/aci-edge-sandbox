@@ -20,114 +20,111 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::hex;
 use crate::rfc3339;
 
-/// How a sandbox started: the start metadata's `bootMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-#[non_exhaustive]
-pub enum BootMode {
-    /// The sandbox started as a clone of a template.
-    Clone,
-    /// The sandbox cold booted: it booted its kernel, as every sandbox does without platform
-    /// snapshots.
-    Cold,
-}
-
-impl BootMode {
-    /// Returns the wire spelling of this mode.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Clone => "clone",
-            Self::Cold => "cold",
+/// Defines a unit-only enum and the wire spelling of each of its values. Serde writes a value as
+/// its spelling, and reads only the spellings: the implementations that serde derives would also
+/// read the form `{"spelling": null}`.
+macro_rules! spelled_enum {
+    (
+        $(#[$attribute:meta])*
+        pub enum $name:ident {
+            $(
+                $(#[$variant_attribute:meta])*
+                $variant:ident => $spelling:literal,
+            )+
         }
-    }
-}
-
-impl fmt::Display for BootMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// Why a sandbox cold booted although its host's setup enables platform snapshots: the start
-/// metadata's `coldReason`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-#[non_exhaustive]
-pub enum ColdReason {
-    /// The setup sets `diagnostics.guestDebug`, so the host keeps no template.
-    GuestDebug,
-    /// The sandbox has more virtual processors than `platformSnapshots.maxVcpus`.
-    VcpusAboveCapacity,
-    /// The sandbox's memory is not a whole number of 128 MiB blocks.
-    MemoryNotWholeBlocks,
-    /// The sandbox has less memory than the templates boot with, the setup's
-    /// `defaults.resources.memoryMib`.
-    MemoryBelowTemplate,
-    /// The sandbox has more memory than `platformSnapshots.maxMemoryMib`.
-    MemoryAboveCapacity,
-    /// The sandbox has a NIC on another guest network than the setup's
-    /// `defaults.guestNetwork`.
-    GuestNetwork,
-    /// The sandbox's image is longer than `platformSnapshots.maxImageMib`.
-    ImageTooLong,
-    /// No template of the sandbox's class is eligible: none has been captured yet, or the one of
-    /// its class expired or was quarantined and is being captured again.
-    NoEligibleTemplate,
-    /// The library's plan for the clone refused the sandbox for another reason.
-    PlanRefused,
-    /// A clone failed because of its template, and the start cold booted instead.
-    TemplateFault,
-}
-
-impl ColdReason {
-    /// Returns the wire spelling of this reason.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::GuestDebug => "guest-debug",
-            Self::VcpusAboveCapacity => "vcpus-above-capacity",
-            Self::MemoryNotWholeBlocks => "memory-not-whole-blocks",
-            Self::MemoryBelowTemplate => "memory-below-template",
-            Self::MemoryAboveCapacity => "memory-above-capacity",
-            Self::GuestNetwork => "guest-network",
-            Self::ImageTooLong => "image-too-long",
-            Self::NoEligibleTemplate => "no-eligible-template",
-            Self::PlanRefused => "plan-refused",
-            Self::TemplateFault => "template-fault",
+    ) => {
+        $(#[$attribute])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
+        pub enum $name {
+            $(
+                $(#[$variant_attribute])*
+                $variant,
+            )+
         }
-    }
-}
 
-impl fmt::Display for ColdReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// Class of a template: whether its clones have a NIC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[non_exhaustive]
-pub enum TemplateClass {
-    /// Clones without a NIC: sandboxes whose network policy attaches no network device.
-    NoNic,
-    /// Clones with a NIC on the setup's `defaults.guestNetwork`. The template holds the NIC under
-    /// a policy that denies all traffic, and each clone applies its own.
-    Nic,
-}
-
-impl TemplateClass {
-    /// Returns the wire spelling of this class.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NoNic => "noNic",
-            Self::Nic => "nic",
+        impl $name {
+            /// Returns the wire spelling of this value.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $spelling,)+
+                }
+            }
         }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text = String::deserialize(deserializer)?;
+                match text.as_str() {
+                    $($spelling => Ok(Self::$variant),)+
+                    _ => Err(serde::de::Error::unknown_variant(&text, &[$($spelling),+])),
+                }
+            }
+        }
+    };
+}
+
+spelled_enum! {
+    /// How a sandbox started: the start metadata's `bootMode`.
+    pub enum BootMode {
+        /// The sandbox started as a clone of a template.
+        Clone => "clone",
+        /// The sandbox cold booted: it booted its kernel, as every sandbox does without platform
+        /// snapshots.
+        Cold => "cold",
     }
 }
 
-impl fmt::Display for TemplateClass {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+spelled_enum! {
+    /// Why a sandbox cold booted although its host's setup enables platform snapshots: the start
+    /// metadata's `coldReason`.
+    pub enum ColdReason {
+        /// The setup sets `diagnostics.guestDebug`, so the host keeps no template.
+        GuestDebug => "guest-debug",
+        /// The sandbox has more virtual processors than `platformSnapshots.maxVcpus`.
+        VcpusAboveCapacity => "vcpus-above-capacity",
+        /// The sandbox's memory is not a whole number of 128 MiB blocks.
+        MemoryNotWholeBlocks => "memory-not-whole-blocks",
+        /// The sandbox has less memory than the templates boot with, the setup's
+        /// `defaults.resources.memoryMib`.
+        MemoryBelowTemplate => "memory-below-template",
+        /// The sandbox has more memory than `platformSnapshots.maxMemoryMib`.
+        MemoryAboveCapacity => "memory-above-capacity",
+        /// The sandbox has a NIC on another guest network than the setup's
+        /// `defaults.guestNetwork`.
+        GuestNetwork => "guest-network",
+        /// The sandbox's image is longer than `platformSnapshots.maxImageMib`.
+        ImageTooLong => "image-too-long",
+        /// No template of the sandbox's class is eligible: none has been captured yet, or the one
+        /// of its class expired or was quarantined and is being captured again.
+        NoEligibleTemplate => "no-eligible-template",
+        /// The library's plan for the clone refused the sandbox for another reason.
+        PlanRefused => "plan-refused",
+        /// A clone failed because of its template, and the start cold booted instead.
+        TemplateFault => "template-fault",
+    }
+}
+
+spelled_enum! {
+    /// Class of a template: whether its clones have a NIC.
+    pub enum TemplateClass {
+        /// Clones without a NIC: sandboxes whose network policy attaches no network device.
+        NoNic => "noNic",
+        /// Clones with a NIC on the setup's `defaults.guestNetwork`. The template holds the NIC
+        /// under a policy that denies all traffic, and each clone applies its own.
+        Nic => "nic",
     }
 }
 
@@ -234,28 +231,12 @@ impl PlatformSnapshotsInfo {
     }
 }
 
-/// Why a host keeps no template although its setup enables platform snapshots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-#[non_exhaustive]
-pub enum DisabledReason {
-    /// The setup sets `diagnostics.guestDebug`, so every start cold boots, with
-    /// [`ColdReason::GuestDebug`].
-    GuestDebug,
-}
-
-impl DisabledReason {
-    /// Returns the wire spelling of this reason.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::GuestDebug => "guest-debug",
-        }
-    }
-}
-
-impl fmt::Display for DisabledReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+spelled_enum! {
+    /// Why a host keeps no template although its setup enables platform snapshots.
+    pub enum DisabledReason {
+        /// The setup sets `diagnostics.guestDebug`, so every start cold boots, with
+        /// [`ColdReason::GuestDebug`].
+        GuestDebug => "guest-debug",
     }
 }
 
@@ -322,31 +303,14 @@ impl TemplateInfo {
     }
 }
 
-/// Whether starts can clone a template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[non_exhaustive]
-pub enum TemplateState {
-    /// A generation is eligible, and every start that it fits clones it.
-    Ready,
-    /// No generation is eligible, so the starts of its class cold boot, with
-    /// [`ColdReason::NoEligibleTemplate`], until the host captures the template again.
-    Unavailable,
-}
-
-impl TemplateState {
-    /// Returns the wire spelling of this state.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Unavailable => "unavailable",
-        }
-    }
-}
-
-impl fmt::Display for TemplateState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+spelled_enum! {
+    /// Whether starts can clone a template.
+    pub enum TemplateState {
+        /// A generation is eligible, and every start that it fits clones it.
+        Ready => "ready",
+        /// No generation is eligible, so the starts of its class cold boot, with
+        /// [`ColdReason::NoEligibleTemplate`], until the host captures the template again.
+        Unavailable => "unavailable",
     }
 }
 
@@ -365,6 +329,12 @@ mod tests {
             assert_eq!(json, serde_json::Value::from(text), "{value:?}");
             assert_eq!(serde_json::from_value::<T>(json).unwrap(), value);
             assert_eq!(display, text);
+            // Only the spelling itself, not the form that serde's derived implementations also
+            // read, `{"spelling": null}`.
+            let tagged = format!(r#"{{"{text}":null}}"#);
+            assert!(serde_json::from_str::<T>(&tagged).is_err(), "{tagged}");
+            let tagged = serde_json::from_str::<serde_json::Value>(&tagged).unwrap();
+            assert!(serde_json::from_value::<T>(tagged).is_err(), "{value:?}");
         }
         for (mode, text) in [(BootMode::Clone, "clone"), (BootMode::Cold, "cold")] {
             assert_eq!(mode.as_str(), text);

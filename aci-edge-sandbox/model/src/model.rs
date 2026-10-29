@@ -1161,9 +1161,11 @@ mod tests {
         for (field, value) in [
             ("bootMode", serde_json::json!("warm")),
             ("bootMode", serde_json::json!("Clone")),
+            ("bootMode", serde_json::json!({"clone": null})),
             ("bootMode", serde_json::json!(null)),
             ("bootMode", serde_json::json!(1)),
             ("coldReason", serde_json::json!("guest_debug")),
+            ("coldReason", serde_json::json!({"guest-debug": null})),
             ("coldReason", serde_json::json!(["guest-debug"])),
             (
                 "template",
@@ -1172,6 +1174,10 @@ mod tests {
             (
                 "template",
                 serde_json::json!({"class": "noNIC", "key": key, "generation": 3}),
+            ),
+            (
+                "template",
+                serde_json::json!({"class": {"nic": null}, "key": key, "generation": 3}),
             ),
             ("template", serde_json::json!({"class": "nic", "key": key})),
             (
