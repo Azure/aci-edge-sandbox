@@ -19,10 +19,11 @@
 //! take `EDGE_AGENT_TEST_CRASH_LIBRARY` and its approved `EDGE_AGENT_TEST_CRASH_SHA256`, a library
 //! built with its clone-crash test feature, which ends the process at the step of a clone's start
 //! that `ACI_EDGE_TEST_CLONE_CRASH_AT` names, or else `EDGE_AGENT_TEST_LIBRARY`; with a library
-//! without the feature, they skip, and say so. The capture-failure case needs
-//! `EDGE_AGENT_TEST_COLD_ONLY_INITRD`, an edge initramfs without a template mode, and skips without
-//! it, saying so. The latency test takes `EDGE_AGENT_TEST_LATENCY_SAMPLES` samples of each mode,
-//! 3 by default, and writes them as JSON to `EDGE_AGENT_TEST_LATENCY_REPORT` when it names a file.
+//! without the feature, they skip, and say so, and once a crash point ended the process, every
+//! later one must. The capture-failure case needs `EDGE_AGENT_TEST_COLD_ONLY_INITRD`, an edge
+//! initramfs without a template mode, and skips without it, saying so. The latency test takes
+//! `EDGE_AGENT_TEST_LATENCY_SAMPLES` samples of each mode, 3 by default, and writes them as JSON
+//! to `EDGE_AGENT_TEST_LATENCY_REPORT` when it names a file.
 //! With `EDGE_AGENT_TEST_LATENCY_TEMPLATE_MEMORY=sandbox`, its templates boot with each geometry's
 //! memory instead of the setup's default, so that its clones grow only their vCPUs.
 //!
@@ -3956,6 +3957,12 @@ fn helper_starts_a_clone_in_another_process() {
     );
 }
 
+/// Says that a test skipped, and why, on standard error. It writes to the stream itself, which
+/// libtest doesn't capture as it captures `eprintln!`, so the skip shows without `--nocapture` too.
+fn say_skipped(reason: &str) {
+    let _ = writeln!(std::io::stderr(), "SKIPPED: {reason}");
+}
+
 /// Starts the sandbox `id` of the snapshot tests' setup, with sandbox state under `state`, in a
 /// helper process with the environment `vars`, and returns how the process ended and the start's
 /// result, if it printed one.
@@ -3992,11 +3999,10 @@ fn start_clone_in_helper(
 fn a_clone_survives_its_caller() {
     let state = tempfile::tempdir().unwrap();
     let first = snapshot_backend(state.path(), platform_snapshots(), |_| {});
-    let id = AciEdgeSandbox::from_shared(first)
-        .provision(&ProvisionRequest::new())
-        .unwrap()
-        .sandbox_id;
-    let (status, started) = start_clone_in_helper(state.path(), &id, &[]);
+    let starter = AciEdgeSandbox::from_shared(first.clone());
+    // The first backend cleans the sandbox up until the second one takes it over.
+    let provisioned = provision(&starter, &first);
+    let (status, started) = start_clone_in_helper(state.path(), &provisioned.id, &[]);
     // A new backend, of a setup that this process has not opened, reaches the clone.
     let second = snapshot_backend(state.path(), platform_snapshots(), |setup| {
         setup.timeouts.stop_ms = 20_000;
@@ -4005,7 +4011,7 @@ fn a_clone_survives_its_caller() {
     let sandbox = Cleanup {
         client: &client,
         backend: &second,
-        id,
+        id: provisioned.release(),
         armed: true,
     };
     assert!(
@@ -4037,10 +4043,11 @@ fn a_clone_start_killed_before_its_commit_leaves_no_vm_and_after_it_a_clone() {
     let first = snapshot_backend(state.path(), platform_snapshots(), |_| {});
     let client = AciEdgeSandbox::from_shared(first.clone());
     for (index, (point, committed)) in CRASH_POINTS.into_iter().enumerate() {
-        let id = provision(&client, &first).release();
+        // The first backend cleans the sandbox up until the checking one takes it over.
+        let provisioned = provision(&client, &first);
         let (status, started) = start_clone_in_helper(
             state.path(),
-            &id,
+            &provisioned.id,
             &[
                 (HELPER_LIBRARY, library.as_os_str()),
                 (HELPER_LIBRARY_SHA256, digest.as_os_str()),
@@ -4055,18 +4062,20 @@ fn a_clone_start_killed_before_its_commit_leaves_no_vm_and_after_it_a_clone() {
         let sandbox = Cleanup {
             client: &checker,
             backend: &checking,
-            id,
+            id: provisioned.release(),
             armed: true,
         };
-        if status.success() {
+        // A library without the feature ignores the first crash point; once one crash point
+        // ended the helper, every later one must.
+        if status.success() && index == 0 {
             assert_cloned(
                 &started.expect("the helper reported no start"),
                 TemplateClass::NoNic,
             );
-            eprintln!(
-                "SKIPPED: the library ignores {CRASH_AT}, so it was built without its clone-crash \
-                 test feature, and no crash point was checked"
-            );
+            say_skipped(&format!(
+                "the library ignores {CRASH_AT}, so it was built without its clone-crash test \
+                 feature, and no crash point was checked"
+            ));
             return;
         }
         assert_eq!(
@@ -4105,9 +4114,9 @@ fn a_clone_start_killed_before_its_commit_leaves_no_vm_and_after_it_a_clone() {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn a_capture_that_fails_fails_the_open_and_names_its_class() {
     let Some(initrd) = std::env::var_os("EDGE_AGENT_TEST_COLD_ONLY_INITRD") else {
-        eprintln!(
-            "SKIPPED: EDGE_AGENT_TEST_COLD_ONLY_INITRD names no initramfs without a template \
-             mode, so this test checked nothing"
+        say_skipped(
+            "EDGE_AGENT_TEST_COLD_ONLY_INITRD names no initramfs without a template mode, so this \
+             test checked nothing",
         );
         return;
     };
