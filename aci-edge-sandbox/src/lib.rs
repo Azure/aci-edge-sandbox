@@ -51,7 +51,9 @@
 //! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests.
 
 // The data model lives in `aci_edge_sandboxes_model`; these keep its modules at their crate paths.
-pub(crate) use aci_edge_sandboxes_model::{capabilities, error, id, model, spec, validate};
+pub(crate) use aci_edge_sandboxes_model::{
+    capabilities, error, id, model, snapshot, spec, validate,
+};
 /// The NVX crate: the data model takes its hypervisors, CIDRs, and hostname and guest-network rules
 /// from it, and its `resolve_guest_path` gives the guest paths of mapped host paths.
 pub use nvx;
@@ -86,4 +88,5 @@ pub use model::{
     NetworkPeer, NetworkPolicy, NetworkPort, NetworkRule, ProcessSpec, Protocol, ProvisionRequest,
     ProvisionResult, RuntimeConfig, StartResult, StdinMode, StopResult,
 };
+pub use snapshot::{BootMode, ColdReason, TemplateClass, TemplateGeneration, TemplateKey};
 pub use spec::{ImageSource, Resources, SandboxSpec};

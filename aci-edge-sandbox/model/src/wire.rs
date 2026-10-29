@@ -16,10 +16,14 @@ use crate::image::{ImageDigest, ImageId};
 use crate::model::{ExecRequest, Metadata, ProvisionRequest};
 use crate::outcome::ExecOutcome;
 use crate::setup::RuntimeDigests;
+use crate::snapshot::PlatformSnapshotsInfo;
 use crate::spec::{SandboxSpec, validate_path, validate_reference};
 
 /// Version of the sandbox ABI. A client requires a library that reports exactly this version.
-pub const SANDBOX_ABI_VERSION: u32 = 2;
+///
+/// Version 3 added [`SetupConfig::platform_snapshots`](crate::SetupConfig::platform_snapshots) and
+/// [`HostInfo::platform_snapshots`].
+pub const SANDBOX_ABI_VERSION: u32 = 3;
 
 /// Input of the provision call.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +156,10 @@ pub struct HostInfo {
     pub default_image: Option<ImageId>,
     /// Digests of the runtime files that the host verified.
     pub runtime_digests: RuntimeDigests,
+    /// The host's templates, when its setup enables
+    /// [platform snapshots](crate::SetupConfig::platform_snapshots).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_snapshots: Option<PlatformSnapshotsInfo>,
 }
 
 impl HostInfo {
@@ -160,7 +168,15 @@ impl HostInfo {
         Self {
             default_image,
             runtime_digests,
+            platform_snapshots: None,
         }
+    }
+
+    /// Sets the host's templates, for a setup that enables platform snapshots.
+    #[must_use]
+    pub fn with_platform_snapshots(mut self, platform_snapshots: PlatformSnapshotsInfo) -> Self {
+        self.platform_snapshots = Some(platform_snapshots);
+        self
     }
 }
 
@@ -282,5 +298,102 @@ mod tests {
         assert!(!is_token("0123456789ABCDEF0123456789abcdef"));
         assert!(!is_token("0123456789abcdef"));
         assert!(!is_token("../0123456789abcdef0123456789abc"));
+    }
+
+    fn host_with_templates() -> HostInfo {
+        use crate::snapshot::{TemplateClass, TemplateInfo, TemplateKey, TemplateState};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        HostInfo::new(None, DIGESTS).with_platform_snapshots(PlatformSnapshotsInfo::new(vec![
+            TemplateInfo::new(TemplateClass::NoNic, TemplateState::Ready).with_generation(
+                TemplateKey::from_bytes([0xcd; 32]),
+                3,
+                UNIX_EPOCH + Duration::from_secs(1_793_257_200),
+            ),
+            TemplateInfo::new(TemplateClass::Nic, TemplateState::Unavailable)
+                .with_last_error("the capture timed out"),
+        ]))
+    }
+
+    const DIGESTS: RuntimeDigests = RuntimeDigests {
+        openvmm: [1; 32],
+        kernel: [2; 32],
+        initrd: [3; 32],
+    };
+
+    #[test]
+    fn host_info_lists_templates_only_when_the_setup_enables_platform_snapshots() {
+        use crate::snapshot::DisabledReason;
+
+        let host = HostInfo::new(None, DIGESTS);
+        let json = serde_json::to_value(&host).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"runtimeDigests": {
+                "openvmm": "01".repeat(32), "kernel": "02".repeat(32), "initrd": "03".repeat(32)
+            }})
+        );
+        assert_eq!(serde_json::from_value::<HostInfo>(json).unwrap(), host);
+
+        let host = host_with_templates();
+        let json = serde_json::to_value(&host).unwrap();
+        assert_eq!(
+            json["platformSnapshots"],
+            serde_json::json!({"templates": [
+                {
+                    "class": "noNic",
+                    "state": "ready",
+                    "key": "cd".repeat(32),
+                    "generation": 3,
+                    "capturedAt": "2026-10-29T07:00:00Z"
+                },
+                {"class": "nic", "state": "unavailable", "lastError": "the capture timed out"}
+            ]})
+        );
+        assert_eq!(serde_json::from_value::<HostInfo>(json).unwrap(), host);
+
+        let host = HostInfo::new(None, DIGESTS)
+            .with_platform_snapshots(PlatformSnapshotsInfo::disabled(DisabledReason::GuestDebug));
+        let json = serde_json::to_value(&host).unwrap();
+        assert_eq!(
+            json["platformSnapshots"],
+            serde_json::json!({"disabledReason": "guest-debug", "templates": []})
+        );
+        assert_eq!(serde_json::from_value::<HostInfo>(json).unwrap(), host);
+    }
+
+    #[test]
+    fn host_info_refuses_unknown_fields_and_malformed_templates() {
+        let json = serde_json::to_value(host_with_templates()).unwrap();
+        serde_json::from_value::<HostInfo>(json.clone()).unwrap();
+        let refused = |pointer: &str, field: &str, value: serde_json::Value| {
+            let mut json = json.clone();
+            json.pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), value.clone());
+            assert!(
+                serde_json::from_value::<HostInfo>(json).is_err(),
+                "{pointer}/{field}: {value}"
+            );
+        };
+        refused("", "templates", serde_json::json!([]));
+        refused("/platformSnapshots", "enabled", true.into());
+        refused(
+            "/platformSnapshots",
+            "disabledReason",
+            "image-too-long".into(),
+        );
+        let template = "/platformSnapshots/templates/0";
+        refused(template, "eligible", true.into());
+        refused(template, "class", "no-nic".into());
+        refused(template, "state", "capturing".into());
+        refused(template, "key", "CD".repeat(32).into());
+        refused(template, "generation", (-1).into());
+        refused(template, "capturedAt", "2026-10-29T07:00:00+00:00".into());
+        refused(template, "capturedAt", "2026-10-29 07:00:00Z".into());
+        refused(template, "capturedAt", 1_793_257_200.into());
+        refused(template, "lastError", false.into());
     }
 }
