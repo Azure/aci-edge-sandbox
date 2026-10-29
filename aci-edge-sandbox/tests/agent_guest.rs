@@ -268,13 +268,17 @@ fn assert_none_naming(name: &str, root: &Path, wait: Duration) {
     }
 }
 
-/// Lists the processes named `name`, without the executable suffix, whose command line names a
-/// path in the directory `root`, failing if they cannot be listed.
+/// Lists the processes named `name`, without the executable suffix, one of whose command-line
+/// arguments names a path in the directory `root`, failing if they cannot be listed.
 fn processes_naming(name: &str, root: &Path) -> BTreeSet<u32> {
     let roots = path_forms(root);
     command_lines(name)
         .into_iter()
-        .filter(|(_, line)| roots.iter().any(|root| names_path_in(line, root)))
+        .filter(|(_, arguments)| {
+            arguments
+                .iter()
+                .any(|argument| roots.iter().any(|root| names_path_in(argument, root)))
+        })
         .map(|(pid, _)| pid)
         .collect()
 }
@@ -293,37 +297,31 @@ fn path_forms(root: &Path) -> Vec<String> {
 }
 
 /// Returns `text` as [`names_path_in`] compares it: on Windows, which ignores the case of paths,
-/// in lower case, with backslashes for slashes, and without the prefix of a verbatim path.
+/// in lower case, with backslashes for slashes, and without the prefixes of verbatim paths.
 fn comparable(text: &str) -> String {
     if !cfg!(windows) {
         return text.to_owned();
     }
-    let text = text.to_lowercase().replace('/', "\\");
-    if let Some(share) = text.strip_prefix(r"\\?\unc\") {
-        format!(r"\\{share}")
-    } else if let Some(path) = text.strip_prefix(r"\\?\") {
-        path.to_owned()
-    } else {
-        text
-    }
+    text.to_lowercase()
+        .replace('/', "\\")
+        .replace(r"\\?\unc\", r"\\")
+        .replace(r"\\?\", "")
 }
 
-/// Whether the command line `line` names the directory `root` or a path in it: whether `root`
-/// occurs in it followed by a path separator, or at the end of an argument, so that a sibling
-/// whose name extends `root`'s does not count.
-fn names_path_in(line: &str, root: &str) -> bool {
-    line.match_indices(root).any(|(at, _)| {
-        matches!(
-            line[at + root.len()..].chars().next(),
-            None | Some('/' | '\\' | '"' | '\'' | ' ' | ',')
-        )
+/// Whether the command-line argument `argument` names the directory `root` or a path in it:
+/// whether `root` occurs in it followed by a path separator or by the argument's end, so that a
+/// sibling whose name extends `root`'s, even with a space, does not count.
+fn names_path_in(argument: &str, root: &str) -> bool {
+    argument.match_indices(root).any(|(at, _)| {
+        let rest = &argument[at + root.len()..];
+        rest.is_empty() || rest.starts_with(std::path::MAIN_SEPARATOR)
     })
 }
 
-/// Lists the processes named `name`, without the executable suffix, with their command lines,
-/// as [`comparable`] writes them.
+/// Lists the processes named `name`, without the executable suffix, with their command-line
+/// arguments, as [`comparable`] writes them.
 #[cfg(windows)]
-fn command_lines(name: &str) -> Vec<(u32, String)> {
+fn command_lines(name: &str) -> Vec<(u32, Vec<String>)> {
     assert!(!name.contains('\''), "{name:?}");
     let output = Command::new("powershell.exe")
         .args([
@@ -352,15 +350,60 @@ fn command_lines(name: &str) -> Vec<(u32, String)> {
                 .trim()
                 .parse()
                 .unwrap_or_else(|_| panic!("unexpected process ID {pid:?}"));
-            (pid, comparable(command_line))
+            let arguments = windows_arguments(command_line)
+                .iter()
+                .map(|argument| comparable(argument))
+                .collect();
+            (pid, arguments)
         })
         .collect()
 }
 
-/// Lists the processes named `name` with their command lines, whose arguments it separates with
-/// spaces.
+/// Splits a Windows command line into its arguments, as the C runtime does: spaces and tabs
+/// outside quotes separate them, and `"` begins and ends quoted text, in which `""` is a quote.
+/// Backslashes are literal, except before a `"`: each pair of them is then one backslash, and an
+/// odd one makes the `"` literal.
+#[cfg(windows)]
+fn windows_arguments(command_line: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut chars = command_line.chars().peekable();
+    loop {
+        while chars.next_if(|c| matches!(c, ' ' | '\t')).is_some() {}
+        if chars.peek().is_none() {
+            return arguments;
+        }
+        let (mut argument, mut quoted) = (String::new(), false);
+        loop {
+            let mut backslashes = 0;
+            while chars.next_if_eq(&'\\').is_some() {
+                backslashes += 1;
+            }
+            if chars.next_if_eq(&'"').is_some() {
+                argument.extend(std::iter::repeat_n('\\', backslashes / 2));
+                if backslashes % 2 == 1 || (quoted && chars.next_if_eq(&'"').is_some()) {
+                    argument.push('"');
+                } else {
+                    quoted = !quoted;
+                }
+                continue;
+            }
+            argument.extend(std::iter::repeat_n('\\', backslashes));
+            match chars.peek() {
+                None => break,
+                Some(' ' | '\t') if !quoted => break,
+                Some(&c) => {
+                    argument.push(c);
+                    chars.next();
+                }
+            }
+        }
+        arguments.push(argument);
+    }
+}
+
+/// Lists the processes named `name` with their command-line arguments.
 #[cfg(target_os = "linux")]
-fn command_lines(name: &str) -> Vec<(u32, String)> {
+fn command_lines(name: &str) -> Vec<(u32, Vec<String>)> {
     // The kernel keeps the first 15 bytes of a process's name.
     let name = &name.as_bytes()[..name.len().min(15)];
     let mut found = Vec::new();
@@ -381,14 +424,20 @@ fn command_lines(name: &str) -> Vec<(u32, String)> {
             continue;
         };
         if comm.strip_suffix(b"\n").unwrap_or(&comm) == name {
-            found.push((pid, String::from_utf8_lossy(&arguments).replace('\0', " ")));
+            // Each argument ends with a NUL.
+            let arguments = arguments
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                .collect();
+            found.push((pid, arguments));
         }
     }
     found
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn command_lines(_name: &str) -> Vec<(u32, String)> {
+fn command_lines(_name: &str) -> Vec<(u32, Vec<String>)> {
     panic!("these tests list processes only on Windows and Linux")
 }
 
@@ -702,18 +751,21 @@ fn helper_holds_its_command_line() {
 }
 
 /// The check for leftover OpenVMM processes counts only those of the test's own state root: a
-/// process of another state root, even one whose path extends the test's, does not fail it, and a
-/// process of the test's own does.
+/// process of another state root, even one whose path extends the test's with a hyphen or a space,
+/// does not fail it, and a process of the test's own does.
 #[test]
 #[cfg(any(windows, target_os = "linux"))]
 fn leftover_vm_checks_count_only_the_test_s_own_processes() {
     let parent = tempfile::tempdir().unwrap();
-    let (own, other, bin) = (
+    let (own, others, bin) = (
         parent.path().join("state"),
-        parent.path().join("state-other"),
+        [
+            parent.path().join("state-other"),
+            parent.path().join("state other"),
+        ],
         parent.path().join("bin"),
     );
-    for directory in [&own, &other, &bin] {
+    for directory in [&own, &bin].into_iter().chain(&others) {
         std::fs::create_dir(directory).unwrap();
     }
     // The stand-in for OpenVMM is this test executable, under a name that no test run takes for
@@ -722,7 +774,7 @@ fn leftover_vm_checks_count_only_the_test_s_own_processes() {
     let program = bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
     let hold = |root: &Path| {
-        Command::new(&program)
+        let child = Command::new(&program)
             .args([
                 "helper_holds_its_command_line",
                 "--exact",
@@ -734,14 +786,25 @@ fn leftover_vm_checks_count_only_the_test_s_own_processes() {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
-            .unwrap()
+            .unwrap();
+        // A process may show its command line only after its spawn returned.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !processes_naming(name, root).contains(&child.id()) {
+            assert!(
+                Instant::now() < deadline,
+                "process {} does not name {}",
+                child.id(),
+                root.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        child
     };
 
-    let foreign = hold(&other);
-    assert_eq!(
-        processes_naming(name, &other),
-        BTreeSet::from([foreign.id()])
-    );
+    let foreign = others.each_ref().map(|other| (other, hold(other)));
+    for (other, child) in &foreign {
+        assert_eq!(processes_naming(name, other), BTreeSet::from([child.id()]));
+    }
     assert_eq!(processes_naming(name, &own), BTreeSet::new());
     assert_none_naming(name, &own, Duration::ZERO);
 
@@ -757,13 +820,14 @@ fn leftover_vm_checks_count_only_the_test_s_own_processes() {
         .unwrap_or_default();
     assert!(message.contains(&format!("[{}]", leaked.id())), "{message}");
 
-    for mut child in [foreign, leaked] {
+    for mut child in foreign.map(|(_, child)| child).into_iter().chain([leaked]) {
         drop(child.stdin.take());
         let status = child.wait().unwrap();
         assert!(status.success(), "{status}");
     }
-    assert_none_naming(name, &own, Duration::from_secs(10));
-    assert_none_naming(name, &other, Duration::from_secs(10));
+    for root in [&own].into_iter().chain(&others) {
+        assert_none_naming(name, root, Duration::from_secs(10));
+    }
 }
 
 #[test]
