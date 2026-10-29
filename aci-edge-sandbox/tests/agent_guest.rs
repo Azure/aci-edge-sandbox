@@ -13,9 +13,10 @@
 //! in the image. `registered_references_are_pulled_once_and_staged` checks a registry image only
 //! when `EDGE_AGENT_TEST_IMAGE_REF` names one, with `EDGE_AGENT_TEST_BUNDLE`, a runtime bundle with
 //! the image tool, and `EDGE_AGENT_TEST_BUNDLE_SHA256`, the SHA-256 of its `SOURCE-MANIFEST.json`.
-//! Run the tests one at a time so that the check for leftover OpenVMM processes is
-//! exact, and optimized, since creating a backend hashes the runtime files and registering an
-//! image hashes and copies the image:
+//! Each test fails if an OpenVMM process of its own state root outlives its sandboxes; the VMs of
+//! other tests and hosts on the machine don't count. Run the tests one at a time, since several of
+//! them time their guests, and optimized, since creating a backend hashes the runtime files and
+//! registering an image hashes and copies the image:
 //! `cargo test --release --features agent --test agent_guest -- --ignored --test-threads=1`.
 #![cfg(feature = "agent")]
 
@@ -45,6 +46,7 @@ use aci_edge_sandboxes::{
 
 const HELPER_STATE: &str = "EDGE_AGENT_TEST_HELPER_STATE";
 const HELPER_SANDBOX: &str = "EDGE_AGENT_TEST_HELPER_SANDBOX";
+const HELPER_HOLD: &str = "EDGE_AGENT_TEST_HELPER_HOLD";
 /// Hashing the test image took most of a second of every start before images were registered.
 const MAX_START_OVERHEAD: Duration = Duration::from_millis(500);
 
@@ -227,47 +229,34 @@ fn make_writable(path: &Path) {
     std::fs::set_permissions(path, permissions).unwrap();
 }
 
-/// Lists the OpenVMM processes running on this host, failing if they cannot be listed.
-fn openvmm_processes() -> BTreeSet<u32> {
-    let executable = required("EDGE_AGENT_TEST_OPENVMM");
-    let name = executable
+/// The process name of `EDGE_AGENT_TEST_OPENVMM`.
+fn openvmm_name() -> String {
+    required("EDGE_AGENT_TEST_OPENVMM")
         .file_stem()
         .unwrap()
         .to_string_lossy()
-        .into_owned();
-    #[cfg(windows)]
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("[Diagnostics.Process]::GetProcessesByName('{name}') | ForEach-Object Id"),
-        ])
-        .output()
-        .unwrap();
-    #[cfg(not(windows))]
-    let output = Command::new("pgrep").args(["-x", &name]).output().unwrap();
-    // pgrep exits with 1 when no process matches.
-    assert!(
-        output.status.success() || (cfg!(not(windows)) && output.status.code() == Some(1)),
-        "cannot list OpenVMM processes: {output:?}"
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            line.parse()
-                .unwrap_or_else(|_| panic!("unexpected process ID {line:?}"))
-        })
-        .collect()
+        .into_owned()
 }
 
-/// Fails if an OpenVMM process that was not running before the test is still running.
-fn assert_no_new_openvmm(before: &BTreeSet<u32>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Lists the OpenVMM processes of the test whose state root is `state`: those whose command line
+/// names a path in it, as every launch of its sandboxes and templates does. The VMs of other tests
+/// and other hosts on the machine don't count.
+fn openvmm_processes(state: &Path) -> BTreeSet<u32> {
+    processes_naming(&openvmm_name(), state)
+}
+
+/// Fails if an OpenVMM process of the test whose state root is `state` is still running ten
+/// seconds from now: a VM that outlived its sandbox.
+fn assert_no_new_openvmm(state: &Path) {
+    assert_none_naming(&openvmm_name(), state, Duration::from_secs(10));
+}
+
+/// Fails if a process named `name` whose command line names a path in `root` is still running
+/// after `wait`.
+fn assert_none_naming(name: &str, root: &Path, wait: Duration) {
+    let deadline = Instant::now() + wait;
     loop {
-        let leaked: Vec<u32> = openvmm_processes().difference(before).copied().collect();
+        let leaked: Vec<u32> = processes_naming(name, root).into_iter().collect();
         if leaked.is_empty() {
             return;
         }
@@ -279,7 +268,135 @@ fn assert_no_new_openvmm(before: &BTreeSet<u32>) {
     }
 }
 
-/// Terminates a process abruptly, as a crash would.
+/// Lists the processes named `name`, without the executable suffix, whose command line names a
+/// path in the directory `root`, failing if they cannot be listed.
+fn processes_naming(name: &str, root: &Path) -> BTreeSet<u32> {
+    let roots = path_forms(root);
+    command_lines(name)
+        .into_iter()
+        .filter(|(_, line)| roots.iter().any(|root| names_path_in(line, root)))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// The forms in which a command line may name the directory `root`: as given, and resolved, as
+/// the library opens its state root.
+fn path_forms(root: &Path) -> Vec<String> {
+    let mut forms = vec![comparable(
+        &std::path::absolute(root).unwrap().to_string_lossy(),
+    )];
+    if let Ok(resolved) = std::fs::canonicalize(root) {
+        forms.push(comparable(&resolved.to_string_lossy()));
+    }
+    forms.dedup();
+    forms
+}
+
+/// Returns `text` as [`names_path_in`] compares it: on Windows, which ignores the case of paths,
+/// in lower case, with backslashes for slashes, and without the prefix of a verbatim path.
+fn comparable(text: &str) -> String {
+    if !cfg!(windows) {
+        return text.to_owned();
+    }
+    let text = text.to_lowercase().replace('/', "\\");
+    if let Some(share) = text.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{share}")
+    } else if let Some(path) = text.strip_prefix(r"\\?\") {
+        path.to_owned()
+    } else {
+        text
+    }
+}
+
+/// Whether the command line `line` names the directory `root` or a path in it: whether `root`
+/// occurs in it followed by a path separator, or at the end of an argument, so that a sibling
+/// whose name extends `root`'s does not count.
+fn names_path_in(line: &str, root: &str) -> bool {
+    line.match_indices(root).any(|(at, _)| {
+        matches!(
+            line[at + root.len()..].chars().next(),
+            None | Some('/' | '\\' | '"' | '\'' | ' ' | ',')
+        )
+    })
+}
+
+/// Lists the processes named `name`, without the executable suffix, with their command lines,
+/// as [`comparable`] writes them.
+#[cfg(windows)]
+fn command_lines(name: &str) -> Vec<(u32, String)> {
+    assert!(!name.contains('\''), "{name:?}");
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+                 Get-CimInstance -ClassName Win32_Process -Filter 'Name = ''{name}.exe''' | \
+                 ForEach-Object {{ '{{0}} {{1}}' -f $_.ProcessId, \
+                 ($_.CommandLine -replace '[\\r\\n]', ' ') }}"
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cannot list the {name} processes: {output:?}"
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (pid, command_line) = line.split_once(' ').unwrap_or((line, ""));
+            let pid = pid
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("unexpected process ID {pid:?}"));
+            (pid, comparable(command_line))
+        })
+        .collect()
+}
+
+/// Lists the processes named `name` with their command lines, whose arguments it separates with
+/// spaces.
+#[cfg(target_os = "linux")]
+fn command_lines(name: &str) -> Vec<(u32, String)> {
+    // The kernel keeps the first 15 bytes of a process's name.
+    let name = &name.as_bytes()[..name.len().min(15)];
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap() {
+        let entry = entry.unwrap();
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|text| text.parse().ok())
+        else {
+            continue;
+        };
+        // A process that ends while it is read no longer counts.
+        let (Ok(comm), Ok(arguments)) = (
+            std::fs::read(entry.path().join("comm")),
+            std::fs::read(entry.path().join("cmdline")),
+        ) else {
+            continue;
+        };
+        if comm.strip_suffix(b"\n").unwrap_or(&comm) == name {
+            found.push((pid, String::from_utf8_lossy(&arguments).replace('\0', " ")));
+        }
+    }
+    found
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn command_lines(_name: &str) -> Vec<(u32, String)> {
+    panic!("these tests list processes only on Windows and Linux")
+}
+
+/// Terminates a process abruptly, as a crash would, and waits until it is gone.
+///
+/// The checks for leftover OpenVMM processes no longer see a process once it exits: its command
+/// line no longer names its state root then. On Linux, the library still finds the process of a
+/// VM that exited until its parent reaps it, so the wait lasts until then.
 fn kill_process(pid: u32) {
     #[cfg(windows)]
     let status = Command::new("powershell.exe")
@@ -287,7 +404,11 @@ fn kill_process(pid: u32) {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &format!("Stop-Process -Id {pid} -Force -ErrorAction Stop"),
+            &format!(
+                "Stop-Process -Id {pid} -Force -ErrorAction Stop; \
+                 $process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
+                 if ($process -and -not $process.WaitForExit(30000)) {{ exit 1 }}"
+            ),
         ])
         .status()
         .unwrap();
@@ -297,6 +418,14 @@ fn kill_process(pid: u32) {
         .status()
         .unwrap();
     assert!(status.success(), "cannot kill process {pid}: {status}");
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(Instant::now() < deadline, "process {pid} was not reaped");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 /// Stops and removes a sandbox when a test ends, printing its diagnostics if the test failed.
@@ -563,6 +692,81 @@ fn start_in_helper(state: &Path, id: &SandboxId) -> Child {
 }
 
 #[test]
+#[ignore = "helper process for leftover_vm_checks_count_only_the_test_s_own_processes"]
+fn helper_holds_its_command_line() {
+    if std::env::var_os(HELPER_HOLD).is_none() {
+        return;
+    }
+    // Runs until the test ends its standard input.
+    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
+}
+
+/// The check for leftover OpenVMM processes counts only those of the test's own state root: a
+/// process of another state root, even one whose path extends the test's, does not fail it, and a
+/// process of the test's own does.
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn leftover_vm_checks_count_only_the_test_s_own_processes() {
+    let parent = tempfile::tempdir().unwrap();
+    let (own, other, bin) = (
+        parent.path().join("state"),
+        parent.path().join("state-other"),
+        parent.path().join("bin"),
+    );
+    for directory in [&own, &other, &bin] {
+        std::fs::create_dir(directory).unwrap();
+    }
+    // The stand-in for OpenVMM is this test executable, under a name that no test run takes for
+    // OpenVMM's. It names a path on its command line as a filter that selects no other test.
+    let name = "openvmm-probe";
+    let program = bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
+    let hold = |root: &Path| {
+        Command::new(&program)
+            .args([
+                "helper_holds_its_command_line",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .arg(root.join("sandbox").join("control"))
+            .env(HELPER_HOLD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+
+    let foreign = hold(&other);
+    assert_eq!(
+        processes_naming(name, &other),
+        BTreeSet::from([foreign.id()])
+    );
+    assert_eq!(processes_naming(name, &own), BTreeSet::new());
+    assert_none_naming(name, &own, Duration::ZERO);
+
+    let leaked = hold(&own);
+    assert_eq!(processes_naming(name, &own), BTreeSet::from([leaked.id()]));
+    let failed = std::panic::catch_unwind(|| {
+        assert_none_naming(name, &own, Duration::from_millis(300));
+    })
+    .expect_err("a leftover process of the test's own state root passed the check");
+    let message = failed
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or_default();
+    assert!(message.contains(&format!("[{}]", leaked.id())), "{message}");
+
+    for mut child in [foreign, leaked] {
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{status}");
+    }
+    assert_none_naming(name, &own, Duration::from_secs(10));
+    assert_none_naming(name, &other, Duration::from_secs(10));
+}
+
+#[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn guest_lifecycle_stops_gracefully_and_cleans_up() {
     let state = tempfile::tempdir().unwrap();
@@ -668,7 +872,6 @@ fn guest_lifecycle_stops_gracefully_and_cleans_up() {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn exec_reports_exit_codes_timeouts_and_unlimited_output() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -765,14 +968,13 @@ fn exec_reports_exit_codes_timeouts_and_unlimited_output() {
 
     assert_graceful(client.stop(id));
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn lifecycle_errors_follow_state_and_a_stopped_sandbox_restarts() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -798,14 +1000,13 @@ fn lifecycle_errors_follow_state_and_a_stopped_sandbox_restarts() {
     assert_graceful(client.stop(id));
     client.deprovision(id).unwrap();
     assert_eq!(failure(client.start(id)), ErrorCode::StaleId);
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn new_backend_reattaches_to_a_running_guest_and_forces_a_stop() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let id = {
         let first = backend(state.path());
         let client = AciEdgeSandbox::from_shared(first.clone());
@@ -837,14 +1038,13 @@ fn new_backend_reattaches_to_a_running_guest_and_forces_a_stop() {
         ErrorCode::NotStarted
     );
     client.deprovision(&sandbox.id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn a_crashed_guest_is_not_running_and_restarts_with_its_console_captured() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend_with(state.path(), true, |_| {});
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -852,10 +1052,10 @@ fn a_crashed_guest_is_not_running_and_restarts_with_its_console_captured() {
     client.start(id).unwrap();
     assert_prints(&client, id, "before-crash");
 
-    let launched: Vec<u32> = openvmm_processes().difference(&before).copied().collect();
+    let launched: Vec<u32> = openvmm_processes(state.path()).into_iter().collect();
     assert_eq!(launched.len(), 1, "{launched:?}");
     kill_process(launched[0]);
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
     assert_eq!(
         failure(client.exec(id, &ExecRequest::command_line("true"))),
         ErrorCode::NotStarted
@@ -873,7 +1073,7 @@ fn a_crashed_guest_is_not_running_and_restarts_with_its_console_captured() {
         "the restarted guest's boot console was not captured ({crashed} -> {restarted} bytes)"
     );
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -891,7 +1091,6 @@ fn helper_starts_a_sandbox_in_another_process() {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn guest_survives_its_caller_and_a_killed_start_leaves_no_vm() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend_with(state.path(), false, |setup| {
         setup.timeouts.stop_ms = 5_000;
     });
@@ -907,7 +1106,7 @@ fn guest_survives_its_caller_and_a_killed_start_leaves_no_vm() {
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.id).unwrap();
     drop(sandbox);
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 
     for delay in [0, 100, 300, 700, 1500] {
         let sandbox = provision(&client, &backend);
@@ -924,7 +1123,7 @@ fn guest_survives_its_caller_and_a_killed_start_leaves_no_vm() {
             panic!("deprovision after a start killed at {delay} ms failed: {error}")
         });
         drop(sandbox);
-        assert_no_new_openvmm(&before);
+        assert_no_new_openvmm(state.path());
     }
 }
 
@@ -932,7 +1131,6 @@ fn guest_survives_its_caller_and_a_killed_start_leaves_no_vm() {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn parallel_sandboxes_and_repeated_restarts_stay_isolated() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
 
@@ -953,7 +1151,7 @@ fn parallel_sandboxes_and_repeated_restarts_stay_isolated() {
             worker.join().unwrap();
         }
     });
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 
     let sandbox = provision(&client, &backend);
     let mut starts = Vec::new();
@@ -980,14 +1178,13 @@ fn parallel_sandboxes_and_repeated_restarts_stay_isolated() {
                 < MAX_START_OVERHEAD.as_millis()),
         "starts spent more than {MAX_START_OVERHEAD:?} outside the guest boot: {starts:?}"
     );
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn concurrent_commands_share_one_guest() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1026,14 +1223,13 @@ fn concurrent_commands_share_one_guest() {
     );
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn exec_streams_output_and_input_while_the_workload_runs() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1142,14 +1338,13 @@ fn exec_streams_output_and_input_while_the_workload_runs() {
 
     assert_graceful(client.stop(id));
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn cancelled_timed_out_and_finished_executions_leave_nothing_running() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1249,14 +1444,13 @@ fn cancelled_timed_out_and_finished_executions_leave_nothing_running() {
 
     assert_graceful(client.stop(id));
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn executions_run_concurrently_without_stalling_each_other() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1366,7 +1560,7 @@ fn executions_run_concurrently_without_stalling_each_other() {
         );
     }
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -1395,7 +1589,6 @@ fn helper_runs_a_command_in_another_process() {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn executions_end_with_their_caller_and_their_sandbox() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1446,14 +1639,13 @@ fn executions_end_with_their_caller_and_their_sandbox() {
     assert!(matches!(outcome, ExecOutcome::Signaled(_)), "{outcome:?}");
 
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn registered_images_are_staged_and_start_without_hashing() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let image = copied_image(state.path());
     let created = Instant::now();
     let first = AgentBackend::new(native_config(state.path(), &image)).unwrap();
@@ -1548,14 +1740,13 @@ fn registered_images_are_staged_and_start_without_hashing() {
         "no longer registered",
     );
     assert!(image.is_file());
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn trusted_digests_and_approved_runtime_files_follow_their_contracts() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let image = copied_image(state.path());
 
     // A trusted digest is recorded without hashing, even one that the content does not have, and
@@ -1618,7 +1809,7 @@ fn trusted_digests_and_approved_runtime_files_follow_their_contracts() {
     trusting.verify_image(&actual).unwrap();
     let reopened = AgentBackend::new(native_config(state.path(), &image)).unwrap();
     assert_eq!(reopened.image_id(), Some(actual));
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -1650,7 +1841,6 @@ fn registered_references_are_pulled_once_and_staged() {
         return;
     };
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let config = adjusted(
         native_config(state.path(), &required("EDGE_AGENT_TEST_IMAGE")),
         |setup| {
@@ -1705,7 +1895,7 @@ fn registered_references_are_pulled_once_and_staged() {
         client.provision_with(&ProvisionRequest::new(), &spec),
         "register it first",
     );
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -1713,7 +1903,6 @@ fn registered_references_are_pulled_once_and_staged() {
 fn host_paths_follow_the_filesystem_policy() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let work = host.path().join("work");
     for directory in ["src/secret", "out/frozen", "other"] {
         std::fs::create_dir_all(work.join(directory)).unwrap();
@@ -1821,7 +2010,7 @@ fn host_paths_follow_the_filesystem_policy() {
     assert_graceful(client.stop(id));
     client.deprovision(&sandbox.release()).unwrap();
     assert!(!src.join("new").exists());
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Reports what the guest reaches through aliases of the denied paths `secret` and `secret.txt`
@@ -1905,7 +2094,6 @@ fn host_link(target: &Path, link: &Path, directory: bool) {
 fn denied_paths_stay_hidden_through_aliases() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let root = host.path().join("shared");
     for directory in ["secret", "sub", "links", "hard"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
@@ -2022,7 +2210,7 @@ fn denied_paths_stay_hidden_through_aliases() {
     for absent in ["moved", "guest-hard-link", "secret/new"] {
         assert!(!root.join(absent).exists(), "{absent}");
     }
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Reports the workload's capabilities and the outcome of operations that would lift its mount
@@ -2068,7 +2256,6 @@ print(json.dumps({
 fn workloads_cannot_lift_their_mount_restrictions() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let (out, frozen) = (host.path().join("out"), host.path().join("frozen"));
     for directory in [&out, &frozen] {
         std::fs::create_dir(directory).unwrap();
@@ -2114,7 +2301,7 @@ fn workloads_cannot_lift_their_mount_restrictions() {
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
     assert!(out.join("written").is_file() && !frozen.join("new").exists());
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -2122,7 +2309,6 @@ fn workloads_cannot_lift_their_mount_restrictions() {
 fn replaced_host_objects_inside_a_writable_mapping_fail_the_next_start() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let out = host.path().join("out");
     let (cache, secret, moved) = (out.join("cache"), out.join("secret"), out.join("moved"));
     for directory in [&cache, &secret] {
@@ -2156,7 +2342,7 @@ fn replaced_host_objects_inside_a_writable_mapping_fail_the_next_start() {
         assert_graceful(client.stop(id));
     }
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -2164,7 +2350,6 @@ fn replaced_host_objects_inside_a_writable_mapping_fail_the_next_start() {
 fn every_mapping_that_fits_the_openvmm_command_line_reaches_the_guest() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let request = |directories: &[PathBuf]| {
         ProvisionRequest::new().with_filesystem(FilesystemPolicy {
             readonly_paths: directories.to_vec(),
@@ -2230,7 +2415,7 @@ fn every_mapping_that_fits_the_openvmm_command_line_reaches_the_guest() {
     eprintln!("{fitting} mappings fit the OpenVMM command line");
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Reports the guest's interfaces, source address, and resolver, and whether it reaches the
@@ -2329,7 +2514,6 @@ impl Drop for Services {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn network_policies_are_enforced() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let host = host_address();
     // The guest must reach the host through its gateway rather than consider it on-link.
     let (guest_network, guest_address, gateway) = if host.octets()[..3] == [10, 0, 0] {
@@ -2474,7 +2658,7 @@ fn network_policies_are_enforced() {
         assert_graceful(client.stop(&sandbox.id));
         client.deprovision(&sandbox.release()).unwrap();
     }
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Reports the guest's proxy variables and whether it reaches the proxy, the proxy's port over
@@ -2583,7 +2767,6 @@ fn guest_network_for(host: Ipv4Addr) -> (&'static str, &'static str) {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn a_loopback_proxy_is_the_only_way_out() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let host = host_address();
     let (guest_network, gateway) = guest_network_for(host);
     let (proxy, datagrams) = tcp_and_udp_on_one_port();
@@ -2679,7 +2862,7 @@ fn a_loopback_proxy_is_the_only_way_out() {
     }
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Serves one TCP connection and one UDP datagram on the given guest ports, then exits. It gives
@@ -2737,7 +2920,6 @@ fn host_loopback_is_bidirectional_and_explicit_forwards_still_work() {
     use std::net::TcpStream;
 
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let host = host_address();
     let (guest_network, gateway) = guest_network_for(host);
     let loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -2884,14 +3066,13 @@ fn host_loopback_is_bidirectional_and_explicit_forwards_still_work() {
     assert_eq!(printed, "loopback\n");
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn exec_environments_layer_over_the_guest_defaults() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = started(&client, &backend, &ProvisionRequest::new());
@@ -2973,5 +3154,5 @@ fn exec_environments_layer_over_the_guest_defaults() {
     assert_prints(&client, &sandbox.id, "still-running");
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
