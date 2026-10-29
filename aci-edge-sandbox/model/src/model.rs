@@ -8,9 +8,12 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::error::Error;
 use crate::id::SandboxId;
+use crate::snapshot::{BootMode, ColdReason, TemplateGeneration};
 
 /// Backend-defined metadata returned by lifecycle operations.
 ///
@@ -729,12 +732,98 @@ pub struct ProvisionResult {
 }
 
 /// Result of `AciEdgeSandbox::start`.
+///
+/// Typed accessors read the metadata that reports [platform snapshots](crate::snapshot):
+/// [`boot_mode`](Self::boot_mode), [`cold_reason`](Self::cold_reason), and
+/// [`template`](Self::template).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartResult {
     /// Backend-defined metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
+}
+
+impl StartResult {
+    /// Metadata key of [`boot_mode`](Self::boot_mode).
+    pub const BOOT_MODE: &'static str = "bootMode";
+    /// Metadata key of [`cold_reason`](Self::cold_reason).
+    pub const COLD_REASON: &'static str = "coldReason";
+    /// Metadata key of [`template`](Self::template).
+    pub const TEMPLATE: &'static str = "template";
+
+    /// Returns how the sandbox started, from the metadata's `bootMode`, which the agent library
+    /// sets on every start. Returns `None` if the metadata lacks it, and
+    /// [`ErrorCode::BackendError`](crate::ErrorCode::BackendError) if it is malformed.
+    pub fn boot_mode(&self) -> crate::error::Result<Option<BootMode>> {
+        self.metadata_value(Self::BOOT_MODE)
+    }
+
+    /// Returns why the sandbox cold booted although its host's setup enables platform snapshots,
+    /// from the metadata's `coldReason`, which is set only then. Returns `None` if the metadata
+    /// lacks it, and [`ErrorCode::BackendError`](crate::ErrorCode::BackendError) if it is
+    /// malformed.
+    pub fn cold_reason(&self) -> crate::error::Result<Option<ColdReason>> {
+        self.metadata_value(Self::COLD_REASON)
+    }
+
+    /// Returns the template that the sandbox started as a clone of, from the metadata's
+    /// `template`, which is set only for a clone. Returns `None` if the metadata lacks it, and
+    /// [`ErrorCode::BackendError`](crate::ErrorCode::BackendError) if it is malformed.
+    pub fn template(&self) -> crate::error::Result<Option<TemplateGeneration>> {
+        self.metadata_value(Self::TEMPLATE)
+    }
+
+    /// Sets the metadata's `bootMode`.
+    #[must_use]
+    pub fn with_boot_mode(self, mode: BootMode) -> Self {
+        self.with_metadata(Self::BOOT_MODE, mode.as_str().into())
+    }
+
+    /// Sets the metadata's `coldReason`.
+    #[must_use]
+    pub fn with_cold_reason(self, reason: ColdReason) -> Self {
+        self.with_metadata(Self::COLD_REASON, reason.as_str().into())
+    }
+
+    /// Sets the metadata's `template`.
+    #[must_use]
+    pub fn with_template(self, template: TemplateGeneration) -> Self {
+        let TemplateGeneration {
+            class,
+            key,
+            generation,
+        } = template;
+        self.with_metadata(
+            Self::TEMPLATE,
+            serde_json::json!({
+                "class": class.as_str(),
+                "key": key.to_string(),
+                "generation": generation,
+            }),
+        )
+    }
+
+    fn metadata_value<T: DeserializeOwned>(&self, key: &str) -> crate::error::Result<Option<T>> {
+        let Some(value) = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(key))
+        else {
+            return Ok(None);
+        };
+        T::deserialize(value).map(Some).map_err(|error| {
+            Error::backend_error(format!("the start metadata's {key} is malformed"))
+                .with_source(error)
+        })
+    }
+
+    fn with_metadata(mut self, key: &str, value: serde_json::Value) -> Self {
+        self.metadata
+            .get_or_insert_with(Metadata::new)
+            .insert(key.to_owned(), value);
+        self
+    }
 }
 
 /// Result of `AciEdgeSandbox::stop`.
@@ -1011,6 +1100,127 @@ mod tests {
                 error.contains("process.timeout in whole milliseconds from 0 through 4294967295"),
                 "{invalid}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn start_metadata_reports_how_a_sandbox_started() {
+        use crate::snapshot::{TemplateClass, TemplateKey};
+
+        // Metadata without the keys, or none at all, reports nothing.
+        let other: StartResult =
+            serde_json::from_str(r#"{"metadata": {"bootMilliseconds": 120}}"#).unwrap();
+        for result in [StartResult::default(), other] {
+            assert_eq!(result.boot_mode().unwrap(), None);
+            assert_eq!(result.cold_reason().unwrap(), None);
+            assert_eq!(result.template().unwrap(), None);
+        }
+
+        let template =
+            TemplateGeneration::new(TemplateClass::Nic, TemplateKey::from_bytes([0x5a; 32]), 3);
+        let clone = StartResult::default()
+            .with_boot_mode(BootMode::Clone)
+            .with_template(template);
+        let json = serde_json::to_value(&clone).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"metadata": {
+                "bootMode": "clone",
+                "template": {"class": "nic", "key": "5a".repeat(32), "generation": 3}
+            }})
+        );
+        let clone: StartResult = serde_json::from_value(json).unwrap();
+        assert_eq!(clone.boot_mode().unwrap(), Some(BootMode::Clone));
+        assert_eq!(clone.cold_reason().unwrap(), None);
+        assert_eq!(clone.template().unwrap(), Some(template));
+
+        // The setters keep the backend's other metadata.
+        let mut metadata = Metadata::new();
+        metadata.insert("bootMilliseconds".to_owned(), 950.into());
+        let cold = StartResult {
+            metadata: Some(metadata),
+        }
+        .with_boot_mode(BootMode::Cold)
+        .with_cold_reason(ColdReason::ImageTooLong);
+        assert_eq!(
+            serde_json::to_value(&cold).unwrap(),
+            serde_json::json!({"metadata": {
+                "bootMilliseconds": 950,
+                "bootMode": "cold",
+                "coldReason": "image-too-long"
+            }})
+        );
+        assert_eq!(cold.boot_mode().unwrap(), Some(BootMode::Cold));
+        assert_eq!(cold.cold_reason().unwrap(), Some(ColdReason::ImageTooLong));
+        assert_eq!(cold.template().unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_start_metadata_is_a_backend_error() {
+        let key = "5a".repeat(32);
+        for (field, value) in [
+            ("bootMode", serde_json::json!("warm")),
+            ("bootMode", serde_json::json!("Clone")),
+            ("bootMode", serde_json::json!({"clone": null})),
+            ("bootMode", serde_json::json!(null)),
+            ("bootMode", serde_json::json!(1)),
+            ("coldReason", serde_json::json!("guest_debug")),
+            ("coldReason", serde_json::json!({"guest-debug": null})),
+            ("coldReason", serde_json::json!(["guest-debug"])),
+            (
+                "template",
+                serde_json::json!({"class": "nic", "key": key.to_uppercase(), "generation": 3}),
+            ),
+            (
+                "template",
+                serde_json::json!({"class": "noNIC", "key": key, "generation": 3}),
+            ),
+            (
+                "template",
+                serde_json::json!({"class": {"nic": null}, "key": key, "generation": 3}),
+            ),
+            ("template", serde_json::json!(["nic", key, 3])),
+            ("template", serde_json::json!({"class": "nic", "key": key})),
+            (
+                "template",
+                serde_json::json!({"class": "nic", "key": key, "generation": -1}),
+            ),
+            (
+                "template",
+                serde_json::json!({"class": "nic", "key": key, "generation": 3, "state": "ready"}),
+            ),
+            ("template", serde_json::json!("nic")),
+        ] {
+            let mut metadata = Metadata::new();
+            metadata.insert(field.to_owned(), value.clone());
+            let result = StartResult {
+                metadata: Some(metadata),
+            };
+            let error = match field {
+                "bootMode" => result.boot_mode().map(drop),
+                "coldReason" => result.cold_reason().map(drop),
+                _ => result.template().map(drop),
+            }
+            .unwrap_err();
+            assert_eq!(
+                error.code(),
+                crate::ErrorCode::BackendError,
+                "{field}: {value}"
+            );
+            assert_eq!(
+                error.message(),
+                format!("the start metadata's {field} is malformed")
+            );
+            // The other keys are read on their own.
+            if field != "bootMode" {
+                assert_eq!(result.boot_mode().unwrap(), None);
+            }
+            if field != "coldReason" {
+                assert_eq!(result.cold_reason().unwrap(), None);
+            }
+            if field != "template" {
+                assert_eq!(result.template().unwrap(), None);
+            }
         }
     }
 }

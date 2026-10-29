@@ -58,6 +58,10 @@ pub struct SetupConfig {
     /// Diagnostic switches.
     #[serde(default)]
     pub diagnostics: Diagnostics,
+    /// Platform snapshots: templates that sandboxes start as clones of. `None` disables them, as
+    /// `enabled: false` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_snapshots: Option<PlatformSnapshots>,
 }
 
 fn schema_version() -> u32 {
@@ -82,6 +86,7 @@ impl SetupConfig {
             images: ImageSettings::default(),
             exec: ExecSettings::default(),
             diagnostics: Diagnostics::default(),
+            platform_snapshots: None,
         }
     }
 
@@ -120,6 +125,13 @@ impl SetupConfig {
         self
     }
 
+    /// Sets the platform snapshots.
+    #[must_use]
+    pub fn with_platform_snapshots(mut self, platform_snapshots: PlatformSnapshots) -> Self {
+        self.platform_snapshots = Some(platform_snapshots);
+        self
+    }
+
     /// Checks the configuration's structure without touching the host, reporting
     /// [`ErrorCode::MalformedRequest`](crate::ErrorCode::MalformedRequest).
     pub fn validate(&self) -> Result<()> {
@@ -138,7 +150,11 @@ impl SetupConfig {
         self.guest_session.validate()?;
         self.defaults.validate()?;
         self.images.validate()?;
-        self.exec.validate()
+        self.exec.validate()?;
+        if let Some(platform_snapshots) = &self.platform_snapshots {
+            platform_snapshots.validate(&self.defaults)?;
+        }
+        Ok(())
     }
 }
 
@@ -622,6 +638,133 @@ pub struct Diagnostics {
     pub guest_debug: bool,
 }
 
+/// Platform snapshots: templates that the host captures when it first opens the setup, so that
+/// sandboxes start as clones of them instead of cold booting.
+///
+/// The host captures two templates, microVM snapshots that hold no tenant data: one without a
+/// NIC, and one with a deny-all NIC on the default guest network,
+/// [`SandboxDefaults::guest_network`]. They boot with the default memory of
+/// [`SandboxDefaults::resources`], so while platform snapshots are enabled, that memory must be a
+/// whole number of [`MEMORY_BLOCK_MIB`](Self::MEMORY_BLOCK_MIB) blocks, and no more than
+/// [`max_memory_mib`](Self::max_memory_mib). Every start that a template fits starts as a clone
+/// of it, and every other start cold boots and says why; see [`crate::snapshot`].
+///
+/// It serializes as `{"enabled": true, "maxVcpus": 4, "maxMemoryMib": 8192}`, with an optional
+/// `maxImageMib`. [`SetupConfig::validate`] checks each field that is present, whether or not
+/// `enabled` is true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[non_exhaustive]
+pub struct PlatformSnapshots {
+    /// Whether the host keeps templates. When it is false, as when this object is absent, every
+    /// sandbox cold boots.
+    pub enabled: bool,
+    /// The processor capacity of the templates: 1, 2, 4, or 8. A clone may have any of 1, 2, 4,
+    /// or 8 virtual processors up to it. Required when [`enabled`](Self::enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vcpus: Option<u32>,
+    /// The memory capacity of the templates, in MiB: a positive multiple of 128. A clone's memory
+    /// is whole 128 MiB blocks, from the default memory up to it. Required when
+    /// [`enabled`](Self::enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mib: Option<u32>,
+    /// The longest image that a clone can use, in MiB; longer images cold boot. `None` selects
+    /// [`DEFAULT_MAX_IMAGE_MIB`](Self::DEFAULT_MAX_IMAGE_MIB), as
+    /// [`max_image_mib()`](Self::max_image_mib()) returns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_image_mib: Option<u32>,
+}
+
+impl PlatformSnapshots {
+    /// The numbers of virtual processors that a template's capacity, and a clone, may have.
+    pub const VCPU_COUNTS: [u32; 4] = [1, 2, 4, 8];
+    /// The block, in MiB, of which a template's memory and a clone's are whole numbers.
+    pub const MEMORY_BLOCK_MIB: u32 = 128;
+    /// The longest image that a clone can use by default, in MiB: 64 GiB.
+    pub const DEFAULT_MAX_IMAGE_MIB: u32 = 64 * 1024;
+
+    /// Enables platform snapshots with these capacities and the default image capacity.
+    pub fn new(max_vcpus: u32, max_memory_mib: u32) -> Self {
+        Self {
+            enabled: true,
+            max_vcpus: Some(max_vcpus),
+            max_memory_mib: Some(max_memory_mib),
+            max_image_mib: None,
+        }
+    }
+
+    /// Disables platform snapshots, as an absent object does.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            max_vcpus: None,
+            max_memory_mib: None,
+            max_image_mib: None,
+        }
+    }
+
+    /// Sets the longest image that a clone can use, in MiB.
+    #[must_use]
+    pub fn with_max_image_mib(mut self, max_image_mib: u32) -> Self {
+        self.max_image_mib = Some(max_image_mib);
+        self
+    }
+
+    /// Returns the longest image that a clone can use, in MiB: the field's value, or
+    /// [`DEFAULT_MAX_IMAGE_MIB`](Self::DEFAULT_MAX_IMAGE_MIB) when it is unset.
+    pub fn max_image_mib(&self) -> u32 {
+        self.max_image_mib.unwrap_or(Self::DEFAULT_MAX_IMAGE_MIB)
+    }
+
+    fn validate(&self, defaults: &SandboxDefaults) -> Result<()> {
+        if let Some(vcpus) = self.max_vcpus
+            && !Self::VCPU_COUNTS.contains(&vcpus)
+        {
+            return Err(Error::malformed_request(format!(
+                "setup platformSnapshots.maxVcpus must be 1, 2, 4, or 8, not {vcpus}"
+            )));
+        }
+        if let Some(memory_mib) = self.max_memory_mib
+            && (memory_mib == 0 || !memory_mib.is_multiple_of(Self::MEMORY_BLOCK_MIB))
+        {
+            return Err(Error::malformed_request(format!(
+                "setup platformSnapshots.maxMemoryMib must be a positive multiple of {}, not \
+                 {memory_mib}",
+                Self::MEMORY_BLOCK_MIB
+            )));
+        }
+        if self.max_image_mib == Some(0) {
+            return Err(Error::malformed_request(
+                "setup platformSnapshots.maxImageMib must be positive",
+            ));
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        let (Some(_), Some(max_memory_mib)) = (self.max_vcpus, self.max_memory_mib) else {
+            return Err(Error::malformed_request(
+                "setup platformSnapshots must set maxVcpus and maxMemoryMib when enabled",
+            ));
+        };
+        // The templates boot with the default memory.
+        let memory_mib = defaults.resources.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB);
+        if !memory_mib.is_multiple_of(Self::MEMORY_BLOCK_MIB) {
+            return Err(Error::malformed_request(format!(
+                "setup defaults.resources.memoryMib must be a multiple of {} when platform \
+                 snapshots are enabled, not {memory_mib}",
+                Self::MEMORY_BLOCK_MIB
+            )));
+        }
+        if memory_mib > max_memory_mib {
+            return Err(Error::malformed_request(format!(
+                "setup defaults.resources.memoryMib, {memory_mib}, must not exceed \
+                 platformSnapshots.maxMemoryMib, {max_memory_mib}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,5 +989,176 @@ mod tests {
             error.message(),
             "unknown hypervisor \"hyperv\"; choose kvm, mshv, or whp"
         );
+    }
+
+    #[test]
+    fn platform_snapshots_are_omitted_until_set_and_round_trip() {
+        let config = SetupConfig::new("/var/lib/nvx", files());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("platformSnapshots"), "{json}");
+        for (snapshots, expected) in [
+            (
+                PlatformSnapshots::new(4, 8192),
+                serde_json::json!({"enabled": true, "maxVcpus": 4, "maxMemoryMib": 8192}),
+            ),
+            (
+                PlatformSnapshots::new(8, 16384).with_max_image_mib(131_072),
+                serde_json::json!({
+                    "enabled": true, "maxVcpus": 8, "maxMemoryMib": 16384, "maxImageMib": 131072
+                }),
+            ),
+            (
+                PlatformSnapshots::disabled(),
+                serde_json::json!({"enabled": false}),
+            ),
+        ] {
+            let config =
+                SetupConfig::new("/var/lib/nvx", files()).with_platform_snapshots(snapshots);
+            config.validate().unwrap();
+            let json = serde_json::to_value(&config).unwrap();
+            assert_eq!(json["platformSnapshots"], expected);
+            assert_eq!(serde_json::from_value::<SetupConfig>(json).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn platform_snapshots_refuse_unknown_and_missing_fields() {
+        for json in [
+            r#"{"enabled": true, "maxVcpus": 4, "maxMemoryMib": 8192, "maxImageSize": 1}"#,
+            r#"{"enabled": true, "maxVcpus": 4, "maxMemoryMib": 8192, "minVcpus": 1}"#,
+            r#"{"maxVcpus": 4, "maxMemoryMib": 8192}"#,
+            r#"{"enabled": "true"}"#,
+            r#"{"enabled": true, "maxVcpus": -1, "maxMemoryMib": 8192}"#,
+            r#"{"enabled": true, "maxVcpus": 4, "maxMemoryMib": 8192, "maxImageMib": 4294967296}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PlatformSnapshots>(json).is_err(),
+                "{json}"
+            );
+        }
+        let config = SetupConfig::new("/var/lib/nvx", files())
+            .with_platform_snapshots(PlatformSnapshots::new(4, 8192));
+        let mut json = serde_json::to_value(&config).unwrap();
+        json["platformSnapshots"]["maxVcpu"] = 4.into();
+        assert!(serde_json::from_value::<SetupConfig>(json).is_err());
+    }
+
+    #[test]
+    fn platform_snapshots_default_to_a_64_gib_image_capacity() {
+        let snapshots: PlatformSnapshots =
+            serde_json::from_str(r#"{"enabled": true, "maxVcpus": 4, "maxMemoryMib": 8192}"#)
+                .unwrap();
+        assert_eq!(snapshots.max_image_mib, None);
+        assert_eq!(snapshots.max_image_mib(), 65_536);
+        assert_eq!(snapshots.with_max_image_mib(1024).max_image_mib(), 1024);
+    }
+
+    #[test]
+    fn platform_snapshots_validate_each_field_present() {
+        let config = |snapshots: PlatformSnapshots| {
+            SetupConfig::new("/var/lib/nvx", files()).with_platform_snapshots(snapshots)
+        };
+        let with_memory = |memory_mib: u32, snapshots: PlatformSnapshots| {
+            let mut config = config(snapshots);
+            config.defaults.resources.memory_mib = Some(memory_mib);
+            config
+        };
+        let disabled = PlatformSnapshots::disabled();
+        let enabled = PlatformSnapshots::new(4, 8192);
+        for vcpus in [1, 2, 4, 8] {
+            config(PlatformSnapshots::new(vcpus, 8192))
+                .validate()
+                .unwrap();
+        }
+        for good in [
+            // The capacity may equal the default memory, 256 MiB.
+            config(PlatformSnapshots::new(1, 256).with_max_image_mib(1)),
+            with_memory(1024, PlatformSnapshots::new(2, 1024)),
+            with_memory(128, PlatformSnapshots::new(8, 4_294_967_168)),
+            config(disabled),
+            // Only snapshots that are enabled constrain the default memory.
+            with_memory(
+                300,
+                PlatformSnapshots {
+                    max_memory_mib: Some(256),
+                    ..disabled
+                },
+            ),
+        ] {
+            good.validate().unwrap();
+        }
+        for (bad, field) in [
+            (
+                config(PlatformSnapshots::new(0, 8192)),
+                "platformSnapshots.maxVcpus",
+            ),
+            (
+                config(PlatformSnapshots::new(3, 8192)),
+                "platformSnapshots.maxVcpus",
+            ),
+            (
+                config(PlatformSnapshots::new(16, 8192)),
+                "platformSnapshots.maxVcpus",
+            ),
+            (
+                config(PlatformSnapshots::new(4, 0)),
+                "platformSnapshots.maxMemoryMib",
+            ),
+            (
+                config(PlatformSnapshots::new(4, 8000)),
+                "platformSnapshots.maxMemoryMib",
+            ),
+            (
+                config(enabled.with_max_image_mib(0)),
+                "platformSnapshots.maxImageMib",
+            ),
+            // Snapshots that are disabled are checked as well.
+            (
+                config(PlatformSnapshots {
+                    max_vcpus: Some(3),
+                    ..disabled
+                }),
+                "platformSnapshots.maxVcpus",
+            ),
+            (
+                config(PlatformSnapshots {
+                    max_memory_mib: Some(100),
+                    ..disabled
+                }),
+                "platformSnapshots.maxMemoryMib",
+            ),
+            (
+                config(disabled.with_max_image_mib(0)),
+                "platformSnapshots.maxImageMib",
+            ),
+            // Snapshots that are enabled need both capacities.
+            (
+                config(PlatformSnapshots {
+                    max_vcpus: None,
+                    ..enabled
+                }),
+                "platformSnapshots must set maxVcpus and maxMemoryMib",
+            ),
+            (
+                config(PlatformSnapshots {
+                    max_memory_mib: None,
+                    ..enabled
+                }),
+                "platformSnapshots must set maxVcpus and maxMemoryMib",
+            ),
+            // The templates boot with the default memory.
+            (
+                with_memory(300, enabled),
+                "defaults.resources.memoryMib must be a multiple of 128",
+            ),
+            (
+                with_memory(1024, PlatformSnapshots::new(4, 512)),
+                "defaults.resources.memoryMib, 1024, must not exceed",
+            ),
+        ] {
+            let error = bad.validate().unwrap_err();
+            assert_eq!(error.code(), ErrorCode::MalformedRequest, "{bad:?}");
+            assert!(error.message().contains(field), "{field}: {error}");
+        }
     }
 }

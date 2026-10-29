@@ -38,9 +38,10 @@ use serde::Serialize;
 
 pub use aci_edge_sandboxes_model::wire::{HostInfo, SandboxDiagnostics};
 pub use aci_edge_sandboxes_model::{
-    BundleSource, CpuProfile, Diagnostics, ExecSettings, GuestSessionPolicy, Hypervisor,
-    ImageDigest, ImageId, ImageSettings, ReferenceSettings, RegisteredImage, RuntimeDigests,
-    RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig, Timeouts,
+    BundleSource, CpuProfile, Diagnostics, DisabledReason, ExecSettings, GuestSessionPolicy,
+    Hypervisor, ImageDigest, ImageId, ImageSettings, PlatformSnapshots, PlatformSnapshotsInfo,
+    ReferenceSettings, RegisteredImage, RuntimeDigests, RuntimeFiles, RuntimeSource,
+    SandboxDefaults, SetupConfig, TemplateInfo, TemplateState, Timeouts,
 };
 
 #[cfg(feature = "agent-bundled")]

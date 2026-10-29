@@ -13,6 +13,7 @@ publish = false
 
 [dependencies]
 getrandom = "0.4"
+humantime = "2.4"
 # `Cidr` and `Hypervisor` come from NVX, without its host side.
 nvx = { version = "0.1.0-alpha.3", default-features = false, features = ["serde"] }
 serde = { version = "1.0.200", features = ["derive"] }

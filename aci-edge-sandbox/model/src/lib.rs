@@ -16,7 +16,9 @@ pub mod id;
 pub mod image;
 pub mod model;
 pub mod outcome;
+mod rfc3339;
 pub mod setup;
+pub mod snapshot;
 pub mod spec;
 pub mod validate;
 pub mod wire;
@@ -38,7 +40,11 @@ pub use model::{
 pub use outcome::{ExecFailure, ExecOutcome};
 pub use setup::{
     BundleSource, CpuProfile, Diagnostics, ExecSettings, GuestSessionPolicy, Hypervisor,
-    ImageSettings, ReferenceSettings, RuntimeDigests, RuntimeFiles, RuntimeSource, SandboxDefaults,
-    SetupConfig, Timeouts,
+    ImageSettings, PlatformSnapshots, ReferenceSettings, RuntimeDigests, RuntimeFiles,
+    RuntimeSource, SandboxDefaults, SetupConfig, Timeouts,
+};
+pub use snapshot::{
+    BootMode, ColdReason, DisabledReason, PlatformSnapshotsInfo, TemplateClass, TemplateGeneration,
+    TemplateInfo, TemplateKey, TemplateState,
 };
 pub use spec::{ImageSource, Resources, SandboxSpec};

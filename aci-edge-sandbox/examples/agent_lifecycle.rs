@@ -16,12 +16,13 @@ use std::sync::Arc;
 use aci_edge_sandboxes::agent::BundledAgent;
 use aci_edge_sandboxes::agent::{
     AgentBackend, AgentConfig, BundleSource, CpuProfile, Diagnostics, Hypervisor, ImageDigest,
-    ImageSettings, ReferenceSettings, RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
+    ImageSettings, PlatformSnapshots, ReferenceSettings, RuntimeFiles, RuntimeSource,
+    SandboxDefaults, SetupConfig,
 };
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ExecOutcome, ExecRequest, FilesystemPolicy,
     ForwardProtocol, HostLoopbackForward, ImageSource, NetworkPolicy, NetworkRule, Protocol,
-    ProvisionRequest, SandboxSpec,
+    ProvisionRequest, SandboxSpec, StartResult,
 };
 
 fn main() -> ExitCode {
@@ -59,6 +60,8 @@ fn run() -> Result<(), String> {
     let mut environment = Vec::new();
     let mut cwd = None;
     let mut memory_mib = None;
+    let mut vcpus = None;
+    let mut platform_snapshots = None;
     let mut cpu_profile = CpuProfile::Auto;
     let mut guest_debug = false;
     let mut command = None;
@@ -108,6 +111,16 @@ fn run() -> Result<(), String> {
                         .parse::<u32>()
                         .map_err(|_| format!("{option} must be a number of MiB"))?,
                 );
+            }
+            "--vcpus" => {
+                vcpus = Some(
+                    value()?
+                        .parse::<u32>()
+                        .map_err(|_| format!("{option} must be a number of virtual processors"))?,
+                );
+            }
+            "--platform-snapshots" => {
+                platform_snapshots = Some(parse_platform_snapshots(&option, &value()?)?);
             }
             "--cpu-profile" => cpu_profile = parse_cpu_profile(&option, &value()?)?,
             "--guest-debug" => guest_debug = true,
@@ -210,6 +223,9 @@ fn run() -> Result<(), String> {
     if let Some(memory_mib) = memory_mib {
         spec = spec.with_memory_mib(memory_mib);
     }
+    if let Some(vcpus) = vcpus {
+        spec = spec.with_vcpus(vcpus);
+    }
     let mut exec = ExecRequest::command_line(command);
     if let Some(cwd) = cwd {
         exec = exec.with_cwd(cwd);
@@ -229,6 +245,9 @@ fn run() -> Result<(), String> {
     if let Some(hypervisor) = hypervisor {
         setup = setup.with_hypervisor(hypervisor);
     }
+    if let Some(platform_snapshots) = platform_snapshots {
+        setup = setup.with_platform_snapshots(platform_snapshots);
+    }
     let mut references = ReferenceSettings::default();
     if let Some(timeout) = pull_timeout_ms {
         references = references.with_pull_timeout_ms(timeout);
@@ -247,7 +266,8 @@ fn run() -> Result<(), String> {
         .sandbox_id;
     let started = client.start(&id);
     let succeeded = started.is_ok();
-    let executed = started.and_then(|_| {
+    let executed = started.and_then(|started| {
+        eprintln!("{}", describe_start(&started)?);
         let output = client.exec(&id, &exec)?.wait_with_output()?;
         let logs = backend.guest_logs(&id)?;
         if !logs.windows(5).any(|window| window == b"exec:") {
@@ -410,6 +430,19 @@ fn parse_cpu_profile(option: &str, text: &str) -> Result<CpuProfile, String> {
     }
 }
 
+/// Parses `MAX_VCPUS,MAX_MEMORY_MIB[,MAX_IMAGE_MIB]`, such as `4,8192` or `4,8192,131072`, which
+/// enables platform snapshots with those capacities. The setup's validation checks the values.
+fn parse_platform_snapshots(option: &str, text: &str) -> Result<PlatformSnapshots, String> {
+    let malformed = || format!("{option} must be MAX_VCPUS,MAX_MEMORY_MIB[,MAX_IMAGE_MIB]");
+    let number = |text: &str| text.parse::<u32>().map_err(|_| malformed());
+    match text.split(',').collect::<Vec<_>>().as_slice() {
+        [vcpus, memory] => Ok(PlatformSnapshots::new(number(vcpus)?, number(memory)?)),
+        [vcpus, memory, image] => Ok(PlatformSnapshots::new(number(vcpus)?, number(memory)?)
+            .with_max_image_mib(number(image)?)),
+        _ => Err(malformed()),
+    }
+}
+
 /// Parses `CIDR` or `CIDR:tcp|udp:PORT`, such as `192.0.2.0/24` or `192.0.2.1:tcp:443`.
 fn parse_rule(option: &str, text: &str) -> Result<NetworkRule, String> {
     let malformed = || format!("{option} must be CIDR or CIDR:tcp|udp:PORT");
@@ -456,6 +489,18 @@ fn parse_forward(option: &str, text: &str) -> Result<HostLoopbackForward, String
 /// Describes an error of the crate or of NVX, with the crate's error code.
 fn describe(error: impl Into<aci_edge_sandboxes::Error>) -> String {
     error.into().to_string()
+}
+
+/// Describes how a sandbox started: its start metadata's `bootMode`, and its `coldReason` when it
+/// cold booted although the setup enables platform snapshots.
+fn describe_start(started: &StartResult) -> aci_edge_sandboxes::Result<String> {
+    let mode = started
+        .boot_mode()?
+        .map_or_else(|| "not reported".to_owned(), |mode| mode.to_string());
+    Ok(match started.cold_reason()? {
+        Some(reason) => format!("bootMode: {mode}, coldReason: {reason}"),
+        None => format!("bootMode: {mode}"),
+    })
 }
 
 #[cfg(test)]
@@ -525,6 +570,53 @@ mod tests {
                 "{other}"
             );
         }
+    }
+
+    #[test]
+    fn platform_snapshots_take_two_or_three_capacities() {
+        let parse = |text: &str| parse_platform_snapshots("--platform-snapshots", text);
+        assert_eq!(parse("4,8192").unwrap(), PlatformSnapshots::new(4, 8192));
+        assert_eq!(
+            parse("8,16384,131072").unwrap(),
+            PlatformSnapshots::new(8, 16384).with_max_image_mib(131_072)
+        );
+        for malformed in [
+            "",
+            "4",
+            "4,",
+            ",8192",
+            "4,8192,",
+            "4,8192,1,1",
+            "4;8192",
+            "four,8192",
+            "-1,8192",
+            "4, 8192",
+        ] {
+            let error = parse(malformed).unwrap_err();
+            assert!(error.starts_with("--platform-snapshots "), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn starts_are_described_by_their_boot_mode_and_cold_reason() {
+        use aci_edge_sandboxes::{BootMode, ColdReason};
+
+        let cold = StartResult::default()
+            .with_boot_mode(BootMode::Cold)
+            .with_cold_reason(ColdReason::MemoryAboveCapacity);
+        assert_eq!(
+            describe_start(&cold).unwrap(),
+            "bootMode: cold, coldReason: memory-above-capacity"
+        );
+        let clone = StartResult::default().with_boot_mode(BootMode::Clone);
+        assert_eq!(describe_start(&clone).unwrap(), "bootMode: clone");
+        assert_eq!(
+            describe_start(&StartResult::default()).unwrap(),
+            "bootMode: not reported"
+        );
+        let malformed: StartResult =
+            serde_json::from_str(r#"{"metadata": {"bootMode": "warm"}}"#).unwrap();
+        assert!(describe_start(&malformed).is_err());
     }
 
     #[test]
