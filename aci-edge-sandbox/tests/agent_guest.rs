@@ -21,7 +21,10 @@
 //! that `ACI_EDGE_TEST_CLONE_CRASH_AT` names, or else `EDGE_AGENT_TEST_LIBRARY`; with a library
 //! without the feature, they skip, and say so. The capture-failure case needs
 //! `EDGE_AGENT_TEST_COLD_ONLY_INITRD`, an edge initramfs without a template mode, and skips without
-//! it, saying so.
+//! it, saying so. The latency test takes `EDGE_AGENT_TEST_LATENCY_SAMPLES` samples of each mode,
+//! 3 by default, and writes them as JSON to `EDGE_AGENT_TEST_LATENCY_REPORT` when it names a file.
+//! With `EDGE_AGENT_TEST_LATENCY_TEMPLATE_MEMORY=sandbox`, its templates boot with each geometry's
+//! memory instead of the setup's default, so that its clones grow only their vCPUs.
 //!
 //! Each test fails if an OpenVMM process of its own state root outlives its sandboxes; the VMs of
 //! other tests and hosts on the machine don't count. Run the tests one at a time, since several of
@@ -30,8 +33,8 @@
 //! `cargo test --release --features agent --test agent_guest -- --ignored --test-threads=1`.
 #![cfg(feature = "agent")]
 
-use std::collections::BTreeSet;
 use std::collections::hash_map::RandomState;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, ErrorKind, PipeReader, Read, Seek, SeekFrom, Write};
@@ -41,7 +44,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aci_edge_sandboxes::agent::{
     AgentBackend, AgentConfig, BundleSource, CpuProfile, DisabledReason, Hypervisor, ImageDigest,
@@ -4134,5 +4137,242 @@ fn a_capture_that_fails_fails_the_open_and_names_its_class() {
     // With an initramfs that captures, the same state root opens.
     let opened = snapshot_backend(state.path(), platform_snapshots(), |_| {});
     ready_templates(opened.info().platform_snapshots.as_ref());
+    assert_no_new_openvmm(state.path());
+}
+
+/// The `percent` percentile of `samples` by nearest rank: the smallest sample that at least
+/// `percent` percent of them do not exceed.
+fn nearest_rank(samples: &[f64], percent: usize) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[(percent * sorted.len()).div_ceil(100).max(1) - 1]
+}
+
+/// The milliseconds of a duration.
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+/// A lifecycle of a sandbox, as the latency test times it, in milliseconds: the start's
+/// `bootMilliseconds` and phases, and the calls of each step.
+fn time_lifecycle(
+    client: &AciEdgeSandbox,
+    backend: &AgentBackend,
+    request: &ProvisionRequest,
+    spec: &SandboxSpec,
+    clones: Option<TemplateClass>,
+) -> BTreeMap<String, f64> {
+    let began = Instant::now();
+    let sandbox = provision_spec(client, backend, request, spec);
+    let provisioned = began.elapsed();
+    let called = Instant::now();
+    let started = client.start(&sandbox.id).unwrap();
+    let start = called.elapsed();
+    match clones {
+        Some(class) => {
+            assert_cloned(&started, class);
+        }
+        None => assert_cold(&started, None),
+    }
+    let called = Instant::now();
+    let output = run(client, &sandbox.id, &["/bin/true"]);
+    let first_exec = called.elapsed();
+    assert_eq!(output.outcome, ExecOutcome::Exited(0), "{output:?}");
+    let called = Instant::now();
+    assert_graceful(client.stop(&sandbox.id));
+    let stop = called.elapsed();
+    let called = Instant::now();
+    client.deprovision(&sandbox.release()).unwrap();
+    let deprovision = called.elapsed();
+    let mut measures = BTreeMap::from([
+        (
+            "bootMilliseconds".to_owned(),
+            boot_milliseconds(&started) as f64,
+        ),
+        ("provision".to_owned(), milliseconds(provisioned)),
+        ("start call".to_owned(), milliseconds(start)),
+        ("first execution".to_owned(), milliseconds(first_exec)),
+        ("stop".to_owned(), milliseconds(stop)),
+        ("deprovision".to_owned(), milliseconds(deprovision)),
+        ("lifecycle".to_owned(), milliseconds(began.elapsed())),
+    ]);
+    let phases = started
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("phases"))
+        .and_then(serde_json::Value::as_object);
+    for (phase, value) in phases.into_iter().flatten() {
+        if let Some(value) = value.as_f64() {
+            measures.insert(format!("phase {phase}"), value);
+        }
+    }
+    measures
+}
+
+/// The P50 and P95 of each measure of `lifecycles`, by nearest rank.
+fn percentiles(lifecycles: &[BTreeMap<String, f64>]) -> BTreeMap<String, (f64, f64)> {
+    let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for lifecycle in lifecycles {
+        for (measure, value) in lifecycle {
+            samples.entry(measure.clone()).or_default().push(*value);
+        }
+    }
+    samples
+        .into_iter()
+        .map(|(measure, values)| {
+            let percentiles = (nearest_rank(&values, 50), nearest_rank(&values, 95));
+            (measure, percentiles)
+        })
+        .collect()
+}
+
+/// Opens the latency test's host with platform snapshots, with sandbox state under `state`, whose
+/// templates boot with `template_memory_mib`, or with the setup's default memory, and returns it
+/// with a report of its open: how long it took, and how long after it began each class's snapshot
+/// was taken.
+fn open_cloning(
+    state: &Path,
+    template_memory_mib: Option<u32>,
+) -> (Arc<AgentBackend>, serde_json::Value) {
+    let captured_after = SystemTime::now();
+    let opened = Instant::now();
+    let cloning = snapshot_backend(state, platform_snapshots(), |setup| {
+        if let Some(memory_mib) = template_memory_mib {
+            setup.defaults.resources.memory_mib = Some(memory_mib);
+        }
+    });
+    let first_open = opened.elapsed();
+    let templates = ready_templates(cloning.info().platform_snapshots.as_ref());
+    let captures: BTreeMap<String, f64> = templates
+        .iter()
+        .map(|template| {
+            let after = template.captured_at.unwrap().duration_since(captured_after);
+            (
+                template.class.to_string(),
+                after.map_or(f64::NAN, milliseconds),
+            )
+        })
+        .collect();
+    eprintln!(
+        "the open with snapshots whose templates boot with {} took {:.0} ms; each class's \
+         snapshot was taken this long after the open began, in ms: {captures:?}",
+        template_memory_mib.map_or("the default memory".to_owned(), |memory_mib| format!(
+            "{memory_mib} MiB"
+        )),
+        milliseconds(first_open)
+    );
+    let report = serde_json::json!({
+        "templateMemoryMib": template_memory_mib,
+        "openMs": milliseconds(first_open),
+        "capturedAfterOpenMs": captures,
+        "templates": templates,
+    });
+    (cloning, report)
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn clones_and_cold_boots_of_each_geometry_side_by_side() {
+    const WARMUPS: usize = 2;
+    let samples: usize = std::env::var("EDGE_AGENT_TEST_LATENCY_SAMPLES")
+        .map(|samples| samples.parse().unwrap())
+        .unwrap_or(3);
+    let sized = match std::env::var("EDGE_AGENT_TEST_LATENCY_TEMPLATE_MEMORY").as_deref() {
+        Err(_) | Ok("default") => false,
+        Ok("sandbox") => true,
+        Ok(other) => {
+            panic!("EDGE_AGENT_TEST_LATENCY_TEMPLATE_MEMORY is default or sandbox, not {other:?}")
+        }
+    };
+    let state = tempfile::tempdir().unwrap();
+    // The host without snapshots opens first and registers the image, so that each open of a host
+    // with snapshots captures only.
+    let plain = backend(state.path());
+    let cold_client = AciEdgeSandbox::from_shared(plain.clone());
+
+    let mut opens = Vec::new();
+    let mut cloning = None;
+    let mut report = Vec::new();
+    for (vcpus, memory_mib) in GEOMETRIES {
+        // The templates boot with the setup's default memory, or each geometry's own, from which
+        // its clones grow no memory.
+        if cloning.is_none() || sized {
+            let (host, open) = open_cloning(state.path(), sized.then_some(memory_mib));
+            opens.push(open);
+            cloning = Some(host);
+        }
+        let cloning = cloning.as_ref().unwrap();
+        let clone_client = AciEdgeSandbox::from_shared(cloning.clone());
+        for network in [false, true] {
+            let (request, class) = if network {
+                (open_network(), TemplateClass::Nic)
+            } else {
+                (ProvisionRequest::new(), TemplateClass::NoNic)
+            };
+            let spec = geometry(vcpus, memory_mib);
+            let (mut clones, mut colds) = (Vec::new(), Vec::new());
+            for index in 0..WARMUPS + samples {
+                // The modes alternate, and every other sample cold boots first.
+                for clone in [index % 2 == 0, index % 2 == 1] {
+                    let lifecycle = if clone {
+                        time_lifecycle(&clone_client, cloning, &request, &spec, Some(class))
+                    } else {
+                        time_lifecycle(&cold_client, &plain, &request, &spec, None)
+                    };
+                    if index >= WARMUPS {
+                        if clone {
+                            clones.push(lifecycle);
+                        } else {
+                            colds.push(lifecycle);
+                        }
+                    }
+                }
+            }
+            let (cloned, cold) = (percentiles(&clones), percentiles(&colds));
+            let mut table = format!(
+                "{vcpus} vCPUs, {memory_mib} MiB, {class}, from templates of {}: {samples} \
+                 samples of each mode after {WARMUPS} warm-ups, in ms\n| measure | clone P50 | \
+                 clone P95 | cold P50 | cold P95 |\n| --- | --- | --- | --- | --- |\n",
+                if sized {
+                    format!("{memory_mib} MiB")
+                } else {
+                    "the default memory".to_owned()
+                }
+            );
+            let measures: BTreeSet<&String> = cloned.keys().chain(cold.keys()).collect();
+            for measure in measures {
+                let cell = |percentiles: &BTreeMap<String, (f64, f64)>| {
+                    percentiles
+                        .get(measure)
+                        .map_or("| - | - ".to_owned(), |(p50, p95)| {
+                            format!("| {p50:.1} | {p95:.1} ")
+                        })
+                };
+                table.push_str(&format!("| {measure} {}{}|\n", cell(&cloned), cell(&cold)));
+            }
+            eprintln!("{table}");
+            report.push(serde_json::json!({
+                "vcpus": vcpus,
+                "memoryMib": memory_mib,
+                "class": class,
+                "templateMemoryMib": sized.then_some(memory_mib),
+                "clone": clones,
+                "cold": colds,
+                "clonePercentiles": cloned,
+                "coldPercentiles": cold,
+            }));
+        }
+    }
+    if let Some(path) = std::env::var_os("EDGE_AGENT_TEST_LATENCY_REPORT") {
+        let report = serde_json::json!({
+            "hypervisor": hypervisor(),
+            "templateMemory": if sized { "sandbox" } else { "default" },
+            "warmups": WARMUPS,
+            "samples": samples,
+            "opens": opens,
+            "geometries": report,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
     assert_no_new_openvmm(state.path());
 }
