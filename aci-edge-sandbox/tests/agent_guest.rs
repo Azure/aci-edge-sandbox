@@ -1308,8 +1308,15 @@ fn executions_run_concurrently_without_stalling_each_other() {
          memory grew {} MiB",
         grown >> 20
     );
+    // Windows timers tick every 15.6 ms and round the waits of an execution up to whole ticks, so
+    // there a sample can take a tick more without anything stalling it.
+    let tick = if cfg!(windows) {
+        Duration::from_micros(15_625)
+    } else {
+        Duration::ZERO
+    };
     assert!(
-        beside <= alone * 2 + Duration::from_millis(2),
+        beside <= alone * 2 + Duration::from_millis(2) + tick,
         "a stalled reader slowed other executions from {alone:?} to {beside:?}"
     );
     assert!(
@@ -2154,61 +2161,73 @@ fn replaced_host_objects_inside_a_writable_mapping_fail_the_next_start() {
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
-fn every_mapping_that_fits_the_kernel_command_line_reaches_the_guest() {
+fn every_mapping_that_fits_the_openvmm_command_line_reaches_the_guest() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
     let before = openvmm_processes();
-    let directories: Vec<PathBuf> = (0..64)
-        .map(|index| {
-            let directory = host.path().join(format!("m{index:02}"));
-            std::fs::create_dir(&directory).unwrap();
-            std::fs::write(directory.join("index"), format!("{index} ")).unwrap();
-            directory
-        })
-        .collect();
-    let request = |count: usize| {
+    let request = |directories: &[PathBuf]| {
         ProvisionRequest::new().with_filesystem(FilesystemPolicy {
-            readonly_paths: directories[..count].to_vec(),
+            readonly_paths: directories.to_vec(),
             ..FilesystemPolicy::default()
         })
     };
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
 
-    // Provisioning plans the mappings without a guest, so it finds the largest set that fits.
-    let mut fitting = 0;
-    for count in 1..=directories.len() {
-        match client.provision(&request(count)) {
+    // The guest receives its bind mounts once it is ready, so the kernel command line does not
+    // bound them, but OpenVMM's names every mapped path, within the 32,767 characters that Windows
+    // allows a process. Long names, in paths that stay within 240 characters, reach that bound
+    // sooner. Provisioning plans the mappings without a guest, so it finds the largest set that
+    // fits.
+    let name = "m".repeat(
+        240usize
+            .saturating_sub(host.path().as_os_str().len() + 4)
+            .min(150),
+    );
+    let mut directories = Vec::new();
+    loop {
+        let index = directories.len();
+        assert!(
+            index < 1000,
+            "{index} mappings fit the OpenVMM command line"
+        );
+        let directory = host.path().join(format!("{index:03}{name}"));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("index"), format!("{index} ")).unwrap();
+        directories.push(directory);
+        match client.provision(&request(&directories)) {
             Ok(provisioned) => {
                 client.deprovision(&provisioned.sandbox_id).unwrap();
-                fitting = count;
             }
             Err(error) => {
                 assert_eq!(error.code(), ErrorCode::PolicyValidation, "{error}");
-                assert!(error.message().contains("kernel command line"), "{error}");
+                assert!(error.message().contains("command line"), "{error}");
+                directories.pop();
                 break;
             }
         }
     }
+    let fitting = directories.len();
     assert!(
-        (2..directories.len()).contains(&fitting),
-        "{fitting} mappings fit the kernel command line"
+        fitting >= 2,
+        "{fitting} mappings fit the OpenVMM command line"
     );
-    let sandbox = started(&client, &backend, &request(fitting));
-    let files: Vec<String> = directories[..fitting]
-        .iter()
-        .map(|directory| format!("{}/index", guest(directory)))
-        .collect();
-    let mut argv = vec!["/bin/cat"];
-    argv.extend(files.iter().map(String::as_str));
-    let output = run(&client, &sandbox.id, &argv);
+    let sandbox = started(&client, &backend, &request(&directories));
+    // The mapped directories share their guest parent, so one glob reads them all, in order.
+    let first = guest(&directories[0]);
+    let (parent, _) = first.rsplit_once('/').unwrap();
+    let output = run(
+        &client,
+        &sandbox.id,
+        &["/bin/sh", "-c", r#"cat "$1"/*/index"#, "sh", parent],
+    );
     let expected: String = (0..fitting).map(|index| format!("{index} ")).collect();
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         expected,
         "{output:?}"
     );
-    eprintln!("{fitting} mappings fit the kernel command line");
+    eprintln!("{fitting} mappings fit the OpenVMM command line");
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
     assert_no_new_openvmm(&before);
