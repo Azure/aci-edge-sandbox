@@ -1,20 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! RFC 3339 timestamps in UTC, such as `2026-10-29T07:00:00Z`.
+//! RFC 3339 timestamps in UTC, such as `2026-10-29T07:00:00Z`, which `humantime` writes and reads.
 //!
-//! A time is written as its date and time of day in UTC, with a fraction of a second only when it
-//! has one, and read back in the same form: a `T` between the date and the time, one to nine
-//! digits of fraction, and the offset `Z`. The form covers the times from the Unix epoch through
-//! the end of the year 9999.
+//! A time is written as its date and time of day in UTC, with a `T` between them and the offset
+//! `Z`, and with a fraction of a second only when it has one, in nine digits, such as
+//! `2026-10-29T07:00:00.500000000Z`. It is read back in the same form, with one to nine digits of
+//! fraction. The form covers the times from the Unix epoch through the end of the year 9999.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const SECONDS_PER_DAY: u64 = 86_400;
-/// Days from 0000-03-01 to the Unix epoch in the proleptic Gregorian calendar.
-const EPOCH_DAYS: u64 = 719_468;
-/// Days in each 400-year cycle of the Gregorian calendar.
-const CYCLE_DAYS: u64 = 146_097;
 /// The last second of the form: 9999-12-31T23:59:59Z.
 const MAX_SECONDS: u64 = 253_402_300_799;
 
@@ -24,104 +19,31 @@ const EXPECTED: &str =
 
 /// Writes `time`, or returns `None` for a time before the Unix epoch or after the year 9999.
 pub(crate) fn format(time: SystemTime) -> Option<String> {
-    let since_epoch = time.duration_since(UNIX_EPOCH).ok()?;
-    let seconds = since_epoch.as_secs();
+    // `humantime` panics on a time before the epoch, and fails on one after the year 9999.
+    let seconds = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
     if seconds > MAX_SECONDS {
         return None;
     }
-    let (year, month, day) = civil_from_days(seconds / SECONDS_PER_DAY);
-    let second_of_day = seconds % SECONDS_PER_DAY;
-    let mut text = format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
-        second_of_day / 3600,
-        second_of_day / 60 % 60,
-        second_of_day % 60
-    );
-    let nanos = since_epoch.subsec_nanos();
-    if nanos != 0 {
-        text.push('.');
-        text.push_str(format!("{nanos:09}").trim_end_matches('0'));
-    }
-    text.push('Z');
-    Some(text)
+    Some(humantime::format_rfc3339(time).to_string())
 }
 
 /// Reads a time in this form, or returns `None` for any other text.
 pub(crate) fn parse(text: &str) -> Option<SystemTime> {
-    let text = text.strip_suffix('Z')?;
-    if !text.is_ascii() || text.len() < 19 {
+    // `humantime` checks the date and the time of day, but it reads second 60 as second 59, and
+    // it is lenient with what follows the seconds: it also reads the offset `+00:00`, a fraction
+    // with no digits or more than nine, and other text before the `Z`, as in
+    // `2026-10-29T07:00:00ZZ`. So the model checks those itself.
+    let (whole_seconds, fraction) = text
+        .strip_suffix('Z')?
+        .split_at_checked("2026-10-29T07:00:00".len())?;
+    let fraction_is_valid = fraction.is_empty()
+        || fraction.strip_prefix('.').is_some_and(|digits| {
+            (1..=9).contains(&digits.len()) && digits.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if !fraction_is_valid || whole_seconds.ends_with(":60") {
         return None;
     }
-    let (date_time, fraction) = text.split_at(19);
-    let separators = date_time.as_bytes();
-    if [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')]
-        .iter()
-        .any(|&(index, separator)| separators[index] != separator)
-    {
-        return None;
-    }
-    let field = |range: std::ops::Range<usize>| {
-        let digits = &date_time[range];
-        if digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            digits.parse::<u64>().ok()
-        } else {
-            None
-        }
-    };
-    let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
-    let (hour, minute, second) = (field(11..13)?, field(14..16)?, field(17..19)?);
-    let nanos = match fraction.strip_prefix('.') {
-        None if fraction.is_empty() => 0,
-        Some(digits)
-            if (1..=9).contains(&digits.len())
-                && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            format!("{digits:0<9}").parse::<u32>().ok()?
-        }
-        _ => return None,
-    };
-    if year < 1970 || !(1..=12).contains(&month) || day == 0 {
-        return None;
-    }
-    if hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
-    // A day past the end of its month counts into the next month, so its date differs.
-    if civil_from_days(days) != (year, month, day) {
-        return None;
-    }
-    let seconds = days * SECONDS_PER_DAY + hour * 3600 + minute * 60 + second;
-    UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
-}
-
-/// Days from the Unix epoch to a date in or after 1970 (Howard Hinnant's `days_from_civil`).
-fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
-    // Counting years from March puts each leap day at the end of its year.
-    let year = if month <= 2 { year - 1 } else { year };
-    let year_of_era = year % 400;
-    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    year / 400 * CYCLE_DAYS + day_of_era - EPOCH_DAYS
-}
-
-/// The date of a day counted from the Unix epoch (Howard Hinnant's `civil_from_days`).
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let days = days + EPOCH_DAYS;
-    let day_of_era = days % CYCLE_DAYS;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    // Months count from March.
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = days / CYCLE_DAYS * 400 + year_of_era + u64::from(month <= 2);
-    (year, month, day)
+    humantime::parse_rfc3339(text).ok()
 }
 
 /// Serde helper that writes an optional time in this form.
@@ -155,6 +77,8 @@ pub(crate) mod option {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn at(seconds: u64, nanos: u32) -> SystemTime {
@@ -169,22 +93,23 @@ mod tests {
             (951_827_696, 0, "2000-02-29T12:34:56Z"),
             (1_709_251_199, 0, "2024-02-29T23:59:59Z"),
             (1_793_257_200, 0, "2026-10-29T07:00:00Z"),
-            (1_793_257_200, 500_000_000, "2026-10-29T07:00:00.5Z"),
-            (1_793_257_200, 123_456_700, "2026-10-29T07:00:00.1234567Z"),
+            // `humantime` writes every fraction in nine digits.
+            (1_793_257_200, 500_000_000, "2026-10-29T07:00:00.500000000Z"),
+            (1_793_257_200, 123_456_700, "2026-10-29T07:00:00.123456700Z"),
             (MAX_SECONDS, 0, "9999-12-31T23:59:59Z"),
         ] {
             assert_eq!(format(at(seconds, nanos)).as_deref(), Some(text));
             assert_eq!(parse(text), Some(at(seconds, nanos)), "{text}");
         }
         // Fractions of any length up to nanoseconds.
-        assert_eq!(
-            parse("2026-10-29T07:00:00.250Z"),
-            Some(at(1_793_257_200, 250_000_000))
-        );
-        assert_eq!(
-            parse("2026-10-29T07:00:00.000000100Z"),
-            Some(at(1_793_257_200, 100))
-        );
+        for (text, nanos) in [
+            ("2026-10-29T07:00:00.5Z", 500_000_000),
+            ("2026-10-29T07:00:00.250Z", 250_000_000),
+            ("2026-10-29T07:00:00.1234567Z", 123_456_700),
+            ("2026-10-29T07:00:00.000000100Z", 100),
+        ] {
+            assert_eq!(parse(text), Some(at(1_793_257_200, nanos)), "{text}");
+        }
     }
 
     #[test]
@@ -193,13 +118,10 @@ mod tests {
             "",
             "Z",
             "2026-10-29T07:00:00",
-            "2026-10-29T07:00:00+00:00",
             "2026-10-29t07:00:00Z",
             "2026-10-29T07:00:00z",
             "2026-10-29 07:00:00Z",
             "2026-10-29T07:00Z",
-            "2026-10-29T07:00:00.Z",
-            "2026-10-29T07:00:00.1234567890Z",
             "2026-10-29T07:00:00,5Z",
             "2026-10-29T07:00:00.+5Z",
             "2026-10-29T07:00:00Zx",
@@ -215,9 +137,25 @@ mod tests {
             "2100-02-29T00:00:00Z",
             "2026-10-29T24:00:00Z",
             "2026-10-29T07:60:00Z",
-            "2026-10-29T07:00:60Z",
             "1969-12-31T23:59:59Z",
         ] {
+            assert_eq!(parse(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn forms_that_humantime_also_reads_are_refused() {
+        for text in [
+            "2026-10-29T07:00:00+00:00",
+            "2026-10-29T07:00:00.Z",
+            "2026-10-29T07:00:00.1234567890Z",
+            "2026-10-29T07:00:60Z",
+            "2026-10-29T07:00:00ZZ",
+            "2026-10-29T07:00:00ZabcZ",
+            "2026-10-29T07:00:00.+abcdZ",
+            "2026-10-29T07:00:00.5+abcdZ",
+        ] {
+            assert!(humantime::parse_rfc3339(text).is_ok(), "{text}");
             assert_eq!(parse(text), None, "{text}");
         }
     }
