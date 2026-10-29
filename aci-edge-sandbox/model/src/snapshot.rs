@@ -173,9 +173,10 @@ impl<'de> Deserialize<'de> for TemplateKey {
     }
 }
 
-/// The template that a clone started from: the start metadata's `template`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// The template that a clone started from: the start metadata's `template`, an object of these
+/// fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct TemplateGeneration {
     /// The template's class.
@@ -195,6 +196,44 @@ impl TemplateGeneration {
             key,
             generation,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for TemplateGeneration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Fields {
+            class: TemplateClass,
+            key: TemplateKey,
+            generation: u64,
+        }
+
+        // Reads only an object: the implementation that serde derives would also read the
+        // fields from a sequence, in order.
+        struct Object;
+
+        impl<'de> serde::de::Visitor<'de> for Object {
+            type Value = TemplateGeneration;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an object of class, key, and generation")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let Fields {
+                    class,
+                    key,
+                    generation,
+                } = Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(TemplateGeneration::new(class, key, generation))
+            }
+        }
+
+        deserializer.deserialize_map(Object)
     }
 }
 
@@ -407,6 +446,36 @@ mod tests {
             assert!(
                 serde_json::from_value::<TemplateKey>(json).is_err(),
                 "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_generations_are_objects_of_their_three_fields() {
+        let key = "ab".repeat(32);
+        let object = format!(r#"{{"class":"noNic","key":"{key}","generation":7}}"#);
+        let generation =
+            TemplateGeneration::new(TemplateClass::NoNic, TemplateKey::from_bytes([0xab; 32]), 7);
+        assert_eq!(serde_json::to_string(&generation).unwrap(), object);
+        assert_eq!(
+            serde_json::from_str::<TemplateGeneration>(&object).unwrap(),
+            generation
+        );
+        for json in [
+            // The fields in order, which serde's derived implementation would read.
+            format!(r#"["noNic","{key}",7]"#),
+            format!(r#"{{"class":"noNic","key":"{key}"}}"#),
+            format!(r#"{{"class":"noNic","key":"{key}","generation":7,"state":"ready"}}"#),
+            "null".to_owned(),
+        ] {
+            assert!(
+                serde_json::from_str::<TemplateGeneration>(&json).is_err(),
+                "{json}"
+            );
+            let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+            assert!(
+                serde_json::from_value::<TemplateGeneration>(value).is_err(),
+                "{json}"
             );
         }
     }

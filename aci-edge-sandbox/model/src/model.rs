@@ -1179,6 +1179,7 @@ mod tests {
                 "template",
                 serde_json::json!({"class": {"nic": null}, "key": key, "generation": 3}),
             ),
+            ("template", serde_json::json!(["nic", key, 3])),
             ("template", serde_json::json!({"class": "nic", "key": key})),
             (
                 "template",
