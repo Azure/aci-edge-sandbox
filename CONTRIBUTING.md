@@ -20,7 +20,7 @@ Build and test the crate from the `aci-edge-sandbox` directory:
 ```bash
 cargo fmt --all -- --check
 ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo clippy --all-targets --all-features -- -D warnings
-ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo test --all-features
+ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo test --workspace --all-features
 ```
 
 Start every new source file with the MIT license header, for example in Rust:

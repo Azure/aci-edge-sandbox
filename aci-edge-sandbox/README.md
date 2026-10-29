@@ -117,7 +117,9 @@ approved, and a `SetupConfig`, which the library applies once per process:
   },
   // How long a library that pulls registry references may take to materialize one.
   "images": { "references": { "pullTimeoutMs": 1800000 } },
-  "diagnostics": { "guestDebug": false }
+  "diagnostics": { "guestDebug": false },
+  // Optional: templates that sandboxes start as clones of; see "Platform snapshots".
+  "platformSnapshots": { "enabled": true, "maxVcpus": 4, "maxMemoryMib": 8192 }
 }
 ```
 
@@ -132,8 +134,10 @@ runtime ABI. The library checks every file but itself: the caller passes the lib
 A `SandboxSpec`, passed to `AciEdgeSandbox::provision_with` beside the provision request, sets
 one sandbox's image (`ImageSource::Path` of a registered local GPT disk, `ImageSource::Digest` of
 a registered image, or `ImageSource::Reference` of a registered registry image where the library
-supports it), its resources, its guest network, and its forwarded ports. Every guest has one
-virtual processor, so `resources.vcpus` may only be 1, and `resources.memoryMib` sets its memory.
+supports it), its resources, its guest network, and its forwarded ports. The library accepts 1,
+2, 4, or 8 virtual processors, the counts that OpenVMM's microVM accepts, in `resources.vcpus`
+and in the setup's `defaults.resources.vcpus`, and refuses other counts; `resources.memoryMib`
+sets the guest's memory.
 `Capabilities::spec` lists the fields that the library honors; hostnames are not among them yet.
 A request may still set `microvm.provision.memoryMib`, but not together
 with `spec.resources.memoryMib`.
@@ -240,8 +244,9 @@ would expose it.
   OpenVMM serves one console client at a time and holds guest output while none is connected, so
   a guest that writes enough console output stalls until a listener reconnects: keep that
   process running, or use the sandbox from its successor, whose listener takes the capture over.
-- **Metadata.** Start reports `bootMilliseconds`, `guestBuildId`, and `phases` (`spawnMs`,
-  `attachMs`, and `readyMs`). Stop reports `forced`, `phases` (`shutdownMs` and `exitMs`), and,
+- **Metadata.** Start reports `bootMode`, `bootMilliseconds`, `guestBuildId`, and `phases`
+  (`spawnMs`, `attachMs`, and `readyMs`), and, with [platform snapshots](#platform-snapshots),
+  `coldReason` or `template`. Stop reports `forced`, `phases` (`shutdownMs` and `exitMs`), and,
   after a failed graceful shutdown, `gracefulError`. A capture failure never fails stop or
   deprovision: both report it as `consoleError`. `AgentBackend::guest_logs` reads a bounded
   snapshot of the guest's log while it runs.
@@ -255,7 +260,7 @@ to whole milliseconds, can be up to an hour, and ends the command as `TimedOut`.
 before the outcome arrives, `wait` closes the output streams, as cancellation does, so that a
 stream that the caller holds without reading cannot delay the outcome; an execution that loses
 output that way ends as `TimedOut`.
-Snapshot/restore and guest-side image pulls are not part of this profile.
+Guest-side image pulls are not part of this profile.
 
 [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) runs one lifecycle. It needs
 `--host-library`, `--host-sha256`, `--state-root`, either `--image` or `--image-ref`, and either `--openvmm`, `--kernel`,
@@ -264,8 +269,11 @@ with `agent-bundled`, which gives each of them a default; see
 [Bundled agent](#bundled-agent-agent-bundled). `--image-sha256`
 requires a local image's digest when it is registered. `--image-ref` requires a bundle;
 `--registry-auth-file PATH` selects its credentials file and `--pull-timeout-ms` sets its pull
-deadline. `--hypervisor`, `--cpu-profile auto|host`,
-`--memory-mib`, and `--guest-debug` adjust the setup. The repeatable `--readonly`,
+deadline. `--hypervisor`, `--cpu-profile auto|host`, and `--guest-debug` adjust the setup, and
+`--platform-snapshots MAX_VCPUS,MAX_MEMORY_MIB[,MAX_IMAGE_MIB]` enables
+[platform snapshots](#platform-snapshots) in it. `--vcpus N` and `--memory-mib N` size the
+sandbox, and the example prints its start's `bootMode` and any `coldReason` on standard error.
+The repeatable `--readonly`,
 `--readwrite`, and `--denied` options map host paths, and `--egress allow|deny` with the
 repeatable `--egress-allow` and `--egress-deny` options, each taking `CIDR` or
 `CIDR:tcp|udp:PORT`, attach a network. `--network-proxy URL` routes the guest's traffic through
@@ -330,6 +338,63 @@ error names gives the reason. On such a development host, `cpuProfile: "host"` (
 hypervisor at every cold boot and does not pin. On Linux, supply a matching
 `libaci_edge_agent.so` and OpenVMM build and select `--hypervisor mshv`.
 
+### Platform snapshots
+
+A setup's optional `platformSnapshots` object (`SetupConfig::with_platform_snapshots`) lets
+sandboxes start as clones of templates instead of cold booting, which is faster:
+
+```jsonc
+"platformSnapshots": {
+  "enabled": true,        // required
+  "maxVcpus": 4,          // 1, 2, 4, or 8; required when enabled
+  "maxMemoryMib": 8192,   // a positive multiple of 128; required when enabled
+  "maxImageMib": 65536    // optional; 64 GiB unless set
+}
+```
+
+- **Templates.** The library keeps two templates for the setup, microVM snapshots that hold no
+  tenant data: one without a NIC, and one with a NIC on `defaults.guestNetwork` that denies all
+  traffic. They boot with the default memory, `defaults.resources.memoryMib`, which must then be
+  whole 128 MiB blocks, no more than `maxMemoryMib`. `maxVcpus` and `maxMemoryMib` are the
+  templates' capacities, and `maxImageMib` is the longest image that a clone can use.
+  `SetupConfig::validate` checks each field that is present, even when `enabled` is false.
+- **Capture.** The first open of a setup that enables them captures the templates, which takes
+  seconds; later opens, in any process, reuse them. A failed capture fails the open, and the next
+  open tries again. The library captures a template again in the background before it expires,
+  and after a clone fails because of it; meanwhile, the starts that need it cold boot.
+- **Which starts clone.** A start clones when the setup does not set `diagnostics.guestDebug`
+  and a ready template fits the sandbox: at most `maxVcpus` virtual processors; memory of whole
+  128 MiB blocks, from `defaults.resources.memoryMib` through `maxMemoryMib`; no NIC, or a NIC on
+  `defaults.guestNetwork`; and an image no longer than `maxImageMib`. Every other start cold
+  boots, as without platform snapshots, and its `coldReason` says why: `guest-debug`,
+  `vcpus-above-capacity`, `memory-not-whole-blocks`, `memory-below-template`,
+  `memory-above-capacity`, `guest-network`, `image-too-long`, `no-eligible-template` (none was
+  captured yet, or the template of its class expired or failed a clone and is being captured
+  again), `plan-refused` (the library refused the clone for another reason), or `template-fault`
+  (a clone failed because of its template, and the start cold booted instead).
+- **Start metadata.** Every start reports `bootMode`, `clone` or `cold`, and a clone reports its
+  `template`: `{"class": "noNic" | "nic", "key": "<64 hex digits>", "generation": 3}`.
+  `StartResult::boot_mode`, `cold_reason`, and `template` read them, returning `None` for an
+  absent key and `backend_error` for a malformed one.
+- **Host info.** `AgentBackend::info().platform_snapshots` describes the templates as of when the
+  backend opened the host. `key`, `generation`, and `capturedAt` (RFC 3339 in UTC) describe the
+  newest generation of a template, when one exists, and `lastError` its last failed capture or
+  refresh:
+
+  ```jsonc
+  "platformSnapshots": {
+    "disabledReason": "guest-debug",   // only when no template is kept despite the setup
+    "templates": [
+      { "class": "noNic", "state": "ready", "key": "<64 hex digits>", "generation": 3,
+        "capturedAt": "2026-10-29T07:00:00Z" },
+      { "class": "nic", "state": "unavailable", "lastError": "…" }
+    ]
+  }
+  ```
+- **Limits.** A clone runs with the kernel's default CPU vulnerability mitigations, where a cold
+  boot turns them off, and its console log holds no guest boot output. Both last until the
+  library's platform lifts those limits.
+
 ### Bundled agent (`agent-bundled`)
 
 The `agent-bundled` feature enables `agent` and makes the build script download, verify, and
@@ -355,7 +420,7 @@ ZIP unless its SHA-256 is the pinned one. To move to another bundle, publish it 
 and update all three fields of `agent-bundle.json` together.
 
 > **Note:** The default build and unit tests pass. The currently pinned bundle provides sandbox
-> ABI 1, while this crate requires ABI 2. Consequently, `agent-bundled` builds and runtime use
+> ABI 1, while this crate requires ABI 3. Consequently, `agent-bundled` builds and runtime use
 > with that bundle fail the compatibility check. A compatible bundle and pin update are pending.
 
 Releases publish no bundle for Linux, so a Linux build needs one of the variables below. Other
@@ -575,10 +640,11 @@ wording may change. The wire body carries the `ErrorCode` alone.
 ## Testing
 
 ```bash
-ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo test --all-features   # unit, mock, and model tests; no hypervisor needed
+ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip cargo test --workspace --all-features   # unit, mock, and model tests; no hypervisor needed
 ```
 
-Set `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` for `--all-features` builds that should not
+`--workspace` also runs the data model's own unit tests, in `model/`. Set
+`ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` for `--all-features` builds that should not
 download the edge agent bundle.
 
 - `testing::MockBackend` scripts executions for consumers' unit tests.
@@ -598,6 +664,10 @@ The crate is not published to a registry. It and its data model depend on the
 `microsoft/nvx` repository.
 
 ## Breaking changes
+
+The crate now speaks sandbox ABI 3: the setup gained `platformSnapshots`, and the host info a
+`platformSnapshots` field. `AgentBackend::new` refuses an agent library of ABI 2 with
+`backend_unavailable`, so use a library of ABI 3. The Rust API only gains items.
 
 The direct OpenVMM backend of earlier versions has been removed; use the agent backend. These
 changes affect Rust callers and builds:
