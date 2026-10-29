@@ -29,12 +29,18 @@ pub(crate) fn format(time: SystemTime) -> Option<String> {
 
 /// Reads a time in this form, or returns `None` for any other text.
 pub(crate) fn parse(text: &str) -> Option<SystemTime> {
-    // `humantime` also reads the offset `+00:00`, a fraction with no digits or more than nine,
-    // and second 60 as second 59, which this form refuses.
+    // `humantime` checks the date and the time of day, but it reads second 60 as second 59, and
+    // it is lenient with what follows the seconds: it also reads the offset `+00:00`, a fraction
+    // with no digits or more than nine, and other text before the `Z`, as in
+    // `2026-10-29T07:00:00ZZ`. So the model checks those itself.
     let (whole_seconds, fraction) = text
         .strip_suffix('Z')?
         .split_at_checked("2026-10-29T07:00:00".len())?;
-    if whole_seconds.ends_with(":60") || fraction == "." || fraction.len() > ".123456789".len() {
+    let fraction_is_valid = fraction.is_empty()
+        || fraction.strip_prefix('.').is_some_and(|digits| {
+            (1..=9).contains(&digits.len()) && digits.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if !fraction_is_valid || whole_seconds.ends_with(":60") {
         return None;
     }
     humantime::parse_rfc3339(text).ok()
@@ -144,6 +150,10 @@ mod tests {
             "2026-10-29T07:00:00.Z",
             "2026-10-29T07:00:00.1234567890Z",
             "2026-10-29T07:00:60Z",
+            "2026-10-29T07:00:00ZZ",
+            "2026-10-29T07:00:00ZabcZ",
+            "2026-10-29T07:00:00.+abcdZ",
+            "2026-10-29T07:00:00.5+abcdZ",
         ] {
             assert!(humantime::parse_rfc3339(text).is_ok(), "{text}");
             assert_eq!(parse(text), None, "{text}");
