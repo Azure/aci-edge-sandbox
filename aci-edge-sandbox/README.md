@@ -40,7 +40,7 @@ milliseconds, about 49.7 days, and refuse a negative or larger one. The wire
 envelope (`version`, `phase`, and `containment`) belongs to the caller.
 
 ## Architecture
-- The NVX mechanics live in the [`nvx` crate](https://github.com/microsoft/nvx/blob/ff3cedf636e18630dd9ca18f0aeec5c0207dae6e/nvx-rs/README.md),
+- The NVX mechanics live in the [`nvx` crate](https://github.com/microsoft/nvx/blob/6b485c82c9fdf4f592e1221efc7d6d41ab9bc66c/nvx-rs/README.md),
   which this crate re-exports as `aci_edge_sandboxes::nvx`. This crate keeps the ACI Edge
   Sandboxes contract: the facade, `Backend`, the data model and its validation, the error
   codes, `SandboxId`, the execution and stream plumbing, and the asynchronous
@@ -330,7 +330,7 @@ Build the native library and the static edge initramfs separately from their mat
 this example neither fetches nor builds them unless it is built with `agent-bundled`. Use the
 pinned OpenVMM, which includes the
 scratchless RAM-overlay topology, and the NVX kernel that its time ABI requires, such as a
-release's `guest/vmlinux`. OpenVMM selects a [CPU profile](https://github.com/microsoft/nvx/blob/ff3cedf636e18630dd9ca18f0aeec5c0207dae6e/doc/usage.md#cpu-profiles) at
+release's `guest/vmlinux`. OpenVMM selects a [CPU profile](https://github.com/microsoft/nvx/blob/6b485c82c9fdf4f592e1221efc7d6d41ab9bc66c/doc/usage.md#cpu-profiles) at
 every cold boot, so start fails with `backend_error` on a host that none of its built-in
 profiles serves, or whose hypervisor does not support its profile; the OpenVMM log that the
 error names gives the reason. On such a development host, `cpuProfile: "host"` (the example's
@@ -633,7 +633,7 @@ TCP and UDP on those ports.
 Any `nvx::Error` converts into an `Error` with the same message: `Unavailable`
 becomes `backend_unavailable`, `Unsupported` becomes `policy_validation`, and
 every other kind becomes `backend_error`. `Error::nvx_code` keeps the error's
-[`nvx::ErrorCode`](https://github.com/microsoft/nvx/blob/ff3cedf636e18630dd9ca18f0aeec5c0207dae6e/nvx-rs/README.md#error-codes), which tells apart the
+[`nvx::ErrorCode`](https://github.com/microsoft/nvx/blob/6b485c82c9fdf4f592e1221efc7d6d41ab9bc66c/nvx-rs/README.md#error-codes), which tells apart the
 failures that share an `ErrorCode`. Callers match these codes rather than messages, whose
 wording may change. The wire body carries the `ErrorCode` alone.
 
@@ -659,8 +659,8 @@ download the edge agent bundle.
 ## Dependency on `nvx`
 
 The crate is not published to a registry. It and its data model depend on the
-[`nvx` crate](https://github.com/microsoft/nvx/blob/ff3cedf636e18630dd9ca18f0aeec5c0207dae6e/nvx-rs/README.md)
-0.1.0-alpha.3 from crates.io, which was published from commit `ff3cedf6` of the public
+[`nvx` crate](https://github.com/microsoft/nvx/blob/6b485c82c9fdf4f592e1221efc7d6d41ab9bc66c/nvx-rs/README.md)
+0.1.0-alpha.6 from crates.io, which was published from commit `6b485c82` of the public
 `microsoft/nvx` repository.
 
 ## Breaking changes
