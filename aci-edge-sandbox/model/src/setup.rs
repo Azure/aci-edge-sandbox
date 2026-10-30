@@ -460,14 +460,18 @@ pub struct ImageSettings {
     /// How a host that pulls registry references materializes them.
     #[serde(default, skip_serializing_if = "ReferenceSettings::is_default")]
     pub references: ReferenceSettings,
-    /// Maximum combined length of retained VHDs in the managed image cache, in bytes.
-    /// Temporary conversion data is excluded. Omission or `None` leaves the cache unlimited.
+    /// Maximum combined length, in bytes, of the staged images that the host's image cache counts:
+    /// registry references, and the default and prefetched images. Images that callers register
+    /// only by path do not count. A registration that would exceed it first evicts unused
+    /// references, the largest first, and fails if they cannot make room. Temporary conversion
+    /// data is excluded. Omission or `None` leaves the cache unlimited; zero is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cache_capacity_bytes: Option<u64>,
 }
 
 impl ImageSettings {
-    /// Sets the maximum combined length of retained image-cache VHDs, in bytes.
+    /// Sets the image cache's limit, in bytes; see
+    /// [`max_cache_capacity_bytes`](Self::max_cache_capacity_bytes).
     #[must_use]
     pub fn with_max_cache_capacity_bytes(mut self, max_cache_capacity_bytes: u64) -> Self {
         self.max_cache_capacity_bytes = Some(max_cache_capacity_bytes);

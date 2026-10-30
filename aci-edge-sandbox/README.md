@@ -12,7 +12,10 @@ repository's `aci-edge-sandbox` directory.
 ## Quick start
 
 Create a client over the agent library with `AciEdgeSandbox::agent`, then provision, start,
-exec, stop, and deprovision; see [Agent backend](#agent-backend).
+exec, stop, and deprovision; see [Agent backend](#agent-backend). A sandbox boots only an image
+that the library has registered: the setup's default image, which the backend registers when it
+opens, or an image that `AgentBackend::register_image` or `AgentBackend::register_reference`
+registered first. Provision and start never pull, copy, or register an image.
 [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) is a runnable version with
 command-line arguments.
 
@@ -25,6 +28,11 @@ command-line arguments.
 | `AciEdgeSandbox::exec` | running → running | live stdout and stderr, then an `ExecOutcome` |
 | `AciEdgeSandbox::stop` | running → provisioned | optional metadata |
 | `AciEdgeSandbox::deprovision` | provisioned → (none) | optional metadata; the ID becomes stale |
+
+Images are registered outside this lifecycle. With a backend that registers images, such as the
+agent backend, `provision` takes the image that its spec names, or the setup's default image,
+only if that image is registered, and fails with `BackendUnavailable` otherwise. `start` boots
+the image that the sandbox was provisioned with.
 
 `ExecOutcome` distinguishes `Exited(code)`, `Signaled(signal)`, `TimedOut`,
 `Cancelled`, and `Failed(reason)`. `Failed(WorkingDirectory)` means that the
@@ -115,8 +123,14 @@ approved, and a `SetupConfig`, which the library applies once per process:
     "resources": { "vcpus": 1, "memoryMib": 256 },
     "guestNetwork": "10.0.0.2/24"
   },
-  // How long a library that pulls registry references may take to materialize one.
-  "images": { "references": { "pullTimeoutMs": 1800000 } },
+  "images": {
+    // Local images that the library registers in the background when it opens.
+    "prefetch": [{ "path": "C:\\images\\tools.gpt" }],
+    // How long a library that pulls registry references may take to materialize one.
+    "references": { "pullTimeoutMs": 1800000 },
+    // Optional: a limit on the image cache, in bytes; see "Image cache limit" below.
+    "maxCacheCapacityBytes": 10737418240
+  },
   "diagnostics": { "guestDebug": false },
   // Optional: templates that sandboxes start as clones of; see "Platform snapshots".
   "platformSnapshots": { "enabled": true, "maxVcpus": 4, "maxMemoryMib": 8192 }
@@ -197,10 +211,12 @@ would expose it.
   than falling back.
 - **Opening.** The first backend that a process opens for a setup verifies the runtime files, or
   checks the seals that an earlier process recorded under the state root, and registers the
-  default image. Later backends for the same setup reuse that host without touching a file, so
-  a caller may create a backend for every operation; the operations check the files that they
-  use. One that finds a runtime file changed makes the next backend verify the files again, and
-  one that finds the default image changed or unregistered makes it register the image again.
+  default image. It also starts registering the local paths of `images.prefetch` in the
+  background; a provision that names one fails until its registration finishes, or if it failed.
+  Later backends for the same setup reuse that host without touching a file, so a caller may
+  create a backend for every operation; the operations check the files that they use. One that
+  finds a runtime file changed makes the next backend verify the files again, and one that finds
+  the default image changed or unregistered makes it register the image again.
   Hosts, guest sessions, and boot-console capture stay in the library for the life of the
   process; dropping a backend leaves its sandboxes running.
 - **Images.** The library registers images under the state root by their content ID,
@@ -212,19 +228,39 @@ would expose it.
   `RegisteredImage::path` names and sandboxes attach, so later changes to the registered file do
   not reach them. A later registration, in any process, reuses one that the file still matches
   without reading the file. Provision takes only registered images: by ID, by the path that was
-  registered, or by the reference. A path whose file changed since its registration fails until
-  it is registered again, and provision never pulls, copies, or hashes an image; it records the
-  image ID and the runtime digests. Start compares the seal of each runtime file and of the
-  staged copy (volume, file ID, length, and last-write time, plus the change time on Linux) with
-  the one taken when it was hashed or staged, instead of hashing again, hands OpenVMM the copy
-  that it checked, and fails with `backend_unavailable` if anything changed, so a start costs
-  about the guest's boot time. A seal detects replacement or modification, not a writer that
+  registered, or by the reference. One that is not registered fails the provision with
+  `backend_unavailable`: register it first. A path whose file changed since its registration
+  fails until it is registered again, and provision never pulls, copies, or hashes an image; it
+  records the image ID and the runtime digests. Start compares the seal of each runtime file and
+  of the staged copy (volume, file ID, length, and last-write time, plus the change time on
+  Linux) with the one taken when it was hashed or staged, instead of hashing again, hands OpenVMM
+  the copy that it checked, and fails with `backend_unavailable` if anything changed, so a start
+  costs about the guest's boot time. A seal detects replacement or modification, not a writer that
   deliberately restores timestamps. On Windows, start also keeps writers out of the files until
   OpenVMM has opened them. Register an image again with `register_image` to stage it anew:
   unchanged content keeps its ID, so sandboxes that use it start again. `images` lists the
   registrations and whether each staged copy still matches, `verify_image` hashes one again, as a
   diagnostic, and `unregister_image` refuses while a provisioned sandbox uses the image, and
   otherwise removes its staged copy.
+- **Image cache limit.** `images.maxCacheCapacityBytes` limits the combined length, in bytes, of
+  the staged copies that the library's image cache counts. Omitted, the cache has no limit; zero
+  is refused.
+  - The cache counts registry references, and the setup's default image and prefetched paths.
+    Other images registered by path do not count, and the library never evicts them.
+  - A registration that makes an image count admits it first. If the counted images and the new
+    one do not fit, the library evicts unused references, the largest first, until it fits. It
+    refuses an image longer than the limit with `policy_validation`, and one that the unused
+    references cannot make room for with `backend_unavailable`, and then evicts nothing.
+  - The library never evicts an image that a provisioned sandbox uses, from its provision until
+    its deprovision, whichever process provisioned it. The setup's default image and prefetched
+    paths are protected: counted, but never evicted, until they are unregistered. An image
+    registered both by path and by reference counts, and is never evicted.
+  - Eviction unregisters the image. A provision that names an evicted reference fails with
+    `backend_unavailable`, and `register_reference` registers it again, which pulls it.
+  - Each backend enforces its own setup's limit when it registers an image, so processes whose
+    setups differ can share a state root. A backend without a limit counts, protects, and evicts
+    nothing, so another with a limit may evict its default image when that is an unused
+    reference. A library that does not support the limit refuses a setup that sets it.
 - **The guest.** The image is attached read-only; the edge guest validates its GPT and p2+ ext4
   layers and keeps its writable layer in RAM, so it needs no scratch disk. Start sends OpenVMM a
   fresh 32-byte capability through standard input, checks the process that serves the control
@@ -625,8 +661,8 @@ TCP and UDP on those ports.
 | `exec` on a stopped sandbox, or a VM that died | `NotStarted` | `not_started` |
 | `start` or `deprovision` on a running sandbox | `AlreadyStarted` | `already_started` |
 | `stop` on a stopped sandbox | `AlreadyStopped` | `already_stopped` |
-| Unsupported policy or exec feature, oversized command, relative or oversized `process.cwd` | `PolicyValidation` | `policy_validation` |
-| A runtime dependency of the backend is missing or unusable | `BackendUnavailable` | `backend_unavailable` |
+| Unsupported policy or exec feature, oversized command, relative or oversized `process.cwd`, an image longer than the image cache's limit | `PolicyValidation` | `policy_validation` |
+| A runtime dependency of the backend is missing or unusable, such as an image that is not registered or changed since its registration, or one that the image cache cannot make room for | `BackendUnavailable` | `backend_unavailable` |
 | The backend does not implement the requested operation | `Unsupported` | `backend_error` (the wire model has no separate code) |
 | Any other backend failure | `BackendError` | `backend_error` |
 

@@ -187,6 +187,11 @@ impl AgentBackend {
     /// [`ImageDigest::Trusted`], and stages it: sandboxes then attach the library's own read-only
     /// copy, which [`RegisteredImage::path`] names, and later changes to the file at `path` do not
     /// reach them. A registration that the file still matches is reused without reading the file.
+    /// Provision and start never register an image: register each one that a sandbox's spec names
+    /// before provisioning it. With an image cache limit
+    /// ([`ImageSettings::max_cache_capacity_bytes`]), an image registered only by path counts
+    /// toward it only if it is the setup's default or a prefetched image, and the library never
+    /// evicts it.
     pub fn register_image(
         &self,
         path: impl Into<PathBuf>,
@@ -204,6 +209,14 @@ impl AgentBackend {
     /// reused without pulling it again. A backend that does not honor references, as
     /// [`Capabilities::spec`] reports, refuses it with
     /// [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation).
+    ///
+    /// With an image cache limit ([`ImageSettings::max_cache_capacity_bytes`]), the library
+    /// admits the pulled image first: it evicts unused references to make room, and refuses the
+    /// registration with [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable)
+    /// if they cannot, or with [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation)
+    /// for an image longer than the limit. A later registration may evict this reference once no
+    /// provisioned sandbox uses it; a provision that names it then fails until it is registered
+    /// again.
     pub fn register_reference(
         &self,
         reference: impl Into<String>,

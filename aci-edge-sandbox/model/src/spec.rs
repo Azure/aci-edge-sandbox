@@ -23,7 +23,8 @@ pub use nvx::net::{is_valid_guest_network, is_valid_hostname};
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SandboxSpec {
-    /// The guest image; `None` selects the backend's default image.
+    /// The guest image; `None` selects the backend's default image. A backend that registers
+    /// images boots only a registered one; see [`ImageSource`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageSource>,
     /// Guest resources; unset values take the backend's defaults.
@@ -116,7 +117,11 @@ impl SandboxSpec {
 ///
 /// A backend that registers images provisions only images registered with it: a path or a
 /// reference that it has not registered fails, and provisioning never pulls, copies, or hashes an
-/// image. The setup's default image is registered when the backend opens.
+/// image. The setup's default image is registered when the backend opens. A host with an image
+/// cache limit ([`ImageSettings::max_cache_capacity_bytes`]) may evict an unused reference to make
+/// room for another image; a provision that names it then fails until it is registered again.
+///
+/// [`ImageSettings::max_cache_capacity_bytes`]: crate::ImageSettings::max_cache_capacity_bytes
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
