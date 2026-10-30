@@ -284,5 +284,8 @@ else
 $results | Format-Table -AutoSize | Out-String -Width 220 | Write-Host
 Write-Host "Logs: $WorkDir"
 if ($results.Result -contains 'FAIL') { exit 1 }
-# Scenarios that expect cargo to fail leave its exit code in $LASTEXITCODE.
+# Every cargo exit code has been judged above: a scenario passes only with the result it expects,
+# and any failed scenario exits 1. Other failures throw ($ErrorActionPreference = 'Stop'). So the
+# $LASTEXITCODE left over here is that of the last scenario, often one that expects cargo to fail,
+# and is not a result.
 exit 0
