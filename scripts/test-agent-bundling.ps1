@@ -284,3 +284,5 @@ else
 $results | Format-Table -AutoSize | Out-String -Width 220 | Write-Host
 Write-Host "Logs: $WorkDir"
 if ($results.Result -contains 'FAIL') { exit 1 }
+# Scenarios that expect cargo to fail leave its exit code in $LASTEXITCODE.
+exit 0
