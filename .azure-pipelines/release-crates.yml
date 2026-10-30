@@ -1,0 +1,186 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+#
+# Manual crates.io release of aci_edge_sandboxes_model and aci_edge_sandboxes through ESRP
+# Release; see RELEASING.md.
+#
+# With dryRun (the default), the run only prepares the two archives: one joint
+# `cargo publish --dry-run` for crates.io, then `cargo package`, whose archives must be the
+# bytes that the dry run verified. It publishes them, with SHA256SUMS and release-manifest.json,
+# as the pipeline artifact `aci-edge-crates`. Review that artifact before any release.
+#
+# To publish, queue the run on the release tag `aci_edge_sandboxes-v<version>` with dryRun
+# cleared, the approved digest of each archive, and esrpVariableGroup naming the variable group
+# of the ESRP Release onboarding. The publish job submits the model, waits for crates.io's index
+# to list it, then submits the crate. A version that crates.io already lists with the approved
+# checksum is skipped, so a run that stopped between the two can be queued again on the same tag.
+#
+# Prerequisites that this file cannot supply: the ESRP Release onboarding for crates.io (service
+# connection, certificates, owners, approvers) in its variable group, the crates.io ownership of
+# both crate names by the account that ESRP publishes as, and an agent pool whose prepare job can
+# reach crates.io.
+
+trigger: none
+pr: none
+
+name: $(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+parameters:
+  - name: dryRun
+    displayName: Dry run - prepare and publish the archives as an artifact only
+    type: boolean
+    default: true
+  - name: approvedModelSha256
+    displayName: Approved SHA-256 of aci_edge_sandboxes_model-<version>.crate (required to publish)
+    type: string
+    default: ' '
+  - name: approvedCrateSha256
+    displayName: Approved SHA-256 of aci_edge_sandboxes-<version>.crate (required to publish)
+    type: string
+    default: ' '
+  - name: esrpVariableGroup
+    displayName: Variable group of the ESRP Release onboarding (required to publish)
+    type: string
+    default: ' '
+  - name: poolName
+    displayName: 1ES agent pool
+    type: string
+  - name: rustToolchain
+    displayName: Rust toolchain
+    type: string
+    default: '1.95.0'
+
+resources:
+  repositories:
+    - repository: 1ESPipelineTemplates
+      type: git
+      name: 1ESPipelineTemplates/1ESPipelineTemplates
+      ref: refs/tags/release
+
+variables:
+  - ${{ if eq(parameters.dryRun, false) }}:
+      - group: ${{ parameters.esrpVariableGroup }}
+
+extends:
+  template: v1/1ES.Official.PipelineTemplate.yml@1ESPipelineTemplates
+  parameters:
+    pool:
+      name: ${{ parameters.poolName }}
+      image: windows-2022
+      os: windows
+    sdl:
+      sourceAnalysisPool:
+        name: ${{ parameters.poolName }}
+        image: windows-2022
+        os: windows
+
+    stages:
+      - stage: Prepare
+        displayName: Prepare the crates
+        jobs:
+          - job: prepare
+            displayName: Dry run and package
+            templateContext:
+              outputs:
+                - output: pipelineArtifact
+                  targetPath: $(Build.ArtifactStagingDirectory)/crates
+                  artifactName: aci-edge-crates
+            steps:
+              - checkout: self
+                fetchTags: true
+                clean: true
+
+              - pwsh: |
+                  rustup toolchain install '${{ parameters.rustToolchain }}' --profile minimal
+                  if ($LASTEXITCODE -ne 0) { throw "rustup failed with exit $LASTEXITCODE" }
+                displayName: Install Rust ${{ parameters.rustToolchain }}
+
+              - pwsh: |
+                  $arguments = @{ OutDir = '$(Build.ArtifactStagingDirectory)/crates'; Toolchain = '${{ parameters.rustToolchain }}' }
+                  $ref = '$(Build.SourceBranch)'
+                  if ($ref -clike 'refs/tags/*') { $arguments.ExpectedTag = $ref.Substring('refs/tags/'.Length) }
+                  ./scripts/release/Invoke-CratePackage.ps1 @arguments
+                displayName: Prepare the archives
+
+      - ${{ if eq(parameters.dryRun, false) }}:
+          - stage: Publish
+            displayName: Publish to crates.io
+            dependsOn: Prepare
+            jobs:
+              - job: publish
+                displayName: Publish through ESRP Release
+                templateContext:
+                  type: releaseJob
+                  isProduction: true
+                  inputs:
+                    - input: pipelineArtifact
+                      artifactName: aci-edge-crates
+                      targetPath: $(Pipeline.Workspace)/crates
+                variables:
+                  cratesDir: $(Pipeline.Workspace)/crates
+                steps:
+                  - checkout: self
+                    fetchTags: true
+
+                  # The run's own source, not just its branch name, must be the release, and the
+                  # archives must be the approved ones.
+                  - pwsh: |
+                      $ErrorActionPreference = 'Stop'
+                      $ref = '$(Build.SourceBranch)'
+                      if ($ref -cnotlike 'refs/tags/aci_edge_sandboxes-v?*') { throw "publishing requires a refs/tags/aci_edge_sandboxes-v<version> ref; this run is on '$ref'" }
+                      $tag = $ref.Substring('refs/tags/'.Length)
+                      $release = Get-Content -Raw '$(cratesDir)/release-manifest.json' | ConvertFrom-Json
+                      if ($release.tag -cne $tag) { throw "the archives were prepared for tag '$($release.tag)', not '$tag'" }
+                      if ($tag -cne "aci_edge_sandboxes-v$($release.version)") { throw "tag $tag does not name version $($release.version)" }
+                      $tagged = (git rev-parse --verify "refs/tags/$tag^{commit}").Trim()
+                      if ($release.commit -ne '$(Build.SourceVersion)' -or $tagged -ne $release.commit) { throw "the archives are from $($release.commit); the run is at $(Build.SourceVersion) and $tag names $tagged" }
+                      if ($release.dirty) { throw 'the archives were prepared from a dirty tree' }
+                      $approved = @{
+                        aci_edge_sandboxes_model = '${{ parameters.approvedModelSha256 }}'.Trim().ToLowerInvariant()
+                        aci_edge_sandboxes = '${{ parameters.approvedCrateSha256 }}'.Trim().ToLowerInvariant()
+                      }
+                      if (@($release.archives).Count -ne 2) { throw 'the artifact must hold exactly two archives' }
+                      foreach ($archive in $release.archives)
+                      {
+                        $sha256 = (Get-FileHash -LiteralPath (Join-Path '$(cratesDir)' $archive.file) -Algorithm SHA256).Hash.ToLowerInvariant()
+                        if ($sha256 -ne $archive.sha256) { throw "$($archive.file) does not have its recorded digest" }
+                        if ($sha256 -ne $approved[$archive.crate]) { throw "$($archive.file) has digest $sha256, not the approved '$($approved[$archive.crate])'" }
+                        if (@(Get-ChildItem -LiteralPath (Join-Path '$(cratesDir)' $archive.crate) -File).Count -ne 1) { throw "$($archive.crate) must hold only its archive" }
+                        Write-Host "##vso[task.setvariable variable=sha256_$($archive.crate)]$sha256"
+                      }
+                      Write-Host "##vso[task.setvariable variable=releaseVersion]$($release.version)"
+                      Write-Host "Releasing $($release.version) from $($release.commit) with the approved archives."
+                    displayName: Check the release ref, commit, version, and digests
+
+                  # The model first: the crate depends on it.
+                  - ${{ each crate in split('aci_edge_sandboxes_model,aci_edge_sandboxes', ',') }}:
+                      - pwsh: |
+                          $state = ./scripts/release/Get-CratesIoVersion.ps1 -Crate '${{ crate }}' -Version '$(releaseVersion)' -ExpectedSha256 '$(sha256_${{ crate }})'
+                          Write-Host "${{ crate }} $(releaseVersion) on crates.io: $state"
+                          Write-Host "##vso[task.setvariable variable=state_${{ crate }}]$state"
+                        displayName: Check crates.io for ${{ crate }}
+
+                      - task: EsrpRelease@12
+                        displayName: Publish ${{ crate }} to crates.io
+                        condition: and(succeeded(), eq(variables['state_${{ crate }}'], 'absent'))
+                        inputs:
+                          connectedservicename: $(serviceName)
+                          usemanagedidentity: false
+                          keyvaultname: $(azureKeyVaultName)
+                          authcertname: $(authCertName)
+                          signcertname: $(signCertName)
+                          clientid: $(clientId)
+                          intent: PackageDistribution
+                          contenttype: Rust
+                          contentsource: Folder
+                          folderlocation: $(cratesDir)\${{ crate }}
+                          owners: $(ownersEmail)
+                          approvers: $(approversEmail)
+                          waitforreleasecompletion: true
+                          serviceendpointurl: https://api.esrp.microsoft.com
+                          mainpublisher: ESRPRELPACMAN
+                          domaintenantid: $(tenantId)
+
+                      - pwsh: |
+                          ./scripts/release/Get-CratesIoVersion.ps1 -Crate '${{ crate }}' -Version '$(releaseVersion)' -ExpectedSha256 '$(sha256_${{ crate }})' -Wait -TimeoutMinutes 30
+                        displayName: Wait for crates.io to list ${{ crate }}

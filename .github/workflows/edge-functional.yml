@@ -1,0 +1,78 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+# Functional acceptance of an edge agent bundle through this crate's client: the agent_lifecycle
+# example and the ignored tests of tests/agent_guest.rs, against the bundle's agent library,
+# OpenVMM, kernel, and edge initramfs. A matching sandbox ABI alone does not show that a bundle
+# works; RELEASING.md requires these checks for every bundle that agent-bundle.json pins.
+#
+# It boots VMs, so it runs only on a self-hosted Windows x64 runner with the Windows Hypervisor
+# Platform, labeled as NVX labels its WHP runners, and only when dispatched.
+
+name: Edge functional acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Release tag of the bundle; the one that agent-bundle.json pins when empty
+        required: false
+        default: ''
+      asset:
+        description: Bundle ZIP asset of that release; required with release
+        required: false
+        default: ''
+      sha256:
+        description: SHA-256 of that asset; required with release
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+
+jobs:
+  acceptance:
+    name: Acceptance / Windows x64 WHP
+    runs-on: [self-hosted, windows, whp, virtual-machine, general]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+      - name: Download the bundle
+        id: bundle
+        env:
+          RELEASE: ${{ inputs.release }}
+          ASSET: ${{ inputs.asset }}
+          SHA256: ${{ inputs.sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (-not $env:RELEASE) {
+            $pin = Get-Content -Raw aci-edge-sandbox/agent-bundle.json | ConvertFrom-Json
+            $env:RELEASE = $pin.release; $env:ASSET = $pin.asset; $env:SHA256 = $pin.sha256
+          }
+          if (-not ($env:ASSET -and $env:SHA256 -match '^[0-9a-f]{64}$')) { throw 'release needs asset and a lowercase sha256.' }
+          $directory = Join-Path $env:RUNNER_TEMP 'bundle-download'
+          gh release download $env:RELEASE --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET --dir $directory
+          if ($LASTEXITCODE -ne 0) { throw 'download failed' }
+          "zip=$(Join-Path $directory $env:ASSET)" >> $env:GITHUB_OUTPUT
+          "sha256=$env:SHA256" >> $env:GITHUB_OUTPUT
+      - name: Run the acceptance checks
+        run: >-
+          ./scripts/test-agent-guest.ps1
+          -BundleZip "${{ steps.bundle.outputs.zip }}"
+          -BundleZipSha256 "${{ steps.bundle.outputs.sha256 }}"
+          -Toolchain $env:RUST_TOOLCHAIN
+          -WorkDir "$env:RUNNER_TEMP/acceptance"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: edge-functional-acceptance
+          path: |
+            ${{ runner.temp }}/acceptance/*.log
+            ${{ runner.temp }}/acceptance/summary.json

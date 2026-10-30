@@ -315,9 +315,15 @@ mod tests {
     fn a_discovered_bundle_names_its_library_and_runtime() {
         // Unit tests run from `<profile>/deps`, beside the bundle that the build script copied
         // into `<profile>`. Only a build that skipped staging, or a target where the agent
-        // library cannot run, has no bundle.
+        // library cannot run, has no bundle. The pinned release stages for Windows x64 only;
+        // other targets stage the bundle that an override names.
         let skipped = env::var_os(contract::BUNDLE_ENV).is_some_and(|value| value == "skip");
-        if !skipped && (cfg!(target_os = "linux") || cfg!(windows)) {
+        let overridden = [contract::BUNDLE_URL_ENV, contract::BUNDLE_DIR_ENV]
+            .into_iter()
+            .any(|name| env::var_os(name).is_some());
+        let staged = cfg!(target_os = "linux")
+            || (cfg!(windows) && (cfg!(target_arch = "x86_64") || overridden));
+        if !skipped && staged {
             assert!(PINS.is_some(), "the build staged no agent bundle");
         }
         let bundle = match BundledAgent::discover() {
