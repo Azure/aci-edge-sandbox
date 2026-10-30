@@ -166,7 +166,9 @@ function New-BundleArchive([string] $Directory, [string] $Archive)
 
 function ConvertTo-FileUrl([string] $Path)
 {
-    ([System.Uri](Resolve-Path $Path).Path).AbsoluteUri
+    # An explicitly absolute URI: PowerShell's [System.Uri] cast parses a Unix path such as /tmp/a.zip
+    # as relative, whose AbsoluteUri is then silently empty.
+    [System.Uri]::new((Resolve-Path $Path).Path, [System.UriKind]::Absolute).AbsoluteUri
 }
 
 # Runs cargo in `Directory` with `Environment` set and every other bundle variable unset, and
