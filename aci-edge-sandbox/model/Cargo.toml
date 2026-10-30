@@ -15,7 +15,7 @@ publish = false
 getrandom = "0.4"
 humantime = "2.4"
 # `Cidr` and `Hypervisor` come from NVX, without its host side.
-nvx = { version = "0.1.0-alpha.6", default-features = false, features = ["serde"] }
+nvx = { version = "0.1.0-alpha.7", default-features = false, features = ["serde"] }
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.120"
 thiserror = "2"
