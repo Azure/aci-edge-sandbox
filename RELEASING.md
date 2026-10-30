@@ -85,6 +85,15 @@ To publish, queue it on the release tag with `dryRun` cleared and `approvedModel
 Before submitting a crate, it asks crates.io whether that version exists: a version with the
 approved checksum is skipped, and one with another checksum fails the run.
 
+## Compatibility record
+
+The crate checks a bundle's sandbox ABI and digests, not that its components work together. Each
+release's notes therefore record the combination that passed the lifecycle smoke: the crate
+version and its `nvx` version; the bundle's release tag, asset, and SHA-256; and the producer
+revisions that its `bundle-manifest.json` names (the Compute-ACI-Agent commit of the agent library
+and edge guest, and the NVX and OpenVMM revisions of the kernel and `openvmm.exe`). A new bundle
+or `nvx` version needs the smoke again before `agent-bundle.json` or the manifests pin it.
+
 ## Recovering from a partial release
 
 If the model is published and the crate is not, do not yank the model. Fix the cause outside the
