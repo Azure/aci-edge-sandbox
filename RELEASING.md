@@ -24,7 +24,7 @@ Publish only when every gate holds:
 | --- | --- |
 | The pinned bundle is the approved bundle for this release | `agent-bundle.json` names it by release tag, asset, and SHA-256 |
 | The pinned bundle speaks this crate's sandbox ABI | `pwsh scripts/test-agent-bundling.ps1 -Pinned` passes |
-| The bundle runs a sandbox | The lifecycle smoke below passes on a Windows x64 host with the Windows Hypervisor Platform |
+| The bundle works with this client | `pwsh scripts/test-agent-guest.ps1` passes for the pinned asset on a Windows x64 host with the Windows Hypervisor Platform: the lifecycle example and every ignored `tests/agent_guest.rs` test |
 | The `nvx` version that the manifests pin is on crates.io | `cargo publish --dry-run` resolves it |
 | The source builds and its tests pass | The CI workflow passes on the release commit |
 | The archives are the reviewed ones | The release run's `SHA256SUMS` equals the approved digests |
@@ -59,14 +59,20 @@ is not built without the consumer's feature, that the consumer's build script re
 `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`, and that the application finds its bundle after
 both are copied elsewhere. With `-ArchiveDir` it is local staging evidence only.
 
-Lifecycle smoke, on a Windows x64 host with the Windows Hypervisor Platform enabled:
+Functional acceptance, on a Windows x64 host with the Windows Hypervisor Platform enabled. A
+matching sandbox ABI shows that the bundle and the crate speak the same interface, not that they
+work together, so every bundle that `agent-bundle.json` pins passes these checks first:
 
 ```powershell
-cd aci-edge-sandbox
-cargo run --release --locked --features agent-bundled --example agent_lifecycle
+pwsh scripts/test-agent-guest.ps1 -BundleZip <asset> -BundleZipSha256 <sha256>
 ```
 
-It must print `READY` and the guest's `/etc/os-release`, then stop and deprovision the sandbox.
+It runs the `agent_lifecycle` example, which pulls an image through the bundle's `direct-images`
+and provisions, starts, runs a command in, stops, and deprovisions a sandbox, then every ignored
+test of `tests/agent_guest.rs` against the bundle's library, OpenVMM, kernel, and initramfs. The
+[Edge functional acceptance](.github/workflows/edge-functional.yml) workflow runs the same script
+on a self-hosted WHP runner when dispatched. Keep its `summary.json` and logs with the release's
+compatibility record.
 
 ## Publish
 
@@ -131,20 +137,20 @@ approved checksum is skipped, and one with another checksum fails the run.
 ## Compatibility record
 
 The crate checks a bundle's sandbox ABI and digests, not that its components work together. Each
-release's notes therefore record the combination that passed the lifecycle smoke: the crate
-version and its `nvx` version; the bundle's release tag, asset, and SHA-256; and the producer
-revisions that its `bundle-manifest.json` names (the Compute-ACI-Agent commit of the agent library
-and edge guest, and the NVX and OpenVMM revisions of the kernel and `openvmm.exe`). A new bundle
-or `nvx` version needs the smoke again before `agent-bundle.json` or the manifests pin it.
+release's notes therefore record the combination that passed functional acceptance
+(`scripts/test-agent-guest.ps1`): the crate version and its `nvx` version; the bundle's release
+tag, asset, and SHA-256; the producer revisions that its `bundle-manifest.json` names (the
+Compute-ACI-Agent commit of the agent library and edge guest, and the NVX and OpenVMM revisions of
+the kernel and `openvmm.exe`); and the host, image, and results of the run. A new bundle or `nvx`
+version needs functional acceptance again before `agent-bundle.json` or the manifests pin it.
 
 ## Recovering from a partial release
 
 If the model is published and the crate is not, do not yank the model. Fix the cause outside the
 crates (credentials, approvals, the index), then publish the crate from the same approved
 archives. The ESRP pipeline, queued again on the same tag with the same digests, skips the
-published model. If the crate itself
-must change, release both crates at the next patch version; yank a version only when it is
-harmful to use.
+published model. If the crate itself must change, release both crates at the next patch
+version; yank a version only when it is harmful to use.
 
 ## Verify after publication
 
@@ -157,4 +163,4 @@ pwsh scripts/release/Test-CrateConsumer.ps1 -Version <version>
 Its lock file must name crates.io as the source of `aci_edge_sandboxes`,
 `aci_edge_sandboxes_model`, and `nvx`. On a Windows x64 host with the Windows Hypervisor
 Platform, add `-Open` to load the agent library through the relocated bundle, and run the
-lifecycle smoke from the published crate.
+`agent_lifecycle` example from the published crate.
