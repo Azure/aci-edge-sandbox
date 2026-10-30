@@ -57,6 +57,13 @@ function Get-Sha256([string] $Path)
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+# The sandbox ABI that this crate's model speaks; synthetic bundles speak it unless a scenario
+# names another.
+$wire = Get-Content -Raw -LiteralPath (Join-Path $crate 'model/src/wire.rs')
+$match = [regex]::Match($wire, 'pub const SANDBOX_ABI_VERSION: u32 = (\d+);')
+if (-not $match.Success) { throw 'model/src/wire.rs declares no SANDBOX_ABI_VERSION.' }
+$crateAbi = [int]$match.Groups[1].Value
+
 # A library header that names `Machine`: a PE file on Windows and a little-endian ELF file
 # elsewhere. The build script reads only the header.
 function New-LibraryBytes([bool] $Pe, [int] $Machine)
@@ -82,7 +89,7 @@ function New-SyntheticBundle
     param
     (
         [string] $Directory,
-        [int] $SandboxAbi = 2,
+        [int] $SandboxAbi = $crateAbi,
         [int] $Machine = $(if ($isWindowsHost) { 0x8664 } else { 62 })
     )
     $exe = if ($isWindowsHost) { '.exe' } else { '' }
