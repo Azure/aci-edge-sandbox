@@ -650,11 +650,11 @@ download the edge agent bundle.
 - `testing::MockBackend` scripts executions for consumers' unit tests.
 - The ignored `agent_guest` tests run the agent backend against a real hypervisor; they need an
   approved agent library, the edge guest, a GPT image, and a hypervisor host.
-- The agent-bundle staging tests are driven by `scripts/nvx.py test-agent-bundling` in the
-  [`microsoft/nvx`](https://github.com/microsoft/nvx) repository. It stages a synthetic agent
-  bundle through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, which the bundled-agent tests must find,
-  and checks that the build rejects broken copies of it; it needs neither a hypervisor nor an
-  agent library that runs.
+- When an `agent-bundled` build stages a bundle, a unit test checks that
+  `BundledAgent::discover` finds it, with its digests. Build with
+  `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR` to stage an extracted bundle, such as a locally built
+  one, without a download (see [Bundled agent](#bundled-agent-agent-bundled)); the test needs
+  neither a hypervisor nor an agent library that runs.
 
 ## Dependency on `nvx`
 
