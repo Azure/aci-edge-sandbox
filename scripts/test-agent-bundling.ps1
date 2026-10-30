@@ -166,7 +166,9 @@ function New-BundleArchive([string] $Directory, [string] $Archive)
 
 function ConvertTo-FileUrl([string] $Path)
 {
-    ([System.Uri](Resolve-Path $Path).Path).AbsoluteUri
+    # An explicitly absolute URI: PowerShell's [System.Uri] cast parses a Unix path such as /tmp/a.zip
+    # as relative, whose AbsoluteUri is then silently empty.
+    [System.Uri]::new((Resolve-Path $Path).Path, [System.UriKind]::Absolute).AbsoluteUri
 }
 
 # Runs cargo in `Directory` with `Environment` set and every other bundle variable unset, and
@@ -282,3 +284,8 @@ else
 $results | Format-Table -AutoSize | Out-String -Width 220 | Write-Host
 Write-Host "Logs: $WorkDir"
 if ($results.Result -contains 'FAIL') { exit 1 }
+# Every cargo exit code has been judged above: a scenario passes only with the result it expects,
+# and any failed scenario exits 1. Other failures throw ($ErrorActionPreference = 'Stop'). So the
+# $LASTEXITCODE left over here is that of the last scenario, often one that expects cargo to fail,
+# and is not a result.
+exit 0
