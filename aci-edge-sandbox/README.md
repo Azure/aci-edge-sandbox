@@ -478,6 +478,32 @@ the executable, boots `mcr.microsoft.com/azurelinux/base/core:3.0`, and runs
 `printf READY; echo; head -n 2 /etc/os-release`. Every option still overrides its default, and
 `--bundle`, `--openvmm`, or `--host-library` options replace the staged runtime or library.
 
+#### Cache reuse and eviction demonstration
+
+`--cache-demo` sets `images.maxCacheCapacityBytes` to **128 MiB** and demonstrates a
+cache hit and two evictions before running the normal lifecycle. With a compatible
+bundle staged as described above, use a fresh state root:
+
+```powershell
+cargo run --release --locked --features agent-bundled --example agent_lifecycle -- `
+    --cache-demo --state-root 'C:\edge-cache-demo' `
+    --image-ref 'mcr.microsoft.com/azurelinux/base/core:3.0'
+```
+
+The mode registers the selected reference, registers it again and checks that its
+registration and staged-file modification time are unchanged, then admits
+`mcr.microsoft.com/cbl-mariner/base/core:2.0`. Each image must fit individually but
+their combined staged lengths must exceed 128 MiB. It verifies the first image was
+evicted, registers it again and verifies the second was evicted, then boots the
+retained image by digest. Progress and staged sizes are printed on standard error.
+
+The host deliberately has no default image in this mode: a default would be protected
+from eviction. Existing registries are rejected rather than changing their images;
+use another fresh state root for each demonstration. The final image stays cached
+after the sandbox is deprovisioned. A path image, an oversized image, or references
+that resolve to identical content or fit together cannot demonstrate eviction and
+fail explicitly. Without `--cache-demo`, the existing unlimited-cache behavior is unchanged.
+
 ### Native host paths and network
 
 The native backend maps host paths to guest paths and reads network rules as described in
@@ -655,6 +681,36 @@ download the edge agent bundle.
   bundle through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, which the bundled-agent tests must find,
   and checks that the build rejects broken copies of it; it needs neither a hypervisor nor an
   agent library that runs.
+
+### Image-cache capacity tests
+
+The ignored `image_cache_capacity_` scenarios in `tests/agent_guest.rs` exercise
+`images.maxCacheCapacityBytes` through the public crate and inspect the persisted
+`images/<digest>.json` registrations. They require a native library that implements
+cache-capacity admission, not merely one with the matching sandbox ABI.
+
+Set the usual `EDGE_AGENT_TEST_*` runtime, image, and library variables. The reference
+scenarios also require `EDGE_AGENT_TEST_BUNDLE`, `EDGE_AGENT_TEST_BUNDLE_SHA256`, and
+network access to `mcr.microsoft.com`. They pull the public Azure Linux `core:3.0`
+and CBL-Mariner `core:2.0` images; the path-only scenarios use `EDGE_AGENT_TEST_IMAGE`.
+
+```powershell
+cargo test --release --locked --features agent --test agent_guest image_cache_capacity_ -- --ignored --test-threads=1
+```
+
+The scenarios cover unlimited and zero limits, exact fits and oversized images,
+external path registrations, defaults by path/reference/digest, asynchronous path
+prefetch and admission failures, duplicate content, reference/path aliases, eviction,
+and provisioned, running, and stopped sandboxes that keep their images in use. They check registration
+IDs, source paths and seals, references, protection and trust attributes, staged
+paths, read-only permissions, and actual staged lengths.
+
+The limit counts staged-image bytes, not compressed download sizes or peak disk
+usage during conversion. Ordinary path registrations are excluded unless protected
+as defaults or prefetched paths by a limited host. References count; unused
+reference-only images can be evicted, largest first. Protection remains in the
+registration until it is explicitly unregistered. Prefetch currently registers only
+paths, not references or digests.
 
 ## Dependency on `nvx`
 

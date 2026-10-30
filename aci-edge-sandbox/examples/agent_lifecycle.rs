@@ -6,6 +6,7 @@
 //! Built with the `agent-bundled` feature, every option has a default: the bundle that the build
 //! staged beside this executable, a state root beside this executable, a public image reference,
 //! and a command that prints `READY` and the guest's OS release.
+//! `--cache-demo` first demonstrates reuse and eviction under a 128 MiB image-cache limit.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,8 +17,8 @@ use std::sync::Arc;
 use aci_edge_sandboxes::agent::BundledAgent;
 use aci_edge_sandboxes::agent::{
     AgentBackend, AgentConfig, BundleSource, CpuProfile, Diagnostics, Hypervisor, ImageDigest,
-    ImageSettings, PlatformSnapshots, ReferenceSettings, RuntimeFiles, RuntimeSource,
-    SandboxDefaults, SetupConfig,
+    ImageId, ImageSettings, PlatformSnapshots, ReferenceSettings, RegisteredImage, RuntimeFiles,
+    RuntimeSource, SandboxDefaults, SetupConfig,
 };
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ExecOutcome, ExecRequest, FilesystemPolicy,
@@ -48,6 +49,7 @@ fn run() -> Result<(), String> {
     let mut image_digest = ImageDigest::Compute;
     let mut pull_timeout_ms = None;
     let mut registry_auth_file = None;
+    let mut cache_demo = false;
     let mut root = None;
     let mut hypervisor = None;
     let mut filesystem = FilesystemPolicy::default();
@@ -80,6 +82,7 @@ fn run() -> Result<(), String> {
             "--image" => image = Some(value()?),
             "--image-ref" => image_ref = Some(value()?),
             "--registry-auth-file" => registry_auth_file = Some(value()?),
+            "--cache-demo" => cache_demo = true,
             "--host-library" => library = Some(value()?),
             "--host-sha256" => digest = Some(parse_digest(&option, &value()?)?),
             "--image-sha256" => {
@@ -171,6 +174,11 @@ fn run() -> Result<(), String> {
     } else if pull_timeout_ms.is_some() || registry_auth_file.is_some() {
         return Err("--pull-timeout-ms and --registry-auth-file require --image-ref".to_owned());
     }
+    let cache_reference = if cache_demo {
+        Some(cache_demo_reference(&image)?.to_owned())
+    } else {
+        None
+    };
     let (library, digest) = match (library, digest, defaults.library) {
         (None, None, Some(staged)) => staged,
         (library, digest, _) => (
@@ -234,13 +242,13 @@ fn run() -> Result<(), String> {
         exec = exec.with_envs(environment).with_inherit_default_env(true);
     }
 
+    let mut sandbox_defaults = SandboxDefaults::default().with_image_digest(image_digest);
+    if !cache_demo {
+        sandbox_defaults = sandbox_defaults.with_image(image);
+    }
     let mut setup = SetupConfig::new(root, runtime)
         .with_cpu_profile(cpu_profile)
-        .with_defaults(
-            SandboxDefaults::default()
-                .with_image(image)
-                .with_image_digest(image_digest),
-        )
+        .with_defaults(sandbox_defaults)
         .with_diagnostics(Diagnostics { guest_debug });
     if let Some(hypervisor) = hypervisor {
         setup = setup.with_hypervisor(hypervisor);
@@ -255,10 +263,18 @@ fn run() -> Result<(), String> {
     if let Some(auth_file) = registry_auth_file {
         references = references.with_auth_file(auth_file);
     }
-    setup = setup.with_images(ImageSettings::default().with_references(references));
+    let mut images = ImageSettings::default().with_references(references);
+    if cache_demo {
+        images = images.with_max_cache_capacity_bytes(CACHE_DEMO_CAPACITY_BYTES);
+    }
+    setup = setup.with_images(images);
     setup.validate().map_err(describe)?;
     let backend =
         Arc::new(AgentBackend::new(AgentConfig::new(setup, library, digest)).map_err(describe)?);
+    if let Some(reference) = cache_reference {
+        let image = run_cache_demo(&backend, &reference)?;
+        spec = spec.with_image(ImageSource::Digest(image));
+    }
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let id = client
         .provision_with(&request, &spec)
@@ -329,6 +345,121 @@ fn run() -> Result<(), String> {
         return Err(format!("guest command {}", output.outcome));
     }
     Ok(())
+}
+
+const CACHE_DEMO_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
+const CACHE_DEMO_OTHER_IMAGE: &str = "mcr.microsoft.com/cbl-mariner/base/core:2.0";
+
+fn cache_demo_reference(image: &ImageSource) -> Result<&str, String> {
+    match image {
+        ImageSource::Reference(reference) if reference != CACHE_DEMO_OTHER_IMAGE => Ok(reference),
+        ImageSource::Reference(_) => Err(format!(
+            "--cache-demo needs an --image-ref different from {CACHE_DEMO_OTHER_IMAGE}"
+        )),
+        _ => Err("--cache-demo requires a registry image selected with --image-ref".to_owned()),
+    }
+}
+
+fn validate_cache_demo_images(
+    first: &RegisteredImage,
+    second: &RegisteredImage,
+) -> Result<(), String> {
+    for image in [first, second] {
+        if image.length > CACHE_DEMO_CAPACITY_BYTES {
+            return Err(format!(
+                "cache demo image {} needs {} bytes, more than the {}-byte limit",
+                image.id, image.length, CACHE_DEMO_CAPACITY_BYTES
+            ));
+        }
+    }
+    if first.id == second.id {
+        return Err(
+            "cache demo references resolved to the same image; eviction needs two images"
+                .to_owned(),
+        );
+    }
+    if first.length.saturating_add(second.length) <= CACHE_DEMO_CAPACITY_BYTES {
+        return Err(
+            "cache demo images fit together within 128 MiB, so they cannot demonstrate eviction"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_cache_eviction(
+    backend: &AgentBackend,
+    evicted: &RegisteredImage,
+    retained: &RegisteredImage,
+) -> Result<(), String> {
+    let images = backend.images().map_err(describe)?;
+    if images.len() != 1 || images[0].id != retained.id {
+        return Err(format!(
+            "cache demo expected only image {} after evicting {}, found {images:?}",
+            retained.id, evicted.id
+        ));
+    }
+    if evicted
+        .path
+        .try_exists()
+        .map_err(|error| error.to_string())?
+    {
+        return Err(format!(
+            "cache demo evicted image {} still has its staged file at {}",
+            evicted.id,
+            evicted.path.display()
+        ));
+    }
+    eprintln!(
+        "cache: evicted {} ({} bytes); retained {} ({} bytes)",
+        evicted.id, evicted.length, retained.id, retained.length
+    );
+    Ok(())
+}
+
+fn run_cache_demo(backend: &AgentBackend, reference: &str) -> Result<ImageId, String> {
+    if !backend.images().map_err(describe)?.is_empty() {
+        return Err(
+            "--cache-demo requires an empty image registry; use a fresh --state-root".to_owned(),
+        );
+    }
+    eprintln!("cache: capacity {CACHE_DEMO_CAPACITY_BYTES} bytes (128 MiB)");
+    let first = backend
+        .register_reference(reference, ImageDigest::Compute)
+        .map_err(describe)?;
+    eprintln!(
+        "cache: registered {reference} as {} ({} staged bytes)",
+        first.id, first.length
+    );
+    let modified = std::fs::metadata(&first.path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| error.to_string())?;
+    let reused = backend
+        .register_reference(reference, ImageDigest::Compute)
+        .map_err(describe)?;
+    let reused_modified = std::fs::metadata(&reused.path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| error.to_string())?;
+    if reused != first || reused_modified != modified {
+        return Err(
+            "cache demo repeated registration did not reuse the staged image unchanged".to_owned(),
+        );
+    }
+    eprintln!("cache: hit for {reference}; registration and staged file unchanged");
+    let second = backend
+        .register_reference(CACHE_DEMO_OTHER_IMAGE, ImageDigest::Compute)
+        .map_err(describe)?;
+    validate_cache_demo_images(&first, &second)?;
+    verify_cache_eviction(backend, &first, &second)?;
+    let restored = backend
+        .register_reference(reference, ImageDigest::Compute)
+        .map_err(describe)?;
+    verify_cache_eviction(backend, &second, &restored)?;
+    eprintln!(
+        "cache: registered {reference} again; using {} for the lifecycle",
+        restored.id
+    );
+    Ok(restored.id)
 }
 
 /// Directory beside this executable that holds the state of a build with `agent-bundled`.
@@ -506,6 +637,64 @@ fn describe_start(started: &StartResult) -> aci_edge_sandboxes::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_demo_image(digest: u8, mib: u64) -> RegisteredImage {
+        RegisteredImage::new(
+            ImageId::from_sha256([digest; 32]),
+            PathBuf::from(format!("image-{digest}.img")),
+            mib * 1024 * 1024,
+            false,
+            true,
+        )
+    }
+
+    #[test]
+    fn cache_demo_requires_a_distinct_registry_reference() {
+        let reference = "mcr.microsoft.com/azurelinux/base/core:3.0";
+        assert_eq!(
+            cache_demo_reference(&ImageSource::Reference(reference.to_owned())).unwrap(),
+            reference
+        );
+        assert!(cache_demo_reference(&ImageSource::Path("image.img".into())).is_err());
+        assert!(cache_demo_reference(&ImageSource::Digest(ImageId::from_sha256([1; 32]))).is_err());
+        assert!(
+            cache_demo_reference(&ImageSource::Reference(CACHE_DEMO_OTHER_IMAGE.to_owned()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cache_demo_accepts_only_images_that_need_eviction() {
+        assert!(
+            validate_cache_demo_images(&cache_demo_image(1, 80), &cache_demo_image(2, 80)).is_ok()
+        );
+        assert!(
+            validate_cache_demo_images(&cache_demo_image(1, 128), &cache_demo_image(2, 1)).is_ok()
+        );
+        for (first, second) in [(1, 1), (64, 64)] {
+            let error = validate_cache_demo_images(
+                &cache_demo_image(1, first),
+                &cache_demo_image(2, second),
+            )
+            .unwrap_err();
+            assert!(error.contains("fit together"), "{error}");
+        }
+    }
+
+    #[test]
+    fn cache_demo_rejects_oversized_and_identical_images() {
+        for (first, second) in [(129, 1), (1, 129)] {
+            let error = validate_cache_demo_images(
+                &cache_demo_image(1, first),
+                &cache_demo_image(2, second),
+            )
+            .unwrap_err();
+            assert!(error.contains("more than"), "{error}");
+        }
+        let error = validate_cache_demo_images(&cache_demo_image(1, 80), &cache_demo_image(1, 80))
+            .unwrap_err();
+        assert!(error.contains("same image"), "{error}");
+    }
 
     #[test]
     fn images_select_either_a_local_path_or_a_registry_reference() {
