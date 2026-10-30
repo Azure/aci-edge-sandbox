@@ -188,10 +188,12 @@ impl AgentBackend {
     /// copy, which [`RegisteredImage::path`] names, and later changes to the file at `path` do not
     /// reach them. A registration that the file still matches is reused without reading the file.
     /// Provision and start never register an image: register each one that a sandbox's spec names
-    /// before provisioning it. With an image cache limit
-    /// ([`ImageSettings::max_cache_capacity_bytes`]), an image registered only by path counts
-    /// toward it only if it is the setup's default or a prefetched image, and the library never
-    /// evicts it.
+    /// before provisioning it. The library never evicts an image registered by path. With an
+    /// image cache limit ([`ImageSettings::max_cache_capacity_bytes`]), one registered only by
+    /// path counts toward the limit only if it is protected: a backend with a limit protects its
+    /// setup's default image and prefetched paths when it registers them, admitting them first as
+    /// [`register_reference`](Self::register_reference) describes, and they stay protected until
+    /// they are unregistered.
     pub fn register_image(
         &self,
         path: impl Into<PathBuf>,
@@ -211,12 +213,13 @@ impl AgentBackend {
     /// [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation).
     ///
     /// With an image cache limit ([`ImageSettings::max_cache_capacity_bytes`]), the library
-    /// admits the pulled image first: it evicts unused references to make room, and refuses the
-    /// registration with [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable)
-    /// if they cannot, or with [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation)
-    /// for an image longer than the limit. A later registration may evict this reference once no
-    /// provisioned sandbox uses it; a provision that names it then fails until it is registered
-    /// again.
+    /// admits the pulled image first, unless the cache counts its content already: it evicts
+    /// unused references to make room, and refuses the registration with
+    /// [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable) if they cannot, or
+    /// with [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation) for an image
+    /// longer than the limit. A later registration may evict the image once no provisioned
+    /// sandbox uses it, unless a backend protected it or a path registered it too; a provision
+    /// that names the reference then fails until it is registered again.
     pub fn register_reference(
         &self,
         reference: impl Into<String>,

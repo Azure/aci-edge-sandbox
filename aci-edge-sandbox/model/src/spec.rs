@@ -117,9 +117,10 @@ impl SandboxSpec {
 ///
 /// A backend that registers images provisions only images registered with it: a path or a
 /// reference that it has not registered fails, and provisioning never pulls, copies, or hashes an
-/// image. The setup's default image is registered when the backend opens. A host with an image
-/// cache limit ([`ImageSettings::max_cache_capacity_bytes`]) may evict an unused reference to make
-/// room for another image; a provision that names it then fails until it is registered again.
+/// image. The setup's default image is registered when the backend opens, unless the setup names
+/// it by digest. A host with an image cache limit
+/// ([`ImageSettings::max_cache_capacity_bytes`]) may evict an unused reference to make room for
+/// another image; a provision that names it then fails until it is registered again.
 ///
 /// [`ImageSettings::max_cache_capacity_bytes`]: crate::ImageSettings::max_cache_capacity_bytes
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

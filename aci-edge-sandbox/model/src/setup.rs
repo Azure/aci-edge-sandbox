@@ -461,10 +461,13 @@ pub struct ImageSettings {
     #[serde(default, skip_serializing_if = "ReferenceSettings::is_default")]
     pub references: ReferenceSettings,
     /// Maximum combined length, in bytes, of the staged images that the host's image cache counts:
-    /// registry references, and the default and prefetched images. Images that callers register
-    /// only by path do not count. A registration that would exceed it first evicts unused
-    /// references, the largest first, and fails if they cannot make room. Temporary conversion
-    /// data is excluded. Omission or `None` leaves the cache unlimited; zero is refused.
+    /// registry references and protected images. A host with a limit protects its default and
+    /// prefetched images, and they stay protected, for every host that shares the state root,
+    /// until they are unregistered. Images that callers register only by path, and that no host
+    /// protected, do not count. A registration that makes an image count and would exceed the
+    /// limit first evicts unused references, the largest first, and fails if they cannot make
+    /// room. Temporary conversion data is excluded. Omission or `None` leaves the cache
+    /// unlimited; zero is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cache_capacity_bytes: Option<u64>,
 }

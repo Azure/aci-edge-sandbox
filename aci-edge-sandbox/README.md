@@ -13,10 +13,11 @@ repository's `aci-edge-sandbox` directory.
 
 Create a client over the agent library with `AciEdgeSandbox::agent`, then provision, start,
 exec, stop, and deprovision; see [Agent backend](#agent-backend). A sandbox boots only an image
-that the library has registered: the setup's default image, which the backend registers when it
-opens, the local paths of the setup's `images.prefetch`, which it registers in the background,
-or an image that `AgentBackend::register_image` or `AgentBackend::register_reference`
-registered first. Provision and start never pull, copy, or register an image.
+that the library has registered. The backend registers the setup's default image when it opens,
+unless the setup names it by digest, and starts registering the local paths of the setup's
+`images.prefetch` in the background. `AgentBackend::register_image` and
+`AgentBackend::register_reference` register any other image, including a default named by
+digest. Provision and start never pull, copy, or register an image.
 [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) is a runnable version with
 command-line arguments.
 
@@ -212,8 +213,8 @@ would expose it.
   than falling back.
 - **Opening.** The first backend that a process opens for a setup verifies the runtime files, or
   checks the seals that an earlier process recorded under the state root, and registers the
-  default image. It also starts registering the local paths of `images.prefetch` in the
-  background; a provision that names one fails until its registration finishes, or if it failed.
+  default image, unless the setup names it by digest. It also starts registering the local paths
+  of `images.prefetch` in the background: a provision that names one fails until it is registered.
   Later backends for the same setup reuse that host without touching a file, so a caller may
   create a backend for every operation; the operations check the files that they use. One that
   finds a runtime file changed makes the next backend verify the files again, and one that finds
@@ -246,16 +247,23 @@ would expose it.
 - **Image cache limit.** `images.maxCacheCapacityBytes` limits the combined length, in bytes, of
   the staged copies that the library's image cache counts. Omitted, the cache has no limit; zero
   is refused.
-  - The cache counts registry references, and the setup's default image and prefetched paths.
-    Other images registered by path do not count, and the library never evicts them.
-  - A registration that makes an image count admits it first. If the counted images and the new
-    one do not fit, the library evicts unused references, the largest first, until it fits. It
-    refuses an image longer than the limit with `policy_validation`, and one that the unused
-    references cannot make room for with `backend_unavailable`, and then evicts nothing.
-  - The library never evicts an image that a provisioned sandbox uses, from its provision until
-    its deprovision, whichever process provisioned it. The setup's default image and prefetched
-    paths are protected: counted, but never evicted, until they are unregistered. An image
-    registered both by path and by reference counts, and is never evicted.
+  - The cache counts registry references and protected images. A backend with a limit protects
+    its setup's default image and prefetched paths when it registers them or finds them
+    registered. The mark is stored under the state root, where every process that shares it sees
+    it, and stays until the image is unregistered, even if no setup names the image any more. An
+    image that callers registered only by path, and that no backend protected, does not count.
+  - A registration that makes an image count, such as a pull or a protection, admits it first.
+    If the counted images and the new one do not fit, the library evicts unused references, the
+    largest first, until it fits. It refuses an image longer than the limit with
+    `policy_validation`, and one that the unused references cannot make room for with
+    `backend_unavailable`, and then evicts nothing. Registering an image that the cache counts
+    already skips admission: it evicts nothing and is not refused, whatever the limit.
+  - A default image that the cache cannot admit fails the open with that refusal. A prefetched
+    path that it cannot admit stays unregistered or, if it was registered already, registered
+    but neither protected nor counted.
+  - The library never evicts a protected image, an image registered by path, even if a reference
+    registered it too, or an image that a provisioned sandbox uses, from its provision until its
+    deprovision, whichever process provisioned it.
   - Eviction unregisters the image. A provision that names an evicted reference fails with
     `backend_unavailable`, and `register_reference` registers it again, which pulls it.
   - Each backend enforces its own setup's limit when it registers an image, so processes whose
