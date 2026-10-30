@@ -70,10 +70,53 @@ It must print `READY` and the guest's `/etc/os-release`, then stop and deprovisi
 
 ## Publish
 
-[`.azure-pipelines/release-crates.yml`](.azure-pipelines/release-crates.yml) is a manual pipeline.
-With `dryRun` (the default), it only prepares and publishes the archives as a pipeline artifact.
-To publish, queue it on the release tag with `dryRun` cleared and `approvedModelSha256` and
-`approvedCrateSha256` set to the approved digests from `SHA256SUMS`. It then:
+Publish `aci_edge_sandboxes_model` first, wait until the crates.io index lists it, then publish
+`aci_edge_sandboxes`. Upload only the approved archives from `Prepare`, never a fresh build.
+
+The owners of both crates decide the route. Each route uploads the same approved archives.
+
+### First release by an owner
+
+crates.io creates a crate when its first version is published, so the first upload of each crate
+uses an owner's API token:
+
+1. The initial owner signs in to crates.io with GitHub, verifies an email address, and creates a
+   token scoped to `publish-new` and `publish-update` for `aci_edge_sandboxes*`, with a short
+   expiry.
+2. On a clean checkout of the release tag, run
+   `cargo publish --locked --registry crates-io --package <crate>` for each crate in order.
+   Packaging is reproducible (`Prepare` packaged twice and compared), and the uploaded archive
+   must have the approved checksum: compare the `cksum` from
+   `https://crates.io/api/v1/crates/<crate>/<version>` with `SHA256SUMS`.
+3. The owner revokes the token and adds the long-term owners (`cargo owner --add`), such as a
+   Microsoft GitHub team.
+
+### Later releases: trusted publishing
+
+For later versions, crates.io trusted publishing lets a GitHub Actions job publish without a
+stored token. The job requests a short-lived token with `rust-lang/crates-io-auth-action`. NVX
+publishes `nvx` this way (`.github/workflows/ci.yml`, jobs `crate-package` and `crate-release`).
+
+Setup, done by owners and repository admins:
+
+1. On crates.io, add a trusted publisher to each crate: repository `Azure/aci-edge-sandbox`, the
+   release workflow file, and the environment `crates-io`.
+2. In this repository, create the `crates-io` environment, restricted to release tags and
+   requiring a reviewer.
+3. Add the release workflow:
+   - a package job with read-only permissions runs `Invoke-CratePackage.ps1 -ExpectedTag` and
+     `-ApprovedSha256Sums`;
+   - a publish job in the `crates-io` environment with `id-token: write` uploads those archives
+     in the order above.
+
+### Alternative: ESRP Release
+
+[`.azure-pipelines/release-crates.yml`](.azure-pipelines/release-crates.yml) is a manual
+Azure Pipelines route through ESRP Release, as used for crates owned by `microsoft-oss-releases`.
+It needs an ESRP onboarding and service connection for crates.io, which this repository does not
+have yet. With `dryRun` (the default), it only prepares and publishes the archives as a pipeline
+artifact. To publish, queue it on the release tag with `dryRun` cleared and `approvedModelSha256`
+and `approvedCrateSha256` set to the approved digests from `SHA256SUMS`. It then:
 
 1. fails unless the run's source is the tag `aci_edge_sandboxes-v<version>`, the tag names the
    commit being built, and the manifests have that version;
@@ -97,8 +140,9 @@ or `nvx` version needs the smoke again before `agent-bundle.json` or the manifes
 ## Recovering from a partial release
 
 If the model is published and the crate is not, do not yank the model. Fix the cause outside the
-crates (credentials, approvals, the index), and queue the pipeline again on the same tag with the
-same approved digests: it skips the published model and submits the crate. If the crate itself
+crates (credentials, approvals, the index), then publish the crate from the same approved
+archives. The ESRP pipeline, queued again on the same tag with the same digests, skips the
+published model. If the crate itself
 must change, release both crates at the next patch version; yank a version only when it is
 harmful to use.
 
