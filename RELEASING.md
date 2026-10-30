@@ -77,9 +77,10 @@ compatibility record.
 ## Publish
 
 Publish `aci_edge_sandboxes_model` first, wait until the crates.io index lists it, then publish
-`aci_edge_sandboxes`. Upload only the approved archives from `Prepare`, never a fresh build.
+`aci_edge_sandboxes`. What is uploaded must have the approved digests from `Prepare`; each route
+checks this before uploading.
 
-The owners of both crates decide the route. Each route uploads the same approved archives.
+The owners of both crates decide the route.
 
 ### First release by an owner
 
@@ -89,11 +90,15 @@ uses an owner's API token:
 1. The initial owner signs in to crates.io with GitHub, verifies an email address, and creates a
    token scoped to `publish-new` and `publish-update` for `aci_edge_sandboxes*`, with a short
    expiry.
-2. On a clean checkout of the release tag, run
-   `cargo publish --locked --registry crates-io --package <crate>` for each crate in order.
-   Packaging is reproducible (`Prepare` packaged twice and compared), and the uploaded archive
-   must have the approved checksum: compare the `cksum` from
-   `https://crates.io/api/v1/crates/<crate>/<version>` with `SHA256SUMS`.
+2. `cargo publish` cannot upload a prepared archive; it packages the source again. Packaging is
+   reproducible for a given commit and Cargo version (`Prepare` packaged twice and compared), so
+   on a clean checkout of the release tag, immediately before uploading, run
+   `Invoke-CratePackage.ps1 -ExpectedTag <tag> -ApprovedSha256Sums <approved SHA256SUMS> -Toolchain <toolchain>`
+   with the toolchain that will publish. Continue only if it passes: it proves that this Cargo
+   packages exactly the approved archives. Then run
+   `cargo +<toolchain> publish --locked --registry crates-io --package <crate>` for each crate in
+   order, with the same toolchain. Afterwards, confirm that the `cksum` from
+   `https://crates.io/api/v1/crates/<crate>/<version>` equals `SHA256SUMS`.
 3. The owner revokes the token and adds the long-term owners (`cargo owner --add`), such as a
    Microsoft GitHub team.
 
@@ -112,8 +117,8 @@ Setup, done by owners and repository admins:
 3. Add the release workflow:
    - a package job with read-only permissions runs `Invoke-CratePackage.ps1 -ExpectedTag` and
      `-ApprovedSha256Sums`;
-   - a publish job in the `crates-io` environment with `id-token: write` uploads those archives
-     in the order above.
+   - a publish job in the `crates-io` environment with `id-token: write` runs `cargo publish`
+     with the package job's toolchain, in the order above, only if the package job passed.
 
 ### Alternative: ESRP Release
 
@@ -154,7 +159,8 @@ version; yank a version only when it is harmful to use.
 
 ## Verify after publication
 
-From any machine, with no `[patch]`, path, or Git source, and a new `CARGO_HOME`:
+On a Windows x64 machine (the only target with a published bundle), with no `[patch]`, path, or
+Git source, and a new `CARGO_HOME`:
 
 ```powershell
 pwsh scripts/release/Test-CrateConsumer.ps1 -Version <version>

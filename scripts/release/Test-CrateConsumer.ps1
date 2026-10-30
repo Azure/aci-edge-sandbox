@@ -51,6 +51,13 @@ param
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# The wrapper depends on aci_edge_sandboxes on x86_64 Windows only, the one target with a published
+# bundle, so the checks below need that host.
+if (-not ($IsWindows -and [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'X64'))
+{
+    throw 'The consumer check runs on Windows x64, the only target with a published agent bundle.'
+}
+
 if (-not $WorkDir)
 {
     $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('aci-consumer-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -75,7 +82,9 @@ function Invoke-Cargo([string] $Log, [string[]] $Arguments)
     Push-Location (Join-Path $WorkDir 'consumer')
     try
     {
-        $output = & cargo @toolchainArgs @Arguments 2>&1 | Out-String
+        # An explicit target directory, so that an inherited CARGO_TARGET_DIR cannot move the
+        # application away from the path the checks run.
+        $output = & cargo @toolchainArgs @Arguments --target-dir (Join-Path $WorkDir 'consumer/target') 2>&1 | Out-String
         [System.IO.File]::WriteAllText((Join-Path $WorkDir $Log), $output)
         [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
     }
@@ -228,11 +237,22 @@ else
     Copy-Item -LiteralPath $source -Destination $bundle -Recurse
     $arguments = @()
     if ($Open) { $arguments += (Join-Path $WorkDir 'state') }
-    $run = (& $relocatedApp @arguments | Out-String)
-    Add-Result 'relocated application finds its bundle' ($run -match [regex]::Escape("microvm=available $bundle")) $run.Trim()
-    Remove-Item -LiteralPath $bundle -Recurse -Force
-    $run = (& $relocatedApp | Out-String)
-    Add-Result 'relocated application without its bundle reports it unavailable' ($run -match 'microvm=unavailable .*backend_unavailable|microvm=unavailable .*no agent bundle') $run.Trim()
+    # The run-time override takes precedence over discovery beside the executable, so clear it
+    # while checking the relocated bundle.
+    $artifactsDir = $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR
+    Remove-Item Env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR -ErrorAction SilentlyContinue
+    try
+    {
+        $run = (& $relocatedApp @arguments | Out-String)
+        Add-Result 'relocated application finds its bundle' ($run -match [regex]::Escape("microvm=available $bundle")) $run.Trim()
+        Remove-Item -LiteralPath $bundle -Recurse -Force
+        $run = (& $relocatedApp | Out-String)
+        Add-Result 'relocated application without its bundle reports it unavailable' ($run -match 'microvm=unavailable .*backend_unavailable|microvm=unavailable .*no agent bundle') $run.Trim()
+    }
+    finally
+    {
+        if ($null -ne $artifactsDir) { $env:ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR = $artifactsDir }
+    }
 }
 
 # The resolved sources.

@@ -71,6 +71,8 @@ if (-not $WorkDir)
 }
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $WorkDir = (Resolve-Path $WorkDir).Path
+# Resolved against the invocation directory, before the script changes to the crate.
+if ($Image) { $Image = (Resolve-Path -LiteralPath $Image).Path }
 
 if ($PSCmdlet.ParameterSetName -eq 'Zip')
 {
@@ -113,6 +115,11 @@ $saved = @{}
 $environment = [ordered]@{
     CARGO_TARGET_DIR = $target
     ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR = $BundleDir
+    # Cleared, so that only the supplied bundle is staged and discovered.
+    ACI_EDGE_SANDBOXES_AGENT_BUNDLE = $null
+    ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL = $null
+    ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256 = $null
+    ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR = $null
     EDGE_AGENT_TEST_LIBRARY = $library
     EDGE_AGENT_TEST_SHA256 = $consumer.backendLibrarySha256
     EDGE_AGENT_TEST_OPENVMM = Join-Path $BundleDir 'bin\openvmm.exe'
