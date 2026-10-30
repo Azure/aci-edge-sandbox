@@ -14,7 +14,8 @@ repository's `aci-edge-sandbox` directory.
 Create a client over the agent library with `AciEdgeSandbox::agent`, then provision, start,
 exec, stop, and deprovision; see [Agent backend](#agent-backend). A sandbox boots only an image
 that the library has registered: the setup's default image, which the backend registers when it
-opens, or an image that `AgentBackend::register_image` or `AgentBackend::register_reference`
+opens, the local paths of the setup's `images.prefetch`, which it registers in the background,
+or an image that `AgentBackend::register_image` or `AgentBackend::register_reference`
 registered first. Provision and start never pull, copy, or register an image.
 [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) is a runnable version with
 command-line arguments.
