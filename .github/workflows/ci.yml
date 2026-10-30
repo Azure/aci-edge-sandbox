@@ -61,13 +61,10 @@ jobs:
       - run: rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
       # One joint dry run for crates.io; it uploads nothing.
       - run: ./scripts/release/Invoke-CratePackage.ps1 -OutDir $env:RUNNER_TEMP/crates -Toolchain $env:RUST_TOOLCHAIN
-      # A consumer of the archives outside the repository, with a synthetic bundle until the
-      # pinned bundle speaks this crate's sandbox ABI.
+      # A consumer of the archives outside the repository, with no bundle variable: its build
+      # downloads and verifies the bundle that agent-bundle.json pins.
       - name: Check an SDK-like consumer of the archives
-        run: |
-          ./scripts/test-agent-bundling.ps1 -Toolchain $env:RUST_TOOLCHAIN -WorkDir $env:RUNNER_TEMP/fixtures
-          $env:ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR = "$env:RUNNER_TEMP/fixtures/good"
-          ./scripts/release/Test-CrateConsumer.ps1 -ArchiveDir $env:RUNNER_TEMP/crates -WorkDir $env:RUNNER_TEMP/consumer -Toolchain $env:RUST_TOOLCHAIN
+        run: ./scripts/release/Test-CrateConsumer.ps1 -ArchiveDir $env:RUNNER_TEMP/crates -WorkDir $env:RUNNER_TEMP/consumer -Toolchain $env:RUST_TOOLCHAIN
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: crates
