@@ -1,50 +1,68 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Opt-in lifecycle, robustness, host-path, network, proxy, port-forwarding, and exec-environment
-//! proofs with a separately supplied native library and guest.
+//! Opt-in lifecycle, robustness, host-path, network, proxy, port-forwarding, exec-environment, and
+//! platform-snapshot proofs with a separately supplied native library and guest.
 //!
 //! The tests need `EDGE_AGENT_TEST_OPENVMM`, `EDGE_AGENT_TEST_KERNEL`, `EDGE_AGENT_TEST_INITRD`,
 //! `EDGE_AGENT_TEST_IMAGE`, `EDGE_AGENT_TEST_LIBRARY`, and the approved `EDGE_AGENT_TEST_SHA256`.
 //! `EDGE_AGENT_TEST_HYPERVISOR` selects `whp`, `mshv`, or `kvm`, and defaults to `whp` on Windows.
 //! `EDGE_AGENT_TEST_CPU_PROFILE=host` boots the guests on a host CPU profile, for hosts that no
 //! built-in profile serves; the default, `auto`, uses the built-in profile.
-//! The host-path, network, proxy, port-forwarding, and exec-environment tests also need `python3`
-//! in the image. `registered_references_are_pulled_once_and_staged` checks a registry image only
-//! when `EDGE_AGENT_TEST_IMAGE_REF` names one, with `EDGE_AGENT_TEST_BUNDLE`, a runtime bundle with
-//! the image tool, and `EDGE_AGENT_TEST_BUNDLE_SHA256`, the SHA-256 of its `SOURCE-MANIFEST.json`.
-//! Run the tests one at a time so that the check for leftover OpenVMM processes is
-//! exact, and optimized, since creating a backend hashes the runtime files and registering an
-//! image hashes and copies the image:
+//! The host-path, network, proxy, port-forwarding, exec-environment, and platform-snapshot tests
+//! also need `python3` in the image. `registered_references_are_pulled_once_and_staged` checks a
+//! registry image only when `EDGE_AGENT_TEST_IMAGE_REF` names one, with `EDGE_AGENT_TEST_BUNDLE`, a
+//! runtime bundle with the image tool, and `EDGE_AGENT_TEST_BUNDLE_SHA256`, the SHA-256 of its
+//! `SOURCE-MANIFEST.json`.
+//!
+//! The platform-snapshot tests open hosts whose setup enables platform snapshots. Their crash cases
+//! take `EDGE_AGENT_TEST_CRASH_LIBRARY` and its approved `EDGE_AGENT_TEST_CRASH_SHA256`, a library
+//! built with its clone-crash test feature, which ends the process at the step of a clone's start
+//! that `ACI_EDGE_TEST_CLONE_CRASH_AT` names, or else `EDGE_AGENT_TEST_LIBRARY`; with a library
+//! without the feature, they skip, and say so, and once a crash point ended the process, every
+//! later one must. The capture-failure case needs `EDGE_AGENT_TEST_COLD_ONLY_INITRD`, an edge
+//! initramfs without a template mode, and skips without it, saying so. The latency test takes
+//! `EDGE_AGENT_TEST_LATENCY_SAMPLES` samples of each mode, 3 by default, and writes them as JSON
+//! to `EDGE_AGENT_TEST_LATENCY_REPORT` when it names a file.
+//! With `EDGE_AGENT_TEST_LATENCY_TEMPLATE_MEMORY=sandbox`, its templates boot with each geometry's
+//! memory instead of the setup's default, so that its clones grow only their vCPUs.
+//!
+//! Each test fails if an OpenVMM process of its own state root outlives its sandboxes; the VMs of
+//! other tests and hosts on the machine don't count. Run the tests one at a time, since several of
+//! them time their guests, and optimized, since creating a backend hashes the runtime files and
+//! registering an image hashes and copies the image:
 //! `cargo test --release --features agent --test agent_guest -- --ignored --test-threads=1`.
 #![cfg(feature = "agent")]
 
-use std::collections::BTreeSet;
 use std::collections::hash_map::RandomState;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, ErrorKind, PipeReader, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aci_edge_sandboxes::agent::{
-    AgentBackend, AgentConfig, BundleSource, CpuProfile, Hypervisor, ImageDigest, ImageId,
-    RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
+    AgentBackend, AgentConfig, BundleSource, CpuProfile, DisabledReason, Hypervisor, ImageDigest,
+    ImageId, PlatformSnapshots, PlatformSnapshotsInfo, RuntimeFiles, RuntimeSource,
+    SandboxDefaults, SetupConfig, TemplateInfo, TemplateState,
 };
 use aci_edge_sandboxes::nvx::resolve_guest_path;
 use aci_edge_sandboxes::{
-    Access, AciEdgeSandbox, EgressPolicy, Error, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
-    ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward, ImageSource, NetworkPeer,
-    NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, Result, SandboxId, SandboxSpec,
-    StdinMode, StopResult,
+    Access, AciEdgeSandbox, BootMode, ColdReason, EgressPolicy, Error, ErrorCode, ExecFailure,
+    ExecOutcome, ExecOutput, ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward,
+    ImageSource, NetworkPeer, NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, Result,
+    SandboxId, SandboxSpec, StartResult, StdinMode, StopResult, TemplateClass, TemplateGeneration,
 };
 
 const HELPER_STATE: &str = "EDGE_AGENT_TEST_HELPER_STATE";
 const HELPER_SANDBOX: &str = "EDGE_AGENT_TEST_HELPER_SANDBOX";
+const HELPER_HOLD: &str = "EDGE_AGENT_TEST_HELPER_HOLD";
 /// Hashing the test image took most of a second of every start before images were registered.
 const MAX_START_OVERHEAD: Duration = Duration::from_millis(500);
 
@@ -227,47 +245,34 @@ fn make_writable(path: &Path) {
     std::fs::set_permissions(path, permissions).unwrap();
 }
 
-/// Lists the OpenVMM processes running on this host, failing if they cannot be listed.
-fn openvmm_processes() -> BTreeSet<u32> {
-    let executable = required("EDGE_AGENT_TEST_OPENVMM");
-    let name = executable
+/// The process name of `EDGE_AGENT_TEST_OPENVMM`.
+fn openvmm_name() -> String {
+    required("EDGE_AGENT_TEST_OPENVMM")
         .file_stem()
         .unwrap()
         .to_string_lossy()
-        .into_owned();
-    #[cfg(windows)]
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("[Diagnostics.Process]::GetProcessesByName('{name}') | ForEach-Object Id"),
-        ])
-        .output()
-        .unwrap();
-    #[cfg(not(windows))]
-    let output = Command::new("pgrep").args(["-x", &name]).output().unwrap();
-    // pgrep exits with 1 when no process matches.
-    assert!(
-        output.status.success() || (cfg!(not(windows)) && output.status.code() == Some(1)),
-        "cannot list OpenVMM processes: {output:?}"
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            line.parse()
-                .unwrap_or_else(|_| panic!("unexpected process ID {line:?}"))
-        })
-        .collect()
+        .into_owned()
 }
 
-/// Fails if an OpenVMM process that was not running before the test is still running.
-fn assert_no_new_openvmm(before: &BTreeSet<u32>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Lists the OpenVMM processes of the test whose state root is `state`: those whose command line
+/// names a path in it, as every launch of its sandboxes and templates does. The VMs of other tests
+/// and other hosts on the machine don't count.
+fn openvmm_processes(state: &Path) -> BTreeSet<u32> {
+    processes_naming(&openvmm_name(), state)
+}
+
+/// Fails if an OpenVMM process of the test whose state root is `state` is still running ten
+/// seconds from now: a VM that outlived its sandbox.
+fn assert_no_new_openvmm(state: &Path) {
+    assert_none_naming(&openvmm_name(), state, Duration::from_secs(10));
+}
+
+/// Fails if a process named `name` whose command line names a path in `root` is still running
+/// after `wait`.
+fn assert_none_naming(name: &str, root: &Path, wait: Duration) {
+    let deadline = Instant::now() + wait;
     loop {
-        let leaked: Vec<u32> = openvmm_processes().difference(before).copied().collect();
+        let leaked: Vec<u32> = processes_naming(name, root).into_iter().collect();
         if leaked.is_empty() {
             return;
         }
@@ -279,7 +284,184 @@ fn assert_no_new_openvmm(before: &BTreeSet<u32>) {
     }
 }
 
-/// Terminates a process abruptly, as a crash would.
+/// Lists the processes named `name`, without the executable suffix, one of whose command-line
+/// arguments names a path in the directory `root`, failing if they cannot be listed.
+fn processes_naming(name: &str, root: &Path) -> BTreeSet<u32> {
+    let roots = path_forms(root);
+    command_lines(name)
+        .into_iter()
+        .filter(|(_, arguments)| {
+            arguments
+                .iter()
+                .any(|argument| roots.iter().any(|root| names_path_in(argument, root)))
+        })
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// The forms in which a command line may name the directory `root`: as given, and resolved, as
+/// the library opens its state root.
+fn path_forms(root: &Path) -> Vec<String> {
+    let mut forms = vec![comparable(
+        &std::path::absolute(root).unwrap().to_string_lossy(),
+    )];
+    if let Ok(resolved) = std::fs::canonicalize(root) {
+        forms.push(comparable(&resolved.to_string_lossy()));
+    }
+    forms.dedup();
+    forms
+}
+
+/// Returns `text` as [`names_path_in`] compares it: on Windows, which ignores the case of paths,
+/// in lower case, with backslashes for slashes, and without the prefixes of verbatim paths.
+fn comparable(text: &str) -> String {
+    if !cfg!(windows) {
+        return text.to_owned();
+    }
+    text.to_lowercase()
+        .replace('/', "\\")
+        .replace(r"\\?\unc\", r"\\")
+        .replace(r"\\?\", "")
+}
+
+/// Whether the command-line argument `argument` names the directory `root` or a path in it:
+/// whether `root` occurs in it followed by a path separator or by the argument's end, so that a
+/// sibling whose name extends `root`'s, even with a space, does not count.
+fn names_path_in(argument: &str, root: &str) -> bool {
+    argument.match_indices(root).any(|(at, _)| {
+        let rest = &argument[at + root.len()..];
+        rest.is_empty() || rest.starts_with(std::path::MAIN_SEPARATOR)
+    })
+}
+
+/// Lists the processes named `name`, without the executable suffix, with their command-line
+/// arguments, as [`comparable`] writes them.
+#[cfg(windows)]
+fn command_lines(name: &str) -> Vec<(u32, Vec<String>)> {
+    assert!(!name.contains('\''), "{name:?}");
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+                 Get-CimInstance -ClassName Win32_Process -Filter 'Name = ''{name}.exe''' | \
+                 ForEach-Object {{ '{{0}} {{1}}' -f $_.ProcessId, \
+                 ($_.CommandLine -replace '[\\r\\n]', ' ') }}"
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cannot list the {name} processes: {output:?}"
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (pid, command_line) = line.split_once(' ').unwrap_or((line, ""));
+            let pid = pid
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("unexpected process ID {pid:?}"));
+            let arguments = windows_arguments(command_line)
+                .iter()
+                .map(|argument| comparable(argument))
+                .collect();
+            (pid, arguments)
+        })
+        .collect()
+}
+
+/// Splits a Windows command line into its arguments, as the C runtime does: spaces and tabs
+/// outside quotes separate them, and `"` begins and ends quoted text, in which `""` is a quote.
+/// Backslashes are literal, except before a `"`: each pair of them is then one backslash, and an
+/// odd one makes the `"` literal.
+#[cfg(windows)]
+fn windows_arguments(command_line: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut chars = command_line.chars().peekable();
+    loop {
+        while chars.next_if(|c| matches!(c, ' ' | '\t')).is_some() {}
+        if chars.peek().is_none() {
+            return arguments;
+        }
+        let (mut argument, mut quoted) = (String::new(), false);
+        loop {
+            let mut backslashes = 0;
+            while chars.next_if_eq(&'\\').is_some() {
+                backslashes += 1;
+            }
+            if chars.next_if_eq(&'"').is_some() {
+                argument.extend(std::iter::repeat_n('\\', backslashes / 2));
+                if backslashes % 2 == 1 || (quoted && chars.next_if_eq(&'"').is_some()) {
+                    argument.push('"');
+                } else {
+                    quoted = !quoted;
+                }
+                continue;
+            }
+            argument.extend(std::iter::repeat_n('\\', backslashes));
+            match chars.peek() {
+                None => break,
+                Some(' ' | '\t') if !quoted => break,
+                Some(&c) => {
+                    argument.push(c);
+                    chars.next();
+                }
+            }
+        }
+        arguments.push(argument);
+    }
+}
+
+/// Lists the processes named `name` with their command-line arguments.
+#[cfg(target_os = "linux")]
+fn command_lines(name: &str) -> Vec<(u32, Vec<String>)> {
+    // The kernel keeps the first 15 bytes of a process's name.
+    let name = &name.as_bytes()[..name.len().min(15)];
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap() {
+        let entry = entry.unwrap();
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|text| text.parse().ok())
+        else {
+            continue;
+        };
+        // A process that ends while it is read no longer counts.
+        let (Ok(comm), Ok(arguments)) = (
+            std::fs::read(entry.path().join("comm")),
+            std::fs::read(entry.path().join("cmdline")),
+        ) else {
+            continue;
+        };
+        if comm.strip_suffix(b"\n").unwrap_or(&comm) == name {
+            // Each argument ends with a NUL.
+            let arguments = arguments
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                .collect();
+            found.push((pid, arguments));
+        }
+    }
+    found
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn command_lines(_name: &str) -> Vec<(u32, Vec<String>)> {
+    panic!("these tests list processes only on Windows and Linux")
+}
+
+/// Terminates a process abruptly, as a crash would, and waits until it is gone.
+///
+/// The checks for leftover OpenVMM processes no longer see a process once it exits: its command
+/// line no longer names its state root then. On Linux, the library still finds the process of a
+/// VM that exited until its parent reaps it, so the wait lasts until then.
 fn kill_process(pid: u32) {
     #[cfg(windows)]
     let status = Command::new("powershell.exe")
@@ -287,7 +469,11 @@ fn kill_process(pid: u32) {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &format!("Stop-Process -Id {pid} -Force -ErrorAction Stop"),
+            &format!(
+                "Stop-Process -Id {pid} -Force -ErrorAction Stop; \
+                 $process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
+                 if ($process -and -not $process.WaitForExit(30000)) {{ exit 1 }}"
+            ),
         ])
         .status()
         .unwrap();
@@ -297,6 +483,14 @@ fn kill_process(pid: u32) {
         .status()
         .unwrap();
     assert!(status.success(), "cannot kill process {pid}: {status}");
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(Instant::now() < deadline, "process {pid} was not reaped");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 /// Stops and removes a sandbox when a test ends, printing its diagnostics if the test failed.
@@ -563,6 +757,96 @@ fn start_in_helper(state: &Path, id: &SandboxId) -> Child {
 }
 
 #[test]
+#[ignore = "helper process for leftover_vm_checks_count_only_the_test_s_own_processes"]
+fn helper_holds_its_command_line() {
+    if std::env::var_os(HELPER_HOLD).is_none() {
+        return;
+    }
+    // Runs until the test ends its standard input.
+    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
+}
+
+/// The check for leftover OpenVMM processes counts only those of the test's own state root: a
+/// process of another state root, even one whose path extends the test's with a hyphen or a space,
+/// does not fail it, and a process of the test's own does.
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn leftover_vm_checks_count_only_the_test_s_own_processes() {
+    let parent = tempfile::tempdir().unwrap();
+    let (own, others, bin) = (
+        parent.path().join("state"),
+        [
+            parent.path().join("state-other"),
+            parent.path().join("state other"),
+        ],
+        parent.path().join("bin"),
+    );
+    for directory in [&own, &bin].into_iter().chain(&others) {
+        std::fs::create_dir(directory).unwrap();
+    }
+    // The stand-in for OpenVMM is this test executable, under a name that no test run takes for
+    // OpenVMM's. It names a path on its command line as a filter that selects no other test.
+    let name = "openvmm-probe";
+    let program = bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
+    let hold = |root: &Path| {
+        let child = Command::new(&program)
+            .args([
+                "helper_holds_its_command_line",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .arg(root.join("sandbox").join("control"))
+            .env(HELPER_HOLD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        // A process may show its command line only after its spawn returned.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !processes_naming(name, root).contains(&child.id()) {
+            assert!(
+                Instant::now() < deadline,
+                "process {} does not name {}",
+                child.id(),
+                root.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        child
+    };
+
+    let foreign = others.each_ref().map(|other| (other, hold(other)));
+    for (other, child) in &foreign {
+        assert_eq!(processes_naming(name, other), BTreeSet::from([child.id()]));
+    }
+    assert_eq!(processes_naming(name, &own), BTreeSet::new());
+    assert_none_naming(name, &own, Duration::ZERO);
+
+    let leaked = hold(&own);
+    assert_eq!(processes_naming(name, &own), BTreeSet::from([leaked.id()]));
+    let failed = std::panic::catch_unwind(|| {
+        assert_none_naming(name, &own, Duration::from_millis(300));
+    })
+    .expect_err("a leftover process of the test's own state root passed the check");
+    let message = failed
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or_default();
+    assert!(message.contains(&format!("[{}]", leaked.id())), "{message}");
+
+    for mut child in foreign.map(|(_, child)| child).into_iter().chain([leaked]) {
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{status}");
+    }
+    for root in [&own].into_iter().chain(&others) {
+        assert_none_naming(name, root, Duration::from_secs(10));
+    }
+}
+
+#[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn guest_lifecycle_stops_gracefully_and_cleans_up() {
     let state = tempfile::tempdir().unwrap();
@@ -668,7 +952,6 @@ fn guest_lifecycle_stops_gracefully_and_cleans_up() {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn exec_reports_exit_codes_timeouts_and_unlimited_output() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -765,14 +1048,13 @@ fn exec_reports_exit_codes_timeouts_and_unlimited_output() {
 
     assert_graceful(client.stop(id));
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn lifecycle_errors_follow_state_and_a_stopped_sandbox_restarts() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -798,14 +1080,13 @@ fn lifecycle_errors_follow_state_and_a_stopped_sandbox_restarts() {
     assert_graceful(client.stop(id));
     client.deprovision(id).unwrap();
     assert_eq!(failure(client.start(id)), ErrorCode::StaleId);
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn new_backend_reattaches_to_a_running_guest_and_forces_a_stop() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let id = {
         let first = backend(state.path());
         let client = AciEdgeSandbox::from_shared(first.clone());
@@ -837,14 +1118,13 @@ fn new_backend_reattaches_to_a_running_guest_and_forces_a_stop() {
         ErrorCode::NotStarted
     );
     client.deprovision(&sandbox.id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn a_crashed_guest_is_not_running_and_restarts_with_its_console_captured() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend_with(state.path(), true, |_| {});
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -852,10 +1132,10 @@ fn a_crashed_guest_is_not_running_and_restarts_with_its_console_captured() {
     client.start(id).unwrap();
     assert_prints(&client, id, "before-crash");
 
-    let launched: Vec<u32> = openvmm_processes().difference(&before).copied().collect();
+    let launched: Vec<u32> = openvmm_processes(state.path()).into_iter().collect();
     assert_eq!(launched.len(), 1, "{launched:?}");
     kill_process(launched[0]);
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
     assert_eq!(
         failure(client.exec(id, &ExecRequest::command_line("true"))),
         ErrorCode::NotStarted
@@ -873,7 +1153,7 @@ fn a_crashed_guest_is_not_running_and_restarts_with_its_console_captured() {
         "the restarted guest's boot console was not captured ({crashed} -> {restarted} bytes)"
     );
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -891,7 +1171,6 @@ fn helper_starts_a_sandbox_in_another_process() {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn guest_survives_its_caller_and_a_killed_start_leaves_no_vm() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend_with(state.path(), false, |setup| {
         setup.timeouts.stop_ms = 5_000;
     });
@@ -907,7 +1186,7 @@ fn guest_survives_its_caller_and_a_killed_start_leaves_no_vm() {
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.id).unwrap();
     drop(sandbox);
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 
     for delay in [0, 100, 300, 700, 1500] {
         let sandbox = provision(&client, &backend);
@@ -924,7 +1203,7 @@ fn guest_survives_its_caller_and_a_killed_start_leaves_no_vm() {
             panic!("deprovision after a start killed at {delay} ms failed: {error}")
         });
         drop(sandbox);
-        assert_no_new_openvmm(&before);
+        assert_no_new_openvmm(state.path());
     }
 }
 
@@ -932,7 +1211,6 @@ fn guest_survives_its_caller_and_a_killed_start_leaves_no_vm() {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn parallel_sandboxes_and_repeated_restarts_stay_isolated() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
 
@@ -953,7 +1231,7 @@ fn parallel_sandboxes_and_repeated_restarts_stay_isolated() {
             worker.join().unwrap();
         }
     });
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 
     let sandbox = provision(&client, &backend);
     let mut starts = Vec::new();
@@ -980,14 +1258,13 @@ fn parallel_sandboxes_and_repeated_restarts_stay_isolated() {
                 < MAX_START_OVERHEAD.as_millis()),
         "starts spent more than {MAX_START_OVERHEAD:?} outside the guest boot: {starts:?}"
     );
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn concurrent_commands_share_one_guest() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1026,14 +1303,13 @@ fn concurrent_commands_share_one_guest() {
     );
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn exec_streams_output_and_input_while_the_workload_runs() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1142,14 +1418,13 @@ fn exec_streams_output_and_input_while_the_workload_runs() {
 
     assert_graceful(client.stop(id));
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn cancelled_timed_out_and_finished_executions_leave_nothing_running() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1249,14 +1524,13 @@ fn cancelled_timed_out_and_finished_executions_leave_nothing_running() {
 
     assert_graceful(client.stop(id));
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn executions_run_concurrently_without_stalling_each_other() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1366,7 +1640,7 @@ fn executions_run_concurrently_without_stalling_each_other() {
         );
     }
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -1395,7 +1669,6 @@ fn helper_runs_a_command_in_another_process() {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn executions_end_with_their_caller_and_their_sandbox() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = provision(&client, &backend);
@@ -1446,14 +1719,13 @@ fn executions_end_with_their_caller_and_their_sandbox() {
     assert!(matches!(outcome, ExecOutcome::Signaled(_)), "{outcome:?}");
 
     client.deprovision(id).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn registered_images_are_staged_and_start_without_hashing() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let image = copied_image(state.path());
     let created = Instant::now();
     let first = AgentBackend::new(native_config(state.path(), &image)).unwrap();
@@ -1548,14 +1820,13 @@ fn registered_images_are_staged_and_start_without_hashing() {
         "no longer registered",
     );
     assert!(image.is_file());
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn trusted_digests_and_approved_runtime_files_follow_their_contracts() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let image = copied_image(state.path());
 
     // A trusted digest is recorded without hashing, even one that the content does not have, and
@@ -1618,7 +1889,7 @@ fn trusted_digests_and_approved_runtime_files_follow_their_contracts() {
     trusting.verify_image(&actual).unwrap();
     let reopened = AgentBackend::new(native_config(state.path(), &image)).unwrap();
     assert_eq!(reopened.image_id(), Some(actual));
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -1650,7 +1921,6 @@ fn registered_references_are_pulled_once_and_staged() {
         return;
     };
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let config = adjusted(
         native_config(state.path(), &required("EDGE_AGENT_TEST_IMAGE")),
         |setup| {
@@ -1705,7 +1975,7 @@ fn registered_references_are_pulled_once_and_staged() {
         client.provision_with(&ProvisionRequest::new(), &spec),
         "register it first",
     );
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -1713,7 +1983,6 @@ fn registered_references_are_pulled_once_and_staged() {
 fn host_paths_follow_the_filesystem_policy() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let work = host.path().join("work");
     for directory in ["src/secret", "out/frozen", "other"] {
         std::fs::create_dir_all(work.join(directory)).unwrap();
@@ -1821,7 +2090,7 @@ fn host_paths_follow_the_filesystem_policy() {
     assert_graceful(client.stop(id));
     client.deprovision(&sandbox.release()).unwrap();
     assert!(!src.join("new").exists());
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Reports what the guest reaches through aliases of the denied paths `secret` and `secret.txt`
@@ -1905,7 +2174,6 @@ fn host_link(target: &Path, link: &Path, directory: bool) {
 fn denied_paths_stay_hidden_through_aliases() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let root = host.path().join("shared");
     for directory in ["secret", "sub", "links", "hard"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
@@ -2022,7 +2290,7 @@ fn denied_paths_stay_hidden_through_aliases() {
     for absent in ["moved", "guest-hard-link", "secret/new"] {
         assert!(!root.join(absent).exists(), "{absent}");
     }
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Reports the workload's capabilities and the outcome of operations that would lift its mount
@@ -2068,7 +2336,6 @@ print(json.dumps({
 fn workloads_cannot_lift_their_mount_restrictions() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let (out, frozen) = (host.path().join("out"), host.path().join("frozen"));
     for directory in [&out, &frozen] {
         std::fs::create_dir(directory).unwrap();
@@ -2114,7 +2381,7 @@ fn workloads_cannot_lift_their_mount_restrictions() {
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
     assert!(out.join("written").is_file() && !frozen.join("new").exists());
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -2122,7 +2389,6 @@ fn workloads_cannot_lift_their_mount_restrictions() {
 fn replaced_host_objects_inside_a_writable_mapping_fail_the_next_start() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let out = host.path().join("out");
     let (cache, secret, moved) = (out.join("cache"), out.join("secret"), out.join("moved"));
     for directory in [&cache, &secret] {
@@ -2156,7 +2422,7 @@ fn replaced_host_objects_inside_a_writable_mapping_fail_the_next_start() {
         assert_graceful(client.stop(id));
     }
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
@@ -2164,7 +2430,6 @@ fn replaced_host_objects_inside_a_writable_mapping_fail_the_next_start() {
 fn every_mapping_that_fits_the_openvmm_command_line_reaches_the_guest() {
     let state = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let request = |directories: &[PathBuf]| {
         ProvisionRequest::new().with_filesystem(FilesystemPolicy {
             readonly_paths: directories.to_vec(),
@@ -2230,7 +2495,7 @@ fn every_mapping_that_fits_the_openvmm_command_line_reaches_the_guest() {
     eprintln!("{fitting} mappings fit the OpenVMM command line");
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Reports the guest's interfaces, source address, and resolver, and whether it reaches the
@@ -2329,7 +2594,6 @@ impl Drop for Services {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn network_policies_are_enforced() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let host = host_address();
     // The guest must reach the host through its gateway rather than consider it on-link.
     let (guest_network, guest_address, gateway) = if host.octets()[..3] == [10, 0, 0] {
@@ -2474,7 +2738,7 @@ fn network_policies_are_enforced() {
         assert_graceful(client.stop(&sandbox.id));
         client.deprovision(&sandbox.release()).unwrap();
     }
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Reports the guest's proxy variables and whether it reaches the proxy, the proxy's port over
@@ -2583,7 +2847,6 @@ fn guest_network_for(host: Ipv4Addr) -> (&'static str, &'static str) {
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn a_loopback_proxy_is_the_only_way_out() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let host = host_address();
     let (guest_network, gateway) = guest_network_for(host);
     let (proxy, datagrams) = tcp_and_udp_on_one_port();
@@ -2679,7 +2942,7 @@ fn a_loopback_proxy_is_the_only_way_out() {
     }
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 /// Serves one TCP connection and one UDP datagram on the given guest ports, then exits. It gives
@@ -2737,7 +3000,6 @@ fn host_loopback_is_bidirectional_and_explicit_forwards_still_work() {
     use std::net::TcpStream;
 
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let host = host_address();
     let (guest_network, gateway) = guest_network_for(host);
     let loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -2884,14 +3146,13 @@ fn host_loopback_is_bidirectional_and_explicit_forwards_still_work() {
     assert_eq!(printed, "loopback\n");
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
 }
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn exec_environments_layer_over_the_guest_defaults() {
     let state = tempfile::tempdir().unwrap();
-    let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let sandbox = started(&client, &backend, &ProvisionRequest::new());
@@ -2973,5 +3234,1154 @@ fn exec_environments_layer_over_the_guest_defaults() {
     assert_prints(&client, &sandbox.id, "still-running");
     assert_graceful(client.stop(&sandbox.id));
     client.deprovision(&sandbox.release()).unwrap();
-    assert_no_new_openvmm(&before);
+    assert_no_new_openvmm(state.path());
+}
+
+// Platform snapshots. A host whose setup enables them captures two templates when the setup first
+// opens, one without a NIC and one with a NIC on the setup's default guest network, starts every
+// sandbox that a template fits as a clone of it, and cold boots the others, saying why.
+
+/// Names another agent library for a helper process, such as one with the clone-crash feature.
+const HELPER_LIBRARY: &str = "EDGE_AGENT_TEST_HELPER_LIBRARY";
+const HELPER_LIBRARY_SHA256: &str = "EDGE_AGENT_TEST_HELPER_LIBRARY_SHA256";
+/// Whether a helper process opens the setup with platform snapshots, `on`, or without, `off`.
+const HELPER_SNAPSHOTS: &str = "EDGE_AGENT_TEST_HELPER_SNAPSHOTS";
+/// Names the step of a clone's start at which a library built with its clone-crash test feature
+/// ends the process, as a crash would.
+const CRASH_AT: &str = "ACI_EDGE_TEST_CLONE_CRASH_AT";
+/// The exit status of a process that such a library ended.
+const CRASH_STATUS: i32 = 86;
+/// The steps of a clone's start at which such a library can end the process, and whether the
+/// clone's launch has committed by then.
+const CRASH_POINTS: [(&str, bool); 4] = [
+    ("launched", false),
+    ("ready", false),
+    ("mapped", false),
+    ("committed", true),
+];
+
+/// The geometries of the snapshot tests' sandboxes, in vCPUs and MiB: the setup's default, which
+/// the templates boot with, and the larger ones that a clone grows to.
+const GEOMETRIES: [(u32, u32); 4] = [(1, 256), (2, 512), (4, 1024), (8, 2048)];
+
+/// The platform snapshots of the snapshot tests' hosts: templates for clones of up to 8 vCPUs and
+/// 8 GiB.
+fn platform_snapshots() -> PlatformSnapshots {
+    PlatformSnapshots::new(8, 8192)
+}
+
+/// Returns the test configuration with `snapshots`, with sandbox state under `state`.
+fn snapshot_config(state: &Path, snapshots: PlatformSnapshots) -> AgentConfig {
+    adjusted(
+        native_config(state, &required("EDGE_AGENT_TEST_IMAGE")),
+        |setup| setup.platform_snapshots = Some(snapshots),
+    )
+}
+
+/// Opens a backend of the test configuration with `snapshots`, with sandbox state under `state`,
+/// and its setup changed by `adjust`.
+fn snapshot_backend(
+    state: &Path,
+    snapshots: PlatformSnapshots,
+    adjust: impl FnOnce(&mut SetupConfig),
+) -> Arc<AgentBackend> {
+    Arc::new(AgentBackend::new(adjusted(snapshot_config(state, snapshots), adjust)).unwrap())
+}
+
+/// Returns the spec of a sandbox with `vcpus` and `memory_mib`.
+fn geometry(vcpus: u32, memory_mib: u32) -> SandboxSpec {
+    SandboxSpec::new()
+        .with_vcpus(vcpus)
+        .with_memory_mib(memory_mib)
+}
+
+/// Returns a provision request whose network allows all egress, which attaches a NIC.
+fn open_network() -> ProvisionRequest {
+    ProvisionRequest::new().with_network(NetworkPolicy::egress(Access::Allow))
+}
+
+/// Returns a start's boot mode, cold reason, and template, failing if the library wrote any of
+/// them malformed.
+fn boot_of(
+    started: &StartResult,
+) -> (
+    Option<BootMode>,
+    Option<ColdReason>,
+    Option<TemplateGeneration>,
+) {
+    (
+        started.boot_mode().unwrap(),
+        started.cold_reason().unwrap(),
+        started.template().unwrap(),
+    )
+}
+
+/// Fails unless the start cloned a template of `class`, and returns the template.
+fn assert_cloned(started: &StartResult, class: TemplateClass) -> TemplateGeneration {
+    match boot_of(started) {
+        (Some(BootMode::Clone), None, Some(template)) if template.class == class => template,
+        _ => panic!(
+            "the start did not clone a {class} template: {:?}",
+            started.metadata
+        ),
+    }
+}
+
+/// Fails unless the start cold booted, for `reason`.
+fn assert_cold(started: &StartResult, reason: Option<ColdReason>) {
+    assert_eq!(
+        boot_of(started),
+        (Some(BootMode::Cold), reason, None),
+        "{:?}",
+        started.metadata
+    );
+}
+
+/// The start's `bootMilliseconds`.
+fn boot_milliseconds(started: &StartResult) -> u64 {
+    started
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("bootMilliseconds"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| panic!("the start reports no boot time: {:?}", started.metadata))
+}
+
+/// Returns the templates that a host reports, `noNic` then `nic`, failing unless both are ready,
+/// with a key, a generation, and a capture time, and without an error.
+fn ready_templates(snapshots: Option<&PlatformSnapshotsInfo>) -> [TemplateInfo; 2] {
+    let snapshots = snapshots.expect("the host reports no platform snapshots");
+    assert_eq!(snapshots.disabled_reason, None, "{snapshots:?}");
+    assert_eq!(snapshots.templates.len(), 2, "{snapshots:?}");
+    [TemplateClass::NoNic, TemplateClass::Nic].map(|class| {
+        let template = snapshots
+            .templates
+            .iter()
+            .find(|template| template.class == class)
+            .unwrap_or_else(|| panic!("the host reports no {class} template: {snapshots:?}"))
+            .clone();
+        assert_eq!(template.state, TemplateState::Ready, "{template:?}");
+        assert!(
+            template.key.is_some()
+                && template.generation.is_some()
+                && template.captured_at.is_some(),
+            "{template:?}"
+        );
+        assert_eq!(template.last_error, None, "{template:?}");
+        template
+    })
+}
+
+/// Returns the generation of a template that [`ready_templates`] returned.
+fn generation_of(template: &TemplateInfo) -> TemplateGeneration {
+    TemplateGeneration::new(
+        template.class,
+        template.key.unwrap(),
+        template.generation.unwrap(),
+    )
+}
+
+/// Reports what a workload sees of its sandbox: `nproc`, the kernel's `MemTotal` in KiB, the
+/// hostname, and the content of `/etc/machine-id` in hexadecimal, or `null` without one.
+const IDENTITY_PROBE: &str = r#"
+import json, socket, subprocess
+def machine_id():
+    try:
+        with open("/etc/machine-id", "rb") as file:
+            return file.read().hex()
+    except FileNotFoundError:
+        return None
+with open("/proc/meminfo") as meminfo:
+    total = next(int(line.split()[1]) for line in meminfo if line.startswith("MemTotal:"))
+nproc = subprocess.run(["nproc"], capture_output=True, text=True, check=True).stdout
+print(json.dumps({
+    "nproc": int(nproc),
+    "memTotalKib": total,
+    "hostname": socket.gethostname(),
+    "machineId": machine_id(),
+}))
+"#;
+
+/// What a workload sees of its sandbox, as [`IDENTITY_PROBE`] reports it.
+fn identity(client: &AciEdgeSandbox, id: &SandboxId) -> serde_json::Value {
+    serde_json::from_str(&python(client, id, IDENTITY_PROBE, &[])).unwrap()
+}
+
+/// Checks an execution's exit code and output streams, and another's standard input.
+fn assert_executions(client: &AciEdgeSandbox, id: &SandboxId) {
+    let output = exec(
+        client,
+        id,
+        &ExecRequest::command_line("printf out; printf err >&2; exit 7"),
+    );
+    assert_eq!(
+        (
+            output.outcome,
+            output.stdout.as_slice(),
+            output.stderr.as_slice()
+        ),
+        (ExecOutcome::Exited(7), &b"out"[..], &b"err"[..])
+    );
+    let mut execution = client
+        .exec(
+            id,
+            &ExecRequest::argv(["/bin/cat"]).with_stdin(StdinMode::Piped),
+        )
+        .unwrap();
+    let mut stdin = execution.take_stdin().unwrap();
+    stdin.write_all(b"piped").unwrap();
+    drop(stdin);
+    let output = execution.wait_with_output().unwrap();
+    assert_eq!(
+        (output.outcome, output.stdout.as_slice()),
+        (ExecOutcome::Exited(0), &b"piped"[..])
+    );
+}
+
+/// A read-only host directory with a file, and a read-write one, which sandboxes map.
+struct Mappings {
+    _host: tempfile::TempDir,
+    readonly: PathBuf,
+    readwrite: PathBuf,
+}
+
+impl Mappings {
+    fn new() -> Self {
+        let host = tempfile::tempdir().unwrap();
+        let (readonly, readwrite) = (host.path().join("ro"), host.path().join("rw"));
+        for directory in [&readonly, &readwrite] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(readonly.join("file"), "readonly").unwrap();
+        Self {
+            _host: host,
+            readonly,
+            readwrite,
+        }
+    }
+
+    fn policy(&self) -> FilesystemPolicy {
+        FilesystemPolicy {
+            readonly_paths: vec![self.readonly.clone()],
+            readwrite_paths: vec![self.readwrite.clone()],
+            ..FilesystemPolicy::default()
+        }
+    }
+
+    /// Checks that the sandbox `id` reads the read-only directory but cannot write in it, and
+    /// writes the file `name` in the read-write one, where the host reads it.
+    fn check(&self, client: &AciEdgeSandbox, id: &SandboxId, name: &str) {
+        let (readonly, readwrite) = (guest(&self.readonly), guest(&self.readwrite));
+        let read = run(client, id, &["/bin/cat", &format!("{readonly}/file")]);
+        assert_eq!(
+            (read.outcome, read.stdout.as_slice()),
+            (ExecOutcome::Exited(0), &b"readonly"[..]),
+            "{read:?}"
+        );
+        let refused = run(client, id, &["/bin/touch", &format!("{readonly}/{name}")]);
+        assert_ne!(refused.outcome, ExecOutcome::Exited(0), "{refused:?}");
+        let written = run(
+            client,
+            id,
+            &[
+                "/bin/sh",
+                "-c",
+                "printf %s \"$1\" > \"$2\"",
+                "sh",
+                name,
+                &format!("{readwrite}/{name}"),
+            ],
+        );
+        assert_eq!(written.outcome, ExecOutcome::Exited(0), "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(self.readwrite.join(name)).unwrap(),
+            name
+        );
+        assert!(!self.readonly.join(name).exists());
+    }
+}
+
+/// Host services that the snapshot tests' sandboxes reach, and the guest network that reaches
+/// the host through its gateway: a TCP service on the host's address and one on its loopback,
+/// and a proxy on its loopback, beside a UDP service on the proxy's port.
+struct HostServices {
+    host: Ipv4Addr,
+    guest_network: &'static str,
+    gateway: &'static str,
+    service: String,
+    loopback: String,
+    proxy: u16,
+    _services: Services,
+    _datagrams: DatagramService,
+}
+
+impl HostServices {
+    fn serve() -> Self {
+        let host = host_address();
+        let (guest_network, gateway) = guest_network_for(host);
+        let (service, loopback) = (
+            TcpListener::bind((host, 0)).unwrap(),
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        );
+        let (proxy, datagrams) = tcp_and_udp_on_one_port();
+        let port = |listener: &TcpListener| listener.local_addr().unwrap().port();
+        let (service_port, loopback_port, proxy_port) =
+            (port(&service), port(&loopback), port(&proxy));
+        Self {
+            host,
+            guest_network,
+            gateway,
+            service: service_port.to_string(),
+            loopback: loopback_port.to_string(),
+            proxy: proxy_port,
+            _services: Services::serve(vec![
+                (service, "service"),
+                (loopback, "loopback"),
+                (proxy, "proxy"),
+            ]),
+            _datagrams: DatagramService::serve(datagrams, "udp"),
+        }
+    }
+
+    /// The URL of the proxy, as a provision request names it.
+    fn proxy_url(&self) -> String {
+        format!("http://localhost:{}", self.proxy)
+    }
+
+    /// Checks that the sandbox `id`, whose network allows all egress, has its NIC on the guest
+    /// network, names its gateway as resolver, and reaches the gateway's DNS service and the host's
+    /// service, but not the host's loopback.
+    fn check_egress(&self, client: &AciEdgeSandbox, id: &SandboxId) {
+        let printed = python(
+            client,
+            id,
+            NETWORK_PROBE,
+            &[
+                self.gateway,
+                &self.host.to_string(),
+                &self.service,
+                &self.service,
+                &self.loopback,
+            ],
+        );
+        let report: serde_json::Value = serde_json::from_str(&printed).unwrap();
+        let (address, _) = self.guest_network.split_once('/').unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "interfaces": report["interfaces"],
+                "source": address,
+                "dns": "reached",
+                "allowed": "reached:service",
+                "other": "reached:service",
+                "loopback": "blocked",
+                "resolver": format!("nameserver {}\n", self.gateway),
+            })
+        );
+        let interfaces = report["interfaces"].as_array().unwrap();
+        assert!(
+            interfaces.len() == 2 && interfaces.contains(&serde_json::json!("lo")),
+            "{report}"
+        );
+    }
+
+    /// Checks that the sandbox `id`, whose network denies everything but the proxy, has the
+    /// proxy's variables and reaches the proxy over TCP only, and nothing else.
+    fn check_proxy(&self, client: &AciEdgeSandbox, id: &SandboxId) {
+        let printed = python(
+            client,
+            id,
+            PROXY_PROBE,
+            &[
+                self.gateway,
+                &self.proxy.to_string(),
+                &self.loopback,
+                &self.host.to_string(),
+                &self.service,
+            ],
+        );
+        let url = format!("http://{}:{}", self.gateway, self.proxy);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&printed).unwrap(),
+            serde_json::json!({
+                "variables": {
+                    "HTTP_PROXY": url,
+                    "HTTPS_PROXY": url,
+                    "http_proxy": url,
+                    "https_proxy": url,
+                    "NO_PROXY": "localhost,127.0.0.1",
+                    "no_proxy": "localhost,127.0.0.1",
+                },
+                "proxy": "reached:proxy",
+                "proxyUdp": "blocked",
+                "other": "blocked",
+                "service": "blocked",
+            })
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn every_geometry_clones_without_and_with_a_network() {
+    let state = tempfile::tempdir().unwrap();
+    let services = HostServices::serve();
+    let mappings = Mappings::new();
+    let cloning = snapshot_backend(state.path(), platform_snapshots(), |setup| {
+        setup.defaults.guest_network = services.guest_network.to_owned();
+    });
+    let templates = ready_templates(cloning.info().platform_snapshots.as_ref());
+    eprintln!("templates: {templates:?}");
+    let templates = templates.each_ref().map(generation_of);
+    let client = AciEdgeSandbox::from_shared(cloning.clone());
+    // A host without snapshots shows what a cold boot of each geometry sees.
+    let plain = backend(state.path());
+    let cold_client = AciEdgeSandbox::from_shared(plain.clone());
+
+    for (vcpus, memory_mib) in GEOMETRIES {
+        let spec = geometry(vcpus, memory_mib);
+        let reference = provision_spec(&cold_client, &plain, &ProvisionRequest::new(), &spec);
+        assert_cold(&cold_client.start(&reference.id).unwrap(), None);
+        let expected = identity(&cold_client, &reference.id);
+        assert_graceful(cold_client.stop(&reference.id));
+        cold_client.deprovision(&reference.release()).unwrap();
+        assert_eq!(expected["nproc"], vcpus, "{expected}");
+
+        let cases = [
+            ("noNic", TemplateClass::NoNic, ProvisionRequest::new()),
+            ("nic", TemplateClass::Nic, open_network()),
+            (
+                "proxy",
+                TemplateClass::Nic,
+                ProvisionRequest::new()
+                    .with_network(NetworkPolicy::deny_all())
+                    .with_network_proxy(services.proxy_url()),
+            ),
+        ];
+        for (name, class, request) in cases {
+            let case = format!("{vcpus}/{memory_mib} {name}");
+            let request = request.with_filesystem(mappings.policy());
+            let sandbox = provision_spec(&client, &cloning, &request, &spec);
+            let id = &sandbox.id;
+            let started = client.start(id).unwrap();
+            let template = assert_cloned(&started, class);
+            assert_eq!(
+                template,
+                templates[usize::from(class == TemplateClass::Nic)],
+                "{case}"
+            );
+
+            // The clone has its own processors and memory, and the cold boot's hostname and the
+            // image's own machine ID.
+            let seen = identity(&client, id);
+            assert_eq!(seen["nproc"], vcpus, "{case}: {seen}");
+            assert_eq!(
+                (&seen["hostname"], &seen["machineId"]),
+                (&expected["hostname"], &expected["machineId"]),
+                "{case}: as a clone {seen}, cold booted {expected}"
+            );
+            let (cloned_kib, cold_kib) = (
+                seen["memTotalKib"].as_u64().unwrap(),
+                expected["memTotalKib"].as_u64().unwrap(),
+            );
+            assert!(
+                cloned_kib <= u64::from(memory_mib) * 1024 && cloned_kib * 10 >= cold_kib * 9,
+                "{case}: MemTotal {cloned_kib} KiB as a clone, {cold_kib} KiB cold booted"
+            );
+
+            mappings.check(&client, id, &format!("{vcpus}-{memory_mib}-{name}"));
+            match name {
+                "nic" => services.check_egress(&client, id),
+                "proxy" => services.check_proxy(&client, id),
+                _ => {}
+            }
+            assert_executions(&client, id);
+            assert_graceful(client.stop(id));
+
+            let restarted = client.start(id).unwrap();
+            assert_eq!(assert_cloned(&restarted, class), template, "{case}");
+            assert_prints(&client, id, "restarted");
+            assert_graceful(client.stop(id));
+            client.deprovision(&sandbox.release()).unwrap();
+            eprintln!(
+                "{case}: cloned generation {} in {} ms, and again in {} ms; MemTotal {cloned_kib} \
+                 KiB as a clone, {cold_kib} KiB cold booted",
+                template.generation,
+                boot_milliseconds(&started),
+                boot_milliseconds(&restarted),
+            );
+        }
+    }
+    assert_no_new_openvmm(state.path());
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn starts_that_no_template_fits_cold_boot_for_their_reason() {
+    let state = tempfile::tempdir().unwrap();
+    let host = host_address();
+    let (guest_network, _) = guest_network_for(host);
+    // Another guest network, which also reaches the host through its gateway.
+    let other_network = if host.octets()[..3] == [10, 0, 2] {
+        "10.0.3.2/24"
+    } else {
+        "10.0.2.2/24"
+    };
+    // A host without snapshots registers the image first, which gives its length.
+    let image_mib = backend(state.path()).images().unwrap()[0]
+        .length
+        .div_ceil(1 << 20);
+
+    let small = snapshot_backend(state.path(), PlatformSnapshots::new(2, 512), |setup| {
+        setup.defaults.guest_network = guest_network.to_owned();
+    });
+    ready_templates(small.info().platform_snapshots.as_ref());
+    let short = snapshot_backend(
+        state.path(),
+        platform_snapshots().with_max_image_mib(u32::try_from(image_mib - 1).unwrap()),
+        |_| {},
+    );
+    let debugging = backend_with(state.path(), true, |setup| {
+        setup.platform_snapshots = Some(platform_snapshots());
+    });
+    assert_eq!(
+        debugging.info().platform_snapshots,
+        Some(PlatformSnapshotsInfo::disabled(DisabledReason::GuestDebug))
+    );
+
+    let cases = [
+        // The host clones what fits it, beside the starts that cold boot.
+        (&small, open_network(), geometry(2, 512), None),
+        (
+            &small,
+            ProvisionRequest::new(),
+            geometry(1, 300),
+            Some(ColdReason::MemoryNotWholeBlocks),
+        ),
+        (
+            &small,
+            ProvisionRequest::new(),
+            geometry(1, 128),
+            Some(ColdReason::MemoryBelowTemplate),
+        ),
+        (
+            &small,
+            ProvisionRequest::new(),
+            geometry(1, 640),
+            Some(ColdReason::MemoryAboveCapacity),
+        ),
+        (
+            &small,
+            ProvisionRequest::new(),
+            geometry(4, 256),
+            Some(ColdReason::VcpusAboveCapacity),
+        ),
+        (
+            &small,
+            open_network(),
+            SandboxSpec::new().with_guest_network(other_network),
+            Some(ColdReason::GuestNetwork),
+        ),
+        (
+            &short,
+            ProvisionRequest::new(),
+            SandboxSpec::new(),
+            Some(ColdReason::ImageTooLong),
+        ),
+        (
+            &debugging,
+            ProvisionRequest::new(),
+            SandboxSpec::new(),
+            Some(ColdReason::GuestDebug),
+        ),
+    ];
+    for (backend, request, spec, reason) in cases {
+        let client = AciEdgeSandbox::from_shared(backend.clone());
+        let sandbox = provision_spec(&client, backend, &request, &spec);
+        let started = client.start(&sandbox.id).unwrap();
+        match reason {
+            None => {
+                assert_cloned(&started, TemplateClass::Nic);
+            }
+            Some(_) => assert_cold(&started, reason),
+        }
+        assert_prints(&client, &sandbox.id, "started");
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+        eprintln!(
+            "{spec:?}: {:?} in {} ms",
+            reason.map_or("clone", ColdReason::as_str),
+            boot_milliseconds(&started)
+        );
+    }
+    assert_no_new_openvmm(state.path());
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn without_platform_snapshots_every_start_cold_boots() {
+    let state = tempfile::tempdir().unwrap();
+    for snapshots in [None, Some(PlatformSnapshots::disabled())] {
+        let plain = backend_with(state.path(), false, |setup| {
+            setup.platform_snapshots = snapshots;
+        });
+        assert_eq!(plain.info().platform_snapshots, None, "{snapshots:?}");
+        let client = AciEdgeSandbox::from_shared(plain.clone());
+        for (request, spec) in [
+            (ProvisionRequest::new(), geometry(1, 256)),
+            (open_network(), geometry(2, 512)),
+        ] {
+            let sandbox = provision_spec(&client, &plain, &request, &spec);
+            assert_cold(&client.start(&sandbox.id).unwrap(), None);
+            assert_prints(&client, &sandbox.id, "cold");
+            assert_graceful(client.stop(&sandbox.id));
+            client.deprovision(&sandbox.release()).unwrap();
+        }
+    }
+    assert_no_new_openvmm(state.path());
+}
+
+#[test]
+#[ignore = "helper process for another_process_reuses_the_templates_without_capturing"]
+fn helper_opens_a_host_in_another_process() {
+    let Some(snapshots) = std::env::var_os(HELPER_SNAPSHOTS) else {
+        return;
+    };
+    let state = required(HELPER_STATE);
+    let config = if snapshots == "on" {
+        snapshot_config(&state, platform_snapshots())
+    } else {
+        native_config(&state, &required("EDGE_AGENT_TEST_IMAGE"))
+    };
+    let opened = Instant::now();
+    let backend = AgentBackend::new(config).unwrap();
+    let elapsed = opened.elapsed();
+    println!(
+        "HELPER_OPENED {}",
+        serde_json::json!({
+            "openMs": elapsed.as_secs_f64() * 1000.0,
+            "platformSnapshots": backend.info().platform_snapshots,
+        })
+    );
+}
+
+/// Opens the setup of the snapshot tests, or with `snapshots` false the setup without them, with
+/// sandbox state under `state`, in a helper process, and returns how long the open took and the
+/// platform snapshots that the host reports.
+fn open_in_helper(state: &Path, snapshots: bool) -> (Duration, Option<PlatformSnapshotsInfo>) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "helper_opens_a_host_in_another_process",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HELPER_STATE, state)
+        .env(HELPER_SNAPSHOTS, if snapshots { "on" } else { "off" })
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = stdout
+        .lines()
+        .find_map(|line| line.split_once("HELPER_OPENED "))
+        .map(|(_, report)| serde_json::from_str(report).unwrap())
+        .unwrap_or_else(|| panic!("the helper reported no open: {stdout}"));
+    (
+        Duration::from_secs_f64(report["openMs"].as_f64().unwrap() / 1000.0),
+        serde_json::from_value(report["platformSnapshots"].clone()).unwrap(),
+    )
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn another_process_reuses_the_templates_without_capturing() {
+    let state = tempfile::tempdir().unwrap();
+    // A host without snapshots registers the image first, so that the next open captures only.
+    backend(state.path());
+    let opened = Instant::now();
+    let first = snapshot_backend(state.path(), platform_snapshots(), |_| {});
+    let first_open = opened.elapsed();
+    let templates = ready_templates(first.info().platform_snapshots.as_ref());
+
+    // Each open runs in a new process, with and without snapshots in turn.
+    let mut opens = Vec::new();
+    for snapshots in [true, false, true, false] {
+        let (elapsed, reported) = open_in_helper(state.path(), snapshots);
+        if snapshots {
+            assert_eq!(ready_templates(reported.as_ref()), templates);
+        } else {
+            assert_eq!(reported, None);
+        }
+        opens.push((snapshots, elapsed));
+    }
+    let fastest = |snapshots: bool| {
+        opens
+            .iter()
+            .filter(|(with, _)| *with == snapshots)
+            .map(|(_, elapsed)| *elapsed)
+            .min()
+            .unwrap()
+    };
+    let (with, without) = (fastest(true), fastest(false));
+    eprintln!(
+        "the first open with snapshots took {first_open:?}; in other processes, opens took \
+         {opens:?}: at best {with:?} with snapshots, {without:?} without"
+    );
+    assert!(
+        with < without + Duration::from_millis(500),
+        "an open that reused the templates took {with:?}, and one without snapshots {without:?}"
+    );
+}
+
+#[test]
+#[ignore = "helper process for the snapshot tests whose clone outlives the process that started it"]
+fn helper_starts_a_clone_in_another_process() {
+    let Some(sandbox) = std::env::var_os(HELPER_SANDBOX) else {
+        return;
+    };
+    let mut config = snapshot_config(&required(HELPER_STATE), platform_snapshots());
+    if let Some(library) = std::env::var_os(HELPER_LIBRARY) {
+        config.library = PathBuf::from(library);
+        config.library_sha256 = digest_from(HELPER_LIBRARY_SHA256);
+    }
+    let client = AciEdgeSandbox::from_shared(Arc::new(AgentBackend::new(config).unwrap()));
+    let id = SandboxId::parse(&sandbox.to_string_lossy()).unwrap();
+    let started = client.start(&id).unwrap();
+    println!(
+        "HELPER_STARTED {}",
+        serde_json::to_string(&started).unwrap()
+    );
+}
+
+/// Says that a test skipped, and why, on standard error. It writes to the stream itself, which
+/// libtest doesn't capture as it captures `eprintln!`, so the skip shows without `--nocapture` too.
+fn say_skipped(reason: &str) {
+    let _ = writeln!(std::io::stderr(), "SKIPPED: {reason}");
+}
+
+/// Starts the sandbox `id` of the snapshot tests' setup, with sandbox state under `state`, in a
+/// helper process with the environment `vars`, and returns how the process ended and the start's
+/// result, if it printed one.
+fn start_clone_in_helper(
+    state: &Path,
+    id: &SandboxId,
+    vars: &[(&str, &OsStr)],
+) -> (ExitStatus, Option<StartResult>) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "helper_starts_a_clone_in_another_process",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HELPER_STATE, state)
+        .env(HELPER_SANDBOX, id.as_str())
+        .envs(vars.iter().copied())
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let started = stdout
+        .lines()
+        .find_map(|line| line.split_once("HELPER_STARTED "))
+        .map(|(_, started)| serde_json::from_str(started).unwrap());
+    (output.status, started)
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn a_clone_survives_its_caller() {
+    let state = tempfile::tempdir().unwrap();
+    let first = snapshot_backend(state.path(), platform_snapshots(), |_| {});
+    let starter = AciEdgeSandbox::from_shared(first.clone());
+    // The first backend cleans the sandbox up until the second one takes it over.
+    let provisioned = provision(&starter, &first);
+    let (status, started) = start_clone_in_helper(state.path(), &provisioned.id, &[]);
+    // A new backend, of a setup that this process has not opened, reaches the clone.
+    let second = snapshot_backend(state.path(), platform_snapshots(), |setup| {
+        setup.timeouts.stop_ms = 20_000;
+    });
+    let client = AciEdgeSandbox::from_shared(second.clone());
+    let sandbox = Cleanup {
+        client: &client,
+        backend: &second,
+        id: provisioned.release(),
+        armed: true,
+    };
+    assert!(
+        status.success(),
+        "the helper could not start the clone: {status}"
+    );
+    assert_cloned(
+        &started.expect("the helper reported no start"),
+        TemplateClass::NoNic,
+    );
+    assert_prints(&client, &sandbox.id, "survived");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(state.path());
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn a_clone_start_killed_before_its_commit_leaves_no_vm_and_after_it_a_clone() {
+    let (library, digest) = match std::env::var_os("EDGE_AGENT_TEST_CRASH_LIBRARY") {
+        Some(library) => (library, "EDGE_AGENT_TEST_CRASH_SHA256"),
+        None => (
+            required("EDGE_AGENT_TEST_LIBRARY").into_os_string(),
+            "EDGE_AGENT_TEST_SHA256",
+        ),
+    };
+    let digest = std::env::var_os(digest).unwrap_or_else(|| panic!("{digest} must be set"));
+    let state = tempfile::tempdir().unwrap();
+    let first = snapshot_backend(state.path(), platform_snapshots(), |_| {});
+    let client = AciEdgeSandbox::from_shared(first.clone());
+    for (index, (point, committed)) in CRASH_POINTS.into_iter().enumerate() {
+        // The first backend cleans the sandbox up until the checking one takes it over.
+        let provisioned = provision(&client, &first);
+        let (status, started) = start_clone_in_helper(
+            state.path(),
+            &provisioned.id,
+            &[
+                (HELPER_LIBRARY, library.as_os_str()),
+                (HELPER_LIBRARY_SHA256, digest.as_os_str()),
+                (CRASH_AT, OsStr::new(point)),
+            ],
+        );
+        // A new backend, of a setup that this process has not opened, takes the sandbox over.
+        let checking = snapshot_backend(state.path(), platform_snapshots(), |setup| {
+            setup.timeouts.stop_ms = 20_000 + u64::try_from(index).unwrap();
+        });
+        let checker = AciEdgeSandbox::from_shared(checking.clone());
+        let sandbox = Cleanup {
+            client: &checker,
+            backend: &checking,
+            id: provisioned.release(),
+            armed: true,
+        };
+        // A library without the feature ignores the first crash point; once one crash point
+        // ended the helper, every later one must.
+        if status.success() && index == 0 {
+            assert_cloned(
+                &started.expect("the helper reported no start"),
+                TemplateClass::NoNic,
+            );
+            say_skipped(&format!(
+                "the library ignores {CRASH_AT}, so it was built without its clone-crash test \
+                 feature, and no crash point was checked"
+            ));
+            return;
+        }
+        assert_eq!(
+            status.code(),
+            Some(CRASH_STATUS),
+            "the helper did not end at {point}: {status}"
+        );
+        if committed {
+            // The clone survives, as it survives a caller that ends after its start.
+            assert_prints(&checker, &sandbox.id, "survived");
+        } else {
+            // No VM is left, and the sandbox starts again.
+            assert_eq!(
+                failure(checker.exec(&sandbox.id, &ExecRequest::command_line("true"))),
+                ErrorCode::NotStarted,
+                "{point}"
+            );
+            assert_eq!(
+                failure(checker.stop(&sandbox.id)),
+                ErrorCode::AlreadyStopped,
+                "{point}"
+            );
+            assert_no_new_openvmm(state.path());
+            let restarted = checker.start(&sandbox.id).unwrap();
+            assert_cloned(&restarted, TemplateClass::NoNic);
+            assert_prints(&checker, &sandbox.id, "restarted");
+        }
+        assert_graceful(checker.stop(&sandbox.id));
+        checker.deprovision(&sandbox.release()).unwrap();
+        assert_no_new_openvmm(state.path());
+        eprintln!("a clone start that ended at {point} passed");
+    }
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn a_capture_that_fails_fails_the_open_and_names_its_class() {
+    let Some(initrd) = std::env::var_os("EDGE_AGENT_TEST_COLD_ONLY_INITRD") else {
+        say_skipped(
+            "EDGE_AGENT_TEST_COLD_ONLY_INITRD names no initramfs without a template mode, so this \
+             test checked nothing",
+        );
+        return;
+    };
+    let state = tempfile::tempdir().unwrap();
+    let config = adjusted(
+        snapshot_config(state.path(), platform_snapshots()),
+        |setup| runtime_files(setup).initrd = PathBuf::from(initrd),
+    );
+    // Nothing is kept of a failed open, so the next one captures again, and fails again.
+    for attempt in 0..2 {
+        let error =
+            AgentBackend::new(config.clone()).expect_err("an open whose capture fails must fail");
+        assert_eq!(error.code(), ErrorCode::BackendUnavailable, "{error}");
+        let words: BTreeSet<&str> = error
+            .message()
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .collect();
+        assert!(
+            [TemplateClass::NoNic, TemplateClass::Nic]
+                .iter()
+                .any(|class| words.contains(class.as_str())),
+            "{error}"
+        );
+        eprintln!("open {attempt}: {error}");
+        assert_no_new_openvmm(state.path());
+    }
+    // With an initramfs that captures, the same state root opens.
+    let opened = snapshot_backend(state.path(), platform_snapshots(), |_| {});
+    ready_templates(opened.info().platform_snapshots.as_ref());
+    assert_no_new_openvmm(state.path());
+}
+
+/// The `percent` percentile of `samples` by nearest rank: the smallest sample that at least
+/// `percent` percent of them do not exceed.
+fn nearest_rank(samples: &[f64], percent: usize) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[(percent * sorted.len()).div_ceil(100).max(1) - 1]
+}
+
+/// The milliseconds of a duration.
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+/// A lifecycle of a sandbox, as the latency test times it, in milliseconds: the start's
+/// `bootMilliseconds` and phases, and the calls of each step.
+fn time_lifecycle(
+    client: &AciEdgeSandbox,
+    backend: &AgentBackend,
+    request: &ProvisionRequest,
+    spec: &SandboxSpec,
+    clones: Option<TemplateClass>,
+) -> BTreeMap<String, f64> {
+    let began = Instant::now();
+    let sandbox = provision_spec(client, backend, request, spec);
+    let provisioned = began.elapsed();
+    let called = Instant::now();
+    let started = client.start(&sandbox.id).unwrap();
+    let start = called.elapsed();
+    match clones {
+        Some(class) => {
+            assert_cloned(&started, class);
+        }
+        None => assert_cold(&started, None),
+    }
+    let called = Instant::now();
+    let output = run(client, &sandbox.id, &["/bin/true"]);
+    let first_exec = called.elapsed();
+    assert_eq!(output.outcome, ExecOutcome::Exited(0), "{output:?}");
+    let called = Instant::now();
+    assert_graceful(client.stop(&sandbox.id));
+    let stop = called.elapsed();
+    let called = Instant::now();
+    client.deprovision(&sandbox.release()).unwrap();
+    let deprovision = called.elapsed();
+    let mut measures = BTreeMap::from([
+        (
+            "bootMilliseconds".to_owned(),
+            boot_milliseconds(&started) as f64,
+        ),
+        ("provision".to_owned(), milliseconds(provisioned)),
+        ("start call".to_owned(), milliseconds(start)),
+        ("first execution".to_owned(), milliseconds(first_exec)),
+        ("stop".to_owned(), milliseconds(stop)),
+        ("deprovision".to_owned(), milliseconds(deprovision)),
+        ("lifecycle".to_owned(), milliseconds(began.elapsed())),
+    ]);
+    let phases = started
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("phases"))
+        .and_then(serde_json::Value::as_object);
+    for (phase, value) in phases.into_iter().flatten() {
+        if let Some(value) = value.as_f64() {
+            measures.insert(format!("phase {phase}"), value);
+        }
+    }
+    measures
+}
+
+/// The P50 and P95 of each measure of `lifecycles`, by nearest rank.
+fn percentiles(lifecycles: &[BTreeMap<String, f64>]) -> BTreeMap<String, (f64, f64)> {
+    let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for lifecycle in lifecycles {
+        for (measure, value) in lifecycle {
+            samples.entry(measure.clone()).or_default().push(*value);
+        }
+    }
+    samples
+        .into_iter()
+        .map(|(measure, values)| {
+            let percentiles = (nearest_rank(&values, 50), nearest_rank(&values, 95));
+            (measure, percentiles)
+        })
+        .collect()
+}
+
+/// Opens the latency test's host with platform snapshots, with sandbox state under `state`, whose
+/// templates boot with `template_memory_mib`, or with the setup's default memory, and returns it
+/// with a report of its open: how long it took, and how long after it began each class's snapshot
+/// was taken.
+fn open_cloning(
+    state: &Path,
+    template_memory_mib: Option<u32>,
+) -> (Arc<AgentBackend>, serde_json::Value) {
+    let captured_after = SystemTime::now();
+    let opened = Instant::now();
+    let cloning = snapshot_backend(state, platform_snapshots(), |setup| {
+        if let Some(memory_mib) = template_memory_mib {
+            setup.defaults.resources.memory_mib = Some(memory_mib);
+        }
+    });
+    let first_open = opened.elapsed();
+    let templates = ready_templates(cloning.info().platform_snapshots.as_ref());
+    let captures: BTreeMap<String, f64> = templates
+        .iter()
+        .map(|template| {
+            let after = template.captured_at.unwrap().duration_since(captured_after);
+            (
+                template.class.to_string(),
+                after.map_or(f64::NAN, milliseconds),
+            )
+        })
+        .collect();
+    eprintln!(
+        "the open with snapshots whose templates boot with {} took {:.0} ms; each class's \
+         snapshot was taken this long after the open began, in ms: {captures:?}",
+        template_memory_mib.map_or("the default memory".to_owned(), |memory_mib| format!(
+            "{memory_mib} MiB"
+        )),
+        milliseconds(first_open)
+    );
+    let report = serde_json::json!({
+        "templateMemoryMib": template_memory_mib,
+        "openMs": milliseconds(first_open),
+        "capturedAfterOpenMs": captures,
+        "templates": templates,
+    });
+    (cloning, report)
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn clones_and_cold_boots_of_each_geometry_side_by_side() {
+    const WARMUPS: usize = 2;
+    let samples: usize = std::env::var("EDGE_AGENT_TEST_LATENCY_SAMPLES")
+        .map(|samples| samples.parse().unwrap())
+        .unwrap_or(3);
+    let sized = match std::env::var("EDGE_AGENT_TEST_LATENCY_TEMPLATE_MEMORY").as_deref() {
+        Err(_) | Ok("default") => false,
+        Ok("sandbox") => true,
+        Ok(other) => {
+            panic!("EDGE_AGENT_TEST_LATENCY_TEMPLATE_MEMORY is default or sandbox, not {other:?}")
+        }
+    };
+    let state = tempfile::tempdir().unwrap();
+    // The host without snapshots opens first and registers the image, so that each open of a host
+    // with snapshots captures only.
+    let plain = backend(state.path());
+    let cold_client = AciEdgeSandbox::from_shared(plain.clone());
+
+    let mut opens = Vec::new();
+    let mut cloning = None;
+    let mut report = Vec::new();
+    for (vcpus, memory_mib) in GEOMETRIES {
+        // The templates boot with the setup's default memory, or each geometry's own, from which
+        // its clones grow no memory.
+        if cloning.is_none() || sized {
+            let (host, open) = open_cloning(state.path(), sized.then_some(memory_mib));
+            opens.push(open);
+            cloning = Some(host);
+        }
+        let cloning = cloning.as_ref().unwrap();
+        let clone_client = AciEdgeSandbox::from_shared(cloning.clone());
+        for network in [false, true] {
+            let (request, class) = if network {
+                (open_network(), TemplateClass::Nic)
+            } else {
+                (ProvisionRequest::new(), TemplateClass::NoNic)
+            };
+            let spec = geometry(vcpus, memory_mib);
+            let (mut clones, mut colds) = (Vec::new(), Vec::new());
+            for index in 0..WARMUPS + samples {
+                // The modes alternate, and every other sample cold boots first.
+                for clone in [index % 2 == 0, index % 2 == 1] {
+                    let lifecycle = if clone {
+                        time_lifecycle(&clone_client, cloning, &request, &spec, Some(class))
+                    } else {
+                        time_lifecycle(&cold_client, &plain, &request, &spec, None)
+                    };
+                    if index >= WARMUPS {
+                        if clone {
+                            clones.push(lifecycle);
+                        } else {
+                            colds.push(lifecycle);
+                        }
+                    }
+                }
+            }
+            let (cloned, cold) = (percentiles(&clones), percentiles(&colds));
+            let mut table = format!(
+                "{vcpus} vCPUs, {memory_mib} MiB, {class}, from templates of {}: {samples} \
+                 samples of each mode after {WARMUPS} warm-ups, in ms\n| measure | clone P50 | \
+                 clone P95 | cold P50 | cold P95 |\n| --- | --- | --- | --- | --- |\n",
+                if sized {
+                    format!("{memory_mib} MiB")
+                } else {
+                    "the default memory".to_owned()
+                }
+            );
+            let measures: BTreeSet<&String> = cloned.keys().chain(cold.keys()).collect();
+            for measure in measures {
+                let cell = |percentiles: &BTreeMap<String, (f64, f64)>| {
+                    percentiles
+                        .get(measure)
+                        .map_or("| - | - ".to_owned(), |(p50, p95)| {
+                            format!("| {p50:.1} | {p95:.1} ")
+                        })
+                };
+                table.push_str(&format!("| {measure} {}{}|\n", cell(&cloned), cell(&cold)));
+            }
+            eprintln!("{table}");
+            report.push(serde_json::json!({
+                "vcpus": vcpus,
+                "memoryMib": memory_mib,
+                "class": class,
+                "templateMemoryMib": sized.then_some(memory_mib),
+                "clone": clones,
+                "cold": colds,
+                "clonePercentiles": cloned,
+                "coldPercentiles": cold,
+            }));
+        }
+    }
+    if let Some(path) = std::env::var_os("EDGE_AGENT_TEST_LATENCY_REPORT") {
+        let report = serde_json::json!({
+            "hypervisor": hypervisor(),
+            "templateMemory": if sized { "sandbox" } else { "default" },
+            "warmups": WARMUPS,
+            "samples": samples,
+            "opens": opens,
+            "geometries": report,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    assert_no_new_openvmm(state.path());
 }
