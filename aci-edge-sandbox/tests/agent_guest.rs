@@ -13,6 +13,10 @@
 //! in the image. `registered_references_are_pulled_once_and_staged` checks a registry image only
 //! when `EDGE_AGENT_TEST_IMAGE_REF` names one, with `EDGE_AGENT_TEST_BUNDLE`, a runtime bundle with
 //! the image tool, and `EDGE_AGENT_TEST_BUNDLE_SHA256`, the SHA-256 of its `SOURCE-MANIFEST.json`.
+//! The `image_cache_capacity_` tests also inspect persisted registrations. Their reference tests
+//! need the runtime bundle and access to the Azure Linux and CBL-Mariner public core images.
+//! The `platform_snapshots_` tests need a library that captures and restores platform templates,
+//! and a shell-equipped image larger than 1 MiB. Matching the sandbox ABI alone is not enough.
 //! Run the tests one at a time so that the check for leftover OpenVMM processes is
 //! exact, and optimized, since creating a backend hashes the runtime files and registering an
 //! image hashes and copies the image:
@@ -32,15 +36,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aci_edge_sandboxes::agent::{
-    AgentBackend, AgentConfig, BundleSource, CpuProfile, Hypervisor, ImageDigest, ImageId,
-    RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
+    AgentBackend, AgentConfig, BundleSource, CpuProfile, DisabledReason, HostInfo, Hypervisor,
+    ImageDigest, ImageId, PlatformSnapshots, PlatformSnapshotsInfo, RegisteredImage, RuntimeFiles,
+    RuntimeSource, SandboxDefaults, SetupConfig, TemplateState,
 };
 use aci_edge_sandboxes::nvx::resolve_guest_path;
 use aci_edge_sandboxes::{
-    Access, AciEdgeSandbox, EgressPolicy, Error, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
-    ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward, ImageSource, NetworkPeer,
-    NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, Result, SandboxId, SandboxSpec,
-    StdinMode, StopResult,
+    Access, AciEdgeSandbox, BootMode, ColdReason, EgressPolicy, Error, ErrorCode, ExecFailure,
+    ExecOutcome, ExecOutput, ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward,
+    ImageSource, NetworkPeer, NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, Result,
+    SandboxId, SandboxSpec, StartResult, StdinMode, StopResult, TemplateClass, TemplateGeneration,
 };
 
 const HELPER_STATE: &str = "EDGE_AGENT_TEST_HELPER_STATE";
@@ -560,6 +565,571 @@ fn start_in_helper(state: &Path, id: &SandboxId) -> Child {
         .stdin(Stdio::null())
         .spawn()
         .unwrap()
+}
+
+fn platform_snapshot_config(state: &Path) -> AgentConfig {
+    adjusted(
+        native_config(state, &required("EDGE_AGENT_TEST_IMAGE")),
+        |setup| {
+            setup.platform_snapshots = Some(PlatformSnapshots::new(2, 512));
+        },
+    )
+}
+
+fn platform_snapshot_network_request() -> ProvisionRequest {
+    let mut policy = NetworkPolicy::deny_all();
+    // Deny-all alone needs no NIC; permit a TEST-NET endpoint without contacting it.
+    policy
+        .egress
+        .allow
+        .push(NetworkRule::to("192.0.2.1").on_port(Protocol::Tcp, 443));
+    ProvisionRequest::new().with_network(policy)
+}
+
+fn ready_platform_templates(backend: &AgentBackend) -> &PlatformSnapshotsInfo {
+    let info = backend
+        .info()
+        .platform_snapshots
+        .as_ref()
+        .expect("an enabled snapshot host must report its templates");
+    assert_eq!(info.disabled_reason, None, "{info:?}");
+    assert_eq!(info.templates.len(), 2, "{info:?}");
+    for class in [TemplateClass::NoNic, TemplateClass::Nic] {
+        let templates: Vec<_> = info
+            .templates
+            .iter()
+            .filter(|template| template.class == class)
+            .collect();
+        assert_eq!(templates.len(), 1, "{info:?}");
+        let template = templates[0];
+        assert_eq!(template.state, TemplateState::Ready, "{template:?}");
+        assert!(template.key.is_some(), "{template:?}");
+        assert!(
+            template.generation.is_some_and(|generation| generation > 0),
+            "{template:?}"
+        );
+        assert!(template.captured_at.is_some(), "{template:?}");
+        assert_eq!(template.last_error, None, "{template:?}");
+    }
+    assert_ne!(info.templates[0].key, info.templates[1].key);
+    info
+}
+
+#[track_caller]
+fn assert_platform_clone(
+    backend: &AgentBackend,
+    started: &StartResult,
+    class: TemplateClass,
+) -> TemplateGeneration {
+    assert_eq!(
+        started.boot_mode().unwrap(),
+        Some(BootMode::Clone),
+        "{started:?}"
+    );
+    assert_eq!(started.cold_reason().unwrap(), None, "{started:?}");
+    let generation = started
+        .template()
+        .unwrap()
+        .expect("a clone must name its template");
+    assert_eq!(generation.class, class, "{started:?}");
+    let template = ready_platform_templates(backend)
+        .templates
+        .iter()
+        .find(|template| template.class == class)
+        .unwrap();
+    assert_eq!(Some(generation.key), template.key, "{started:?}");
+    assert_eq!(
+        Some(generation.generation),
+        template.generation,
+        "{started:?}"
+    );
+    generation
+}
+
+#[track_caller]
+fn assert_platform_cold(started: &StartResult, reason: Option<ColdReason>) {
+    assert_eq!(
+        started.boot_mode().unwrap(),
+        Some(BootMode::Cold),
+        "{started:?}"
+    );
+    assert_eq!(started.cold_reason().unwrap(), reason, "{started:?}");
+    assert_eq!(started.template().unwrap(), None, "{started:?}");
+}
+
+#[track_caller]
+fn assert_snapshot_command(client: &AciEdgeSandbox, id: &SandboxId, command: &str, stdout: &[u8]) {
+    let output = exec(client, id, &ExecRequest::command_line(command));
+    assert_eq!(output.outcome, ExecOutcome::Exited(0), "{output:?}");
+    assert_eq!(output.stdout, stdout, "{output:?}");
+}
+
+fn assert_snapshot_memory(client: &AciEdgeSandbox, id: &SandboxId, memory_mib: u64) {
+    let output = exec(
+        client,
+        id,
+        &ExecRequest::command_line(
+            "while read name value unit; do \
+             if [ \"$name\" = MemTotal: ]; then printf '%s' \"$value\"; break; fi; \
+             done < /proc/meminfo",
+        ),
+    );
+    assert_eq!(output.outcome, ExecOutcome::Exited(0), "{output:?}");
+    let kib = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    // Allow Linux's reserved memory, but not a missing 128 MiB memory block.
+    assert!(
+        kib > (memory_mib - 128) * 1024 && kib <= memory_mib * 1024,
+        "restored guest exposes {kib} KiB for a {memory_mib} MiB sandbox"
+    );
+}
+
+#[test]
+#[ignore = "requires an approved native library, shell-equipped image, and a hypervisor"]
+fn platform_snapshots_omitted_or_disabled_start_cold() {
+    let before = openvmm_processes();
+    for snapshots in [None, Some(PlatformSnapshots::disabled())] {
+        let state = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            AgentBackend::new(adjusted(
+                native_config(state.path(), &required("EDGE_AGENT_TEST_IMAGE")),
+                |setup| setup.platform_snapshots = snapshots,
+            ))
+            .unwrap(),
+        );
+        assert_eq!(backend.info().platform_snapshots, None);
+        let client = AciEdgeSandbox::from_shared(backend.clone());
+        let sandbox = provision(&client, &backend);
+        assert_platform_cold(&client.start(&sandbox.id).unwrap(), None);
+        assert_prints(&client, &sandbox.id, "cold");
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+    }
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_capture_and_restore_both_network_classes() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(state.path())).unwrap());
+    ready_platform_templates(&backend);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    for (class, request, network) in [
+        (
+            TemplateClass::NoNic,
+            ProvisionRequest::new(),
+            b"".as_slice(),
+        ),
+        (
+            TemplateClass::NoNic,
+            ProvisionRequest::new().with_network(NetworkPolicy::deny_all()),
+            b"".as_slice(),
+        ),
+        (
+            TemplateClass::Nic,
+            platform_snapshot_network_request(),
+            b"nic".as_slice(),
+        ),
+    ] {
+        let sandbox = provision_with(&client, &backend, &request);
+        assert_platform_clone(&backend, &client.start(&sandbox.id).unwrap(), class);
+        assert_snapshot_command(
+            &client,
+            &sandbox.id,
+            "for device in /sys/class/net/*/device; do \
+             if [ -e \"$device\" ]; then printf nic; fi; done",
+            network,
+        );
+        assert_prints(&client, &sandbox.id, "cloned");
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+    }
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_restores_are_isolated_and_restart_without_tenant_state() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(state.path())).unwrap());
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let first = provision(&client, &backend);
+    let second = provision(&client, &backend);
+    let generation = assert_platform_clone(
+        &backend,
+        &client.start(&first.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_snapshot_command(
+        &client,
+        &first.id,
+        "printf first > /tmp/platform-snapshot-marker",
+        b"",
+    );
+    assert_platform_clone(
+        &backend,
+        &client.start(&second.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_snapshot_command(
+        &client,
+        &second.id,
+        "test ! -e /tmp/platform-snapshot-marker && printf second > /tmp/platform-snapshot-marker",
+        b"",
+    );
+    assert_snapshot_command(
+        &client,
+        &first.id,
+        "cat /tmp/platform-snapshot-marker",
+        b"first",
+    );
+    assert_graceful(client.stop(&first.id));
+    let restored = assert_platform_clone(
+        &backend,
+        &client.start(&first.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_eq!(restored, generation);
+    assert_snapshot_command(
+        &client,
+        &first.id,
+        "test ! -e /tmp/platform-snapshot-marker && printf fresh",
+        b"fresh",
+    );
+    assert_snapshot_command(
+        &client,
+        &second.id,
+        "cat /tmp/platform-snapshot-marker",
+        b"second",
+    );
+    for sandbox in [first, second] {
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+    }
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_restore_at_cpu_and_memory_capacity() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(state.path())).unwrap());
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let spec = SandboxSpec::new().with_vcpus(2).with_memory_mib(512);
+    let sandbox = provision_spec(&client, &backend, &ProvisionRequest::new(), &spec);
+    assert_platform_clone(
+        &backend,
+        &client.start(&sandbox.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_snapshot_command(
+        &client,
+        &sandbox.id,
+        "grep -c '^processor' /proc/cpuinfo",
+        b"2\n",
+    );
+    assert_snapshot_memory(&client, &sandbox.id, 512);
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_ineligible_resources_and_network_cold_boot() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(state.path())).unwrap());
+    ready_platform_templates(&backend);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    for (spec, request, reason) in [
+        (
+            SandboxSpec::new().with_vcpus(4),
+            ProvisionRequest::new(),
+            ColdReason::VcpusAboveCapacity,
+        ),
+        (
+            SandboxSpec::new().with_memory_mib(257),
+            ProvisionRequest::new(),
+            ColdReason::MemoryNotWholeBlocks,
+        ),
+        (
+            SandboxSpec::new().with_memory_mib(128),
+            ProvisionRequest::new(),
+            ColdReason::MemoryBelowTemplate,
+        ),
+        (
+            SandboxSpec::new().with_memory_mib(640),
+            ProvisionRequest::new(),
+            ColdReason::MemoryAboveCapacity,
+        ),
+        (
+            SandboxSpec::new().with_guest_network("10.1.0.2/24"),
+            platform_snapshot_network_request(),
+            ColdReason::GuestNetwork,
+        ),
+    ] {
+        let sandbox = provision_spec(&client, &backend, &request, &spec);
+        assert_platform_cold(&client.start(&sandbox.id).unwrap(), Some(reason));
+        assert_prints(&client, &sandbox.id, "fallback");
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+    }
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, an image larger than 1 MiB, and a hypervisor"]
+fn platform_snapshots_oversized_images_cold_boot() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let config = adjusted(platform_snapshot_config(state.path()), |setup| {
+        setup.platform_snapshots = Some(PlatformSnapshots::new(2, 512).with_max_image_mib(1));
+    });
+    let backend = Arc::new(AgentBackend::new(config).unwrap());
+    ready_platform_templates(&backend);
+    let image = backend
+        .images()
+        .unwrap()
+        .into_iter()
+        .find(|image| Some(image.id) == backend.image_id())
+        .unwrap();
+    assert!(
+        image.length > 1024 * 1024,
+        "the image must exceed the template's 1 MiB capacity"
+    );
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let sandbox = provision(&client, &backend);
+    assert_platform_cold(
+        &client.start(&sandbox.id).unwrap(),
+        Some(ColdReason::ImageTooLong),
+    );
+    assert_prints(&client, &sandbox.id, "large-image");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshots, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_guest_debug_disables_templates() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(
+        AgentBackend::new(adjusted(platform_snapshot_config(state.path()), |setup| {
+            setup.diagnostics.guest_debug = true;
+        }))
+        .unwrap(),
+    );
+    let info = backend.info().platform_snapshots.as_ref().unwrap();
+    assert_eq!(
+        info.disabled_reason,
+        Some(DisabledReason::GuestDebug),
+        "{info:?}"
+    );
+    assert!(info.templates.is_empty(), "{info:?}");
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let sandbox = provision(&client, &backend);
+    assert_platform_cold(
+        &client.start(&sandbox.id).unwrap(),
+        Some(ColdReason::GuestDebug),
+    );
+    assert_prints(&client, &sandbox.id, "debug-cold");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+const SNAPSHOT_HELPER_STATE: &str = "EDGE_AGENT_TEST_SNAPSHOT_HELPER_STATE";
+const SNAPSHOT_HELPER_REPORT: &str = "EDGE_AGENT_TEST_SNAPSHOT_HELPER_REPORT";
+
+#[test]
+#[ignore = "helper process for platform_snapshots_reuse_generations_across_backends_and_processes"]
+fn helper_reopens_platform_snapshot_store() {
+    let Some(state) = std::env::var_os(SNAPSHOT_HELPER_STATE) else {
+        return;
+    };
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(Path::new(&state))).unwrap());
+    ready_platform_templates(&backend);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let sandbox = provision(&client, &backend);
+    assert_platform_clone(
+        &backend,
+        &client.start(&sandbox.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_prints(&client, &sandbox.id, "child-restored");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    std::fs::write(
+        required(SNAPSHOT_HELPER_REPORT),
+        serde_json::to_vec(backend.info()).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_reuse_generations_across_backends_and_processes() {
+    let directory = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let state = directory.path().join("state");
+    let report = directory.path().join("helper-info.json");
+    let config = platform_snapshot_config(&state);
+    let backend = Arc::new(AgentBackend::new(config.clone()).unwrap());
+    ready_platform_templates(&backend);
+    let reopened = AgentBackend::new(config).unwrap();
+    assert_eq!(
+        reopened.info().platform_snapshots,
+        backend.info().platform_snapshots
+    );
+    let mut helper = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "helper_reopens_platform_snapshot_store",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(SNAPSHOT_HELPER_STATE, &state)
+        .env(SNAPSHOT_HELPER_REPORT, &report)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = helper.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            helper.kill().unwrap();
+            helper.wait().unwrap();
+            panic!("the snapshot-store helper did not finish within 120 seconds");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "snapshot-store helper failed: {status}");
+    let info: HostInfo = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert_eq!(info.platform_snapshots, backend.info().platform_snapshots);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let sandbox = provision(&client, &backend);
+    assert_platform_clone(
+        &backend,
+        &client.start(&sandbox.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_prints(&client, &sandbox.id, "reused");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_changed_capacity_uses_new_templates() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let config = platform_snapshot_config(state.path());
+    let original = AgentBackend::new(config.clone()).unwrap();
+    let previous = ready_platform_templates(&original);
+    let changed = Arc::new(
+        AgentBackend::new(adjusted(config, |setup| {
+            setup.platform_snapshots = Some(PlatformSnapshots::new(2, 1024));
+        }))
+        .unwrap(),
+    );
+    let current = ready_platform_templates(&changed);
+    for template in &previous.templates {
+        let replacement = current
+            .templates
+            .iter()
+            .find(|other| other.class == template.class)
+            .unwrap();
+        assert_ne!(template.key, replacement.key);
+    }
+    let client = AciEdgeSandbox::from_shared(changed.clone());
+    let spec = SandboxSpec::new().with_memory_mib(768);
+    let sandbox = provision_spec(&client, &changed, &ProvisionRequest::new(), &spec);
+    assert_platform_clone(
+        &changed,
+        &client.start(&sandbox.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_prints(&client, &sandbox.id, "new-capacity");
+    assert_snapshot_memory(&client, &sandbox.id, 768);
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires an approved native library and runtime files"]
+fn platform_snapshots_invalid_configuration_is_rejected_before_state() {
+    for (settings, memory, field) in [
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 3, "maxMemoryMib": 512}),
+            None,
+            "maxVcpus",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2, "maxMemoryMib": 300}),
+            None,
+            "maxMemoryMib",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2, "maxMemoryMib": 512, "maxImageMib": 0}),
+            None,
+            "maxImageMib",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxMemoryMib": 512}),
+            None,
+            "must set maxVcpus",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2}),
+            None,
+            "must set maxVcpus",
+        ),
+        (
+            serde_json::json!({"enabled": false, "maxMemoryMib": 100}),
+            None,
+            "maxMemoryMib",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2, "maxMemoryMib": 512}),
+            Some(257),
+            "defaults.resources.memoryMib",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2, "maxMemoryMib": 512}),
+            Some(1024),
+            "defaults.resources.memoryMib",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let config = adjusted(platform_snapshot_config(&state), |setup| {
+            setup.platform_snapshots = Some(serde_json::from_value(settings).unwrap());
+            if let Some(memory) = memory {
+                setup.defaults.resources.memory_mib = Some(memory);
+            }
+        });
+        let error = AgentBackend::new(config).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::MalformedRequest, "{error}");
+        assert!(error.message().contains(field), "{error}");
+        assert!(
+            !state.exists(),
+            "invalid snapshots created state at {}",
+            state.display()
+        );
+    }
 }
 
 #[test]
@@ -1640,6 +2210,671 @@ fn explicit_runtime_files_register_no_references() {
         ErrorCode::PolicyValidation
     );
     assert_eq!(backend.images().unwrap().len(), 1);
+}
+
+fn image_cache_config(state: &Path, capacity: Option<u64>) -> AgentConfig {
+    adjusted(
+        native_config(state, &required("EDGE_AGENT_TEST_IMAGE")),
+        |setup| {
+            setup.defaults.image = None;
+            setup.images.max_cache_capacity_bytes = capacity;
+        },
+    )
+}
+
+fn image_cache_bundle_config(state: &Path, capacity: Option<u64>) -> AgentConfig {
+    adjusted(image_cache_config(state, capacity), |setup| {
+        setup.runtime = RuntimeSource::Bundle(BundleSource {
+            path: std::path::absolute(required("EDGE_AGENT_TEST_BUNDLE")).unwrap(),
+            manifest_sha256: digest_from("EDGE_AGENT_TEST_BUNDLE_SHA256"),
+        });
+    })
+}
+
+fn image_record_path(state: &Path, id: &ImageId) -> PathBuf {
+    let id = id.to_string();
+    state
+        .join("images")
+        .join(format!("{}.json", id.strip_prefix("sha256:").unwrap()))
+}
+
+fn image_record(state: &Path, id: &ImageId) -> serde_json::Value {
+    let path = image_record_path(state, id);
+    serde_json::from_slice(
+        &std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display())),
+    )
+    .unwrap()
+}
+
+#[track_caller]
+fn assert_image_record(
+    state: &Path,
+    image: &RegisteredImage,
+    paths: &[PathBuf],
+    references: &[&str],
+    protected: bool,
+) -> serde_json::Value {
+    let record = image_record(state, &image.id);
+    assert_eq!(record["format"], 2, "{record}");
+    assert_eq!(record["id"], image.id.to_string(), "{record}");
+    assert_eq!(
+        record["stagedPath"],
+        serde_json::to_value(&image.path).unwrap(),
+        "{record}"
+    );
+    assert_eq!(record["trusted"], false, "{record}");
+    if protected {
+        assert_eq!(record["protected"], true, "{record}");
+    } else {
+        assert!(record.get("protected").is_none(), "{record}");
+    }
+    let recorded_paths: Vec<PathBuf> = record["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| {
+            assert!(source["seal"].is_object(), "{source}");
+            let path: PathBuf = serde_json::from_value(source["path"].clone()).unwrap();
+            assert_eq!(
+                source["seal"]["length"],
+                std::fs::metadata(&path).unwrap().len(),
+                "{source}"
+            );
+            path
+        })
+        .collect();
+    let mut expected_paths: Vec<PathBuf> = paths
+        .iter()
+        .map(|path| std::path::absolute(path).unwrap())
+        .collect();
+    expected_paths.sort();
+    assert_eq!(recorded_paths, expected_paths, "{record}");
+    let mut references = references.to_vec();
+    references.sort();
+    assert_eq!(
+        record["references"],
+        serde_json::json!(references),
+        "{record}"
+    );
+    let metadata = std::fs::metadata(&image.path).unwrap();
+    assert_eq!(metadata.len(), image.length, "{image:?}");
+    assert!(metadata.permissions().readonly(), "{image:?}");
+    assert!(image.intact && !image.trusted, "{image:?}");
+    assert_eq!(record["binding"]["format"], "gpt", "{record}");
+    assert_eq!(
+        record["binding"]["image"]["length"], image.length,
+        "{record}"
+    );
+    assert_eq!(record["binding"]["image"]["kind"], "regular", "{record}");
+    assert_eq!(
+        record["binding"]["policy"]["result"], "accepted",
+        "{record}"
+    );
+    record
+}
+
+fn image_cache_ids(backend: &AgentBackend) -> BTreeSet<ImageId> {
+    backend
+        .images()
+        .unwrap()
+        .into_iter()
+        .map(|image| image.id)
+        .collect()
+}
+
+fn image_cache_bytes(backend: &AgentBackend, state: &Path) -> u64 {
+    backend
+        .images()
+        .unwrap()
+        .iter()
+        .filter(|image| {
+            let record = image_record(state, &image.id);
+            record["protected"] == true
+                || !record["references"].as_array().unwrap().is_empty()
+                || record["paths"].as_array().unwrap().is_empty()
+        })
+        .map(|image| std::fs::metadata(&image.path).unwrap().len())
+        .sum()
+}
+
+#[track_caller]
+fn assert_image_capacity_rejected<T>(result: Result<T>, capacity: u64) {
+    match result {
+        Ok(_) => panic!("the image unexpectedly fit in a cache of {capacity} bytes"),
+        Err(error) => {
+            assert_eq!(error.code(), ErrorCode::PolicyValidation, "{error}");
+            assert!(
+                error.message().contains(&format!(
+                    "more than the image cache's capacity of {capacity} bytes"
+                )),
+                "{error}"
+            );
+        }
+    }
+}
+
+fn wait_for_prefetched_image(backend: &AgentBackend, id: ImageId, paths: usize) -> RegisteredImage {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(image) = backend
+            .images()
+            .unwrap()
+            .into_iter()
+            .find(|image| image.id == id)
+        {
+            let state = &backend.config().setup.state_root;
+            if image_record(state, &id)["paths"].as_array().unwrap().len() == paths {
+                return image;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "prefetch did not register image {id}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+const IMAGE_CACHE_REFERENCES: [&str; 2] = [
+    "mcr.microsoft.com/azurelinux/base/core:3.0",
+    "mcr.microsoft.com/cbl-mariner/base/core:2.0",
+];
+
+fn register_cache_references(backend: &AgentBackend) -> [RegisteredImage; 2] {
+    IMAGE_CACHE_REFERENCES.map(|reference| {
+        let image = backend
+            .register_reference(reference, ImageDigest::Compute)
+            .unwrap();
+        eprintln!("{reference}: {} staged bytes, {}", image.length, image.id);
+        image
+    })
+}
+
+// Restore the original VHD footer, if present, so a caller-owned alias has the reference's ID.
+fn copy_registered_image(state: &Path, image: &RegisteredImage, path: &Path) -> PathBuf {
+    let record = image_record(state, &image.id);
+    let mut source = std::fs::File::open(&image.path).unwrap();
+    let mut copy = std::fs::File::create(path).unwrap();
+    std::io::copy(&mut source, &mut copy).unwrap();
+    if let Some(footer) = record.get("footer") {
+        let footer: Vec<u8> = serde_json::from_value(footer.clone()).unwrap();
+        copy.write_all(&footer).unwrap();
+    }
+    drop(copy);
+    assert_eq!(sha256_of(path), *image.id.sha256());
+    path.to_path_buf()
+}
+
+#[test]
+#[ignore = "requires an approved native library and runtime files"]
+fn image_cache_capacity_zero_is_rejected_before_creating_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("state");
+    let error = AgentBackend::new(image_cache_config(&state, Some(0))).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::MalformedRequest, "{error}");
+    assert!(
+        error.message().contains("images.maxCacheCapacityBytes"),
+        "{error}"
+    );
+    assert!(!state.exists());
+}
+
+#[test]
+#[ignore = "requires an approved native library, guest image, and a hypervisor"]
+fn image_cache_capacity_ordinary_paths_are_external() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let path = std::path::absolute(required("EDGE_AGENT_TEST_IMAGE")).unwrap();
+    let backend = Arc::new(AgentBackend::new(image_cache_config(state.path(), Some(1))).unwrap());
+    let image = backend.register_image(&path, ImageDigest::Compute).unwrap();
+    assert!(image.length > 1);
+    assert_eq!(image.id, ImageId::from_sha256(sha256_of(&path)));
+    let record = assert_image_record(state.path(), &image, &[path.clone()], &[], false);
+    assert_eq!(image_cache_bytes(&backend, state.path()), 0);
+
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    for source in [
+        ImageSource::Path(path.clone()),
+        ImageSource::Digest(image.id),
+    ] {
+        let spec = SandboxSpec::new().with_image(source);
+        let sandbox = provision_spec(&client, &backend, &ProvisionRequest::new(), &spec);
+        client.start(&sandbox.id).unwrap();
+        assert_prints(&client, &sandbox.id, "external");
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+    }
+    let config = adjusted(image_cache_config(state.path(), Some(1)), |setup| {
+        setup.defaults.image = Some(ImageSource::Path(path.clone()));
+    });
+    assert_image_capacity_rejected(AgentBackend::new(config), 1);
+    assert_eq!(image_record(state.path(), &image.id), record);
+    assert_eq!(image_cache_ids(&backend), BTreeSet::from([image.id]));
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires an approved native library, guest image, and a hypervisor"]
+fn image_cache_capacity_default_paths_and_digests_are_protected() {
+    let before = openvmm_processes();
+    let path = std::path::absolute(required("EDGE_AGENT_TEST_IMAGE")).unwrap();
+    for by_digest in [false, true] {
+        let state = tempfile::tempdir().unwrap();
+        let seed = AgentBackend::new(image_cache_config(state.path(), None)).unwrap();
+        let image = seed.register_image(&path, ImageDigest::Compute).unwrap();
+        let source = if by_digest {
+            ImageSource::Digest(image.id)
+        } else {
+            ImageSource::Path(path.clone())
+        };
+        let mut config = image_cache_config(state.path(), None);
+        config.setup.defaults.image = Some(source);
+        let unlimited = AgentBackend::new(config.clone()).unwrap();
+        assert_eq!(unlimited.image_id(), Some(image.id));
+        let record = assert_image_record(state.path(), &image, &[path.clone()], &[], false);
+        config.setup.images.max_cache_capacity_bytes = Some(image.length - 1);
+        assert_image_capacity_rejected(AgentBackend::new(config.clone()), image.length - 1);
+        assert_eq!(image_record(state.path(), &image.id), record);
+
+        config.setup.images.max_cache_capacity_bytes = Some(image.length);
+        let backend = Arc::new(AgentBackend::new(config.clone()).unwrap());
+        assert_eq!(backend.image_id(), Some(image.id));
+        assert_image_record(state.path(), &image, &[path.clone()], &[], true);
+        assert_eq!(image_cache_bytes(&backend, state.path()), image.length);
+        assert_eq!(
+            AgentBackend::new(config).unwrap().image_id(),
+            Some(image.id)
+        );
+        let client = AciEdgeSandbox::from_shared(backend.clone());
+        let sandbox = provision(&client, &backend);
+        client.start(&sandbox.id).unwrap();
+        assert_prints(&client, &sandbox.id, "default");
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+
+        assert_image_record(state.path(), &image, &[path.clone()], &[], true);
+        assert!(backend.unregister_image(&image.id).unwrap());
+        assert!(!image_record_path(state.path(), &image.id).exists());
+        let ordinary = seed.register_image(&path, ImageDigest::Compute).unwrap();
+        assert_eq!(ordinary.id, image.id);
+        assert_image_record(state.path(), &ordinary, &[path.clone()], &[], false);
+        assert_eq!(image_cache_bytes(&seed, state.path()), 0);
+    }
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires an approved native library, runtime files, and a guest image"]
+fn image_cache_capacity_prefetch_only_registers_paths_and_deduplicates_content() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = std::path::absolute(required("EDGE_AGENT_TEST_IMAGE")).unwrap();
+    let alias = directory.path().join("alias.img");
+    std::fs::copy(&path, &alias).unwrap();
+    let id = ImageId::from_sha256(sha256_of(&path));
+    let measured = AgentBackend::new(image_cache_config(&directory.path().join("measure"), None))
+        .unwrap()
+        .register_image(&path, ImageDigest::Compute)
+        .unwrap();
+    for capacity in [None, Some(measured.length)] {
+        let state = tempfile::tempdir().unwrap();
+        let mut config = image_cache_config(state.path(), capacity);
+        config.setup.images.prefetch = vec![
+            ImageSource::Reference(IMAGE_CACHE_REFERENCES[0].to_owned()),
+            ImageSource::Digest(ImageId::from_sha256([77; 32])),
+            ImageSource::Path(path.clone()),
+            ImageSource::Path(alias.clone()),
+        ];
+        let backend = AgentBackend::new(config).unwrap();
+        let image = wait_for_prefetched_image(&backend, id, 2);
+        assert_image_record(
+            state.path(),
+            &image,
+            &[path.clone(), alias.clone()],
+            &[],
+            capacity.is_some(),
+        );
+        assert_eq!(image_cache_ids(&backend), BTreeSet::from([id]));
+        assert_eq!(
+            image_cache_bytes(&backend, state.path()),
+            if capacity.is_some() { image.length } else { 0 }
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires an approved native library, runtime bundle, public registries, and a hypervisor"]
+fn image_cache_capacity_references_fit_reuse_reject_and_evict() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let unlimited = AgentBackend::new(image_cache_bundle_config(state.path(), None)).unwrap();
+    let images = register_cache_references(&unlimited);
+    for (image, reference) in images.iter().zip(IMAGE_CACHE_REFERENCES) {
+        assert_image_record(state.path(), image, &[], &[reference], false);
+    }
+    let total: u64 = images.iter().map(|image| image.length).sum();
+    assert_eq!(image_cache_bytes(&unlimited, state.path()), total);
+    let (small, small_reference, large, large_reference) = if images[0].length <= images[1].length {
+        (
+            &images[0],
+            IMAGE_CACHE_REFERENCES[0],
+            &images[1],
+            IMAGE_CACHE_REFERENCES[1],
+        )
+    } else {
+        (
+            &images[1],
+            IMAGE_CACHE_REFERENCES[1],
+            &images[0],
+            IMAGE_CACHE_REFERENCES[0],
+        )
+    };
+    assert!(unlimited.unregister_image(&small.id).unwrap());
+    let exact = AgentBackend::new(image_cache_bundle_config(state.path(), Some(total))).unwrap();
+    let fitted = exact
+        .register_reference(small_reference, ImageDigest::Compute)
+        .unwrap();
+    assert_eq!(fitted.length, small.length);
+    let record = assert_image_record(state.path(), &fitted, &[], &[small_reference], false);
+    let modified = std::fs::metadata(&fitted.path).unwrap().modified().unwrap();
+    assert_eq!(
+        exact
+            .register_reference(small_reference, ImageDigest::Compute)
+            .unwrap(),
+        fitted
+    );
+    assert_eq!(
+        std::fs::metadata(&fitted.path).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_eq!(image_record(state.path(), &fitted.id), record);
+    assert_eq!(image_cache_bytes(&exact, state.path()), total);
+    assert!(exact.unregister_image(&fitted.id).unwrap());
+
+    let tight = AgentBackend::new(image_cache_bundle_config(
+        state.path(),
+        Some(small.length - 1),
+    ))
+    .unwrap();
+    let retained = image_record(state.path(), &large.id);
+    assert_image_capacity_rejected(
+        tight.register_reference(small_reference, ImageDigest::Compute),
+        small.length - 1,
+    );
+    assert_eq!(image_cache_ids(&tight), BTreeSet::from([large.id]));
+    assert_eq!(image_record(state.path(), &large.id), retained);
+    let backend = Arc::new(
+        AgentBackend::new(image_cache_bundle_config(state.path(), Some(small.length))).unwrap(),
+    );
+    let admitted = backend
+        .register_reference(small_reference, ImageDigest::Compute)
+        .unwrap();
+    assert_eq!(admitted.length, small.length);
+    assert_eq!(image_cache_ids(&backend), BTreeSet::from([admitted.id]));
+    assert_eq!(image_cache_bytes(&backend, state.path()), small.length);
+    assert!(!large.path.exists());
+    assert!(!image_record_path(state.path(), &large.id).exists());
+    assert_image_record(state.path(), &admitted, &[], &[small_reference], false);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let old = SandboxSpec::new().with_image(ImageSource::Reference(large_reference.to_owned()));
+    assert_unavailable(
+        client.provision_with(&ProvisionRequest::new(), &old),
+        "is not registered; register it first",
+    );
+    let spec = SandboxSpec::new().with_image(ImageSource::Reference(small_reference.to_owned()));
+    let sandbox = provision_spec(&client, &backend, &ProvisionRequest::new(), &spec);
+    client.start(&sandbox.id).unwrap();
+    assert_prints(&client, &sandbox.id, "admitted");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires an approved native library and runtime bundle with public registry access"]
+fn image_cache_capacity_reference_defaults_and_path_aliases_keep_their_attributes() {
+    let state = tempfile::tempdir().unwrap();
+    let unlimited = AgentBackend::new(image_cache_bundle_config(state.path(), None)).unwrap();
+    let images = register_cache_references(&unlimited);
+    let total: u64 = images.iter().map(|image| image.length).sum();
+    let alias = copy_registered_image(state.path(), &images[0], &state.path().join("alias.vhd"));
+    let mixed = unlimited
+        .register_image(&alias, ImageDigest::Compute)
+        .unwrap();
+    assert_eq!(mixed.id, images[0].id);
+    assert_image_record(
+        state.path(),
+        &mixed,
+        &[alias.clone()],
+        &[IMAGE_CACHE_REFERENCES[0]],
+        false,
+    );
+    for (source, image, paths, reference) in [
+        (
+            ImageSource::Reference(IMAGE_CACHE_REFERENCES[0].to_owned()),
+            &images[0],
+            vec![alias.clone()],
+            IMAGE_CACHE_REFERENCES[0],
+        ),
+        (
+            ImageSource::Digest(images[1].id),
+            &images[1],
+            vec![],
+            IMAGE_CACHE_REFERENCES[1],
+        ),
+    ] {
+        let mut config = image_cache_bundle_config(state.path(), Some(total));
+        config.setup.defaults.image = Some(source);
+        let backend = AgentBackend::new(config).unwrap();
+        assert_eq!(backend.image_id(), Some(image.id));
+        assert_image_record(state.path(), image, &paths, &[reference], true);
+    }
+    assert_eq!(image_cache_bytes(&unlimited, state.path()), total);
+    let raw = state.path().join("ordinary.img");
+    std::fs::copy(&images[0].path, &raw).unwrap();
+    let ordinary = unlimited
+        .register_image(&raw, ImageDigest::Compute)
+        .unwrap();
+    assert_ne!(
+        ordinary.id, images[0].id,
+        "the reference image must retain its VHD footer"
+    );
+    let unchanged = assert_image_record(state.path(), &ordinary, &[raw.clone()], &[], false);
+    let mut config = image_cache_bundle_config(state.path(), Some(total));
+    config.setup.defaults.image = Some(ImageSource::Path(raw));
+    assert_unavailable(
+        AgentBackend::new(config),
+        "only 0 bytes are unused and evictable",
+    );
+    assert_eq!(image_record(state.path(), &ordinary.id), unchanged);
+    assert_eq!(image_cache_ids(&unlimited).len(), 3);
+    assert_eq!(image_cache_bytes(&unlimited, state.path()), total);
+}
+
+#[test]
+#[ignore = "requires an approved native library, runtime bundle, and public registry access"]
+fn image_cache_capacity_default_and_prefetched_paths_share_the_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let seed_state = directory.path().join("seed");
+    let seed = AgentBackend::new(image_cache_bundle_config(&seed_state, None)).unwrap();
+    let images = register_cache_references(&seed);
+    let paths = [
+        copy_registered_image(
+            &seed_state,
+            &images[0],
+            &directory.path().join("default.vhd"),
+        ),
+        copy_registered_image(
+            &seed_state,
+            &images[1],
+            &directory.path().join("prefetch.vhd"),
+        ),
+    ];
+    let total: u64 = images.iter().map(|image| image.length).sum();
+    let state = directory.path().join("limited");
+    let mut config = image_cache_config(&state, Some(total));
+    config.setup.defaults.image = Some(ImageSource::Path(paths[0].clone()));
+    config.setup.images.prefetch = vec![ImageSource::Path(paths[1].clone())];
+    let backend = AgentBackend::new(config).unwrap();
+    assert_eq!(backend.image_id(), Some(images[0].id));
+    let prefetched = wait_for_prefetched_image(&backend, images[1].id, 1);
+    let default = backend
+        .images()
+        .unwrap()
+        .into_iter()
+        .find(|image| image.id == images[0].id)
+        .unwrap();
+    assert_image_record(&state, &default, &[paths[0].clone()], &[], true);
+    assert_image_record(&state, &prefetched, &[paths[1].clone()], &[], true);
+    assert_eq!(image_cache_bytes(&backend, &state), total);
+
+    let ordinary = directory.path().join("ordinary.img");
+    std::fs::copy(&images[0].path, &ordinary).unwrap();
+    let external = backend
+        .register_image(&ordinary, ImageDigest::Compute)
+        .unwrap();
+    let record = assert_image_record(&state, &external, &[ordinary.clone()], &[], false);
+    assert_eq!(image_cache_bytes(&backend, &state), total);
+    let mut crowded = image_cache_config(&state, Some(total));
+    crowded.setup.defaults.image = Some(ImageSource::Path(ordinary));
+    assert_unavailable(
+        AgentBackend::new(crowded),
+        "only 0 bytes are unused and evictable",
+    );
+    assert_eq!(image_record(&state, &external.id), record);
+    assert_eq!(image_cache_ids(&backend).len(), 3);
+}
+
+#[test]
+#[ignore = "requires an approved native library, runtime bundle, public registries, and a hypervisor"]
+fn image_cache_capacity_failed_prefetch_preserves_external_registration() {
+    let directory = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let seed_state = directory.path().join("seed");
+    let seed = AgentBackend::new(image_cache_bundle_config(&seed_state, None)).unwrap();
+    let images = register_cache_references(&seed);
+    let paths = [
+        copy_registered_image(
+            &seed_state,
+            &images[0],
+            &directory.path().join("default.vhd"),
+        ),
+        copy_registered_image(
+            &seed_state,
+            &images[1],
+            &directory.path().join("prefetch.vhd"),
+        ),
+    ];
+    let alias = directory.path().join("default-alias.vhd");
+    std::fs::copy(&paths[0], &alias).unwrap();
+    let state = directory.path().join("limited");
+    let external = AgentBackend::new(image_cache_config(&state, None)).unwrap();
+    let prefetched = external
+        .register_image(&paths[1], ImageDigest::Compute)
+        .unwrap();
+    let unchanged = assert_image_record(&state, &prefetched, &[paths[1].clone()], &[], false);
+    let capacity = images[0].length.max(images[1].length);
+    let mut config = image_cache_config(&state, Some(capacity));
+    config.setup.defaults.image = Some(ImageSource::Path(paths[0].clone()));
+    config.setup.images.prefetch = vec![
+        ImageSource::Path(paths[1].clone()),
+        ImageSource::Path(alias.clone()),
+    ];
+    let backend = Arc::new(AgentBackend::new(config).unwrap());
+    // The final alias confirms that the preceding prefetch attempt has finished.
+    let default = wait_for_prefetched_image(&backend, images[0].id, 2);
+    assert_image_record(&state, &default, &[paths[0].clone(), alias], &[], true);
+    assert_eq!(image_record(&state, &prefetched.id), unchanged);
+    assert_eq!(image_cache_bytes(&backend, &state), default.length);
+    assert_eq!(
+        image_cache_ids(&backend),
+        BTreeSet::from([default.id, prefetched.id])
+    );
+    assert_unavailable(
+        backend.register_image(&paths[1], ImageDigest::Compute),
+        "only 0 bytes are unused and evictable",
+    );
+    assert_eq!(image_record(&state, &prefetched.id), unchanged);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let sandbox = provision(&client, &backend);
+    client.start(&sandbox.id).unwrap();
+    assert_prints(&client, &sandbox.id, "default-first");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+
+    assert!(backend.unregister_image(&default.id).unwrap());
+    let admitted = backend
+        .register_image(&paths[1], ImageDigest::Compute)
+        .unwrap();
+    assert_eq!(admitted.id, prefetched.id);
+    assert_image_record(&state, &admitted, &[paths[1].clone()], &[], true);
+    assert_eq!(image_cache_bytes(&backend, &state), admitted.length);
+    assert!(admitted.length <= capacity);
+    assert!(!image_record_path(&state, &default.id).exists());
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires an approved native library, runtime bundle, public registries, and a hypervisor"]
+fn image_cache_capacity_provisioned_references_are_not_evicted() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let unlimited = AgentBackend::new(image_cache_bundle_config(state.path(), None)).unwrap();
+    let images = register_cache_references(&unlimited);
+    assert_ne!(images[0].id, images[1].id);
+    assert!(unlimited.unregister_image(&images[1].id).unwrap());
+    let capacity = images[0].length.max(images[1].length);
+    let backend = Arc::new(
+        AgentBackend::new(image_cache_bundle_config(state.path(), Some(capacity))).unwrap(),
+    );
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let spec =
+        SandboxSpec::new().with_image(ImageSource::Reference(IMAGE_CACHE_REFERENCES[0].to_owned()));
+    let sandbox = provision_spec(&client, &backend, &ProvisionRequest::new(), &spec);
+    let record = assert_image_record(
+        state.path(),
+        &images[0],
+        &[],
+        &[IMAGE_CACHE_REFERENCES[0]],
+        false,
+    );
+    for phase in ["provisioned", "running", "stopped"] {
+        match phase {
+            "running" => {
+                client.start(&sandbox.id).unwrap();
+                assert_prints(&client, &sandbox.id, "in-use");
+            }
+            "stopped" => assert_graceful(client.stop(&sandbox.id)),
+            _ => {}
+        }
+        assert_unavailable(
+            backend.register_reference(IMAGE_CACHE_REFERENCES[1], ImageDigest::Compute),
+            "only 0 bytes are unused and evictable",
+        );
+        assert_eq!(
+            image_cache_ids(&backend),
+            BTreeSet::from([images[0].id]),
+            "{phase}"
+        );
+        assert_eq!(image_record(state.path(), &images[0].id), record, "{phase}");
+    }
+    client.deprovision(&sandbox.release()).unwrap();
+    let admitted = backend
+        .register_reference(IMAGE_CACHE_REFERENCES[1], ImageDigest::Compute)
+        .unwrap();
+    assert_eq!(admitted.length, images[1].length);
+    assert_eq!(image_cache_ids(&backend), BTreeSet::from([admitted.id]));
+    assert!(!image_record_path(state.path(), &images[0].id).exists());
+    assert!(!images[0].path.exists());
+    assert_image_record(
+        state.path(),
+        &admitted,
+        &[],
+        &[IMAGE_CACHE_REFERENCES[1]],
+        false,
+    );
+    assert!(image_cache_bytes(&backend, state.path()) <= capacity);
+    assert_no_new_openvmm(&before);
 }
 
 #[test]
