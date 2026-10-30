@@ -504,6 +504,31 @@ after the sandbox is deprovisioned. A path image, an oversized image, or referen
 that resolve to identical content or fit together cannot demonstrate eviction and
 fail explicitly. Without `--cache-demo`, the existing unlimited-cache behavior is unchanged.
 
+#### Snapshot restore acceptance smoke
+
+`--snapshot-demo` adds assertions to the lifecycle flow instead of merely printing
+its boot mode. It requires `--platform-snapshots` and cannot be combined with
+`--cache-demo`. With a compatible, snapshot-capable bundle staged as described above:
+
+```powershell
+cargo run --release --locked --features agent-bundled --example agent_lifecycle -- `
+    --snapshot-demo --platform-snapshots '2,512' --state-root 'C:\edge-snapshot-demo'
+```
+
+The mode requires the initial start to report `bootMode: clone`, no cold reason,
+and a nonzero generation whose class/key matches a ready host template. After the
+supplied command succeeds, it writes and verifies a guest-only marker, gracefully
+stops, restarts, requires another clone of the same template class/key, and verifies
+that the marker is absent. A refreshed generation of the same template is allowed.
+It then performs the existing final stop and deprovision. Probe, restore, or cleanup
+failures return a nonzero exit code; a cold fallback is not accepted as a successful
+snapshot smoke run.
+
+The probes need a writable guest `/tmp` and a POSIX shell. They do not map the marker
+onto the host. This verifies restoration of a clean platform template, not saving
+and resuming tenant state. Without `--snapshot-demo`, `--platform-snapshots` retains
+its existing behavior, including valid cold fallbacks.
+
 ### Native host paths and network
 
 The native backend maps host paths to guest paths and reads network rules as described in
@@ -711,6 +736,36 @@ as defaults or prefetched paths by a limited host. References count; unused
 reference-only images can be evicted, largest first. Protection remains in the
 registration until it is explicitly unregistered. Prefetch currently registers only
 paths, not references or digests.
+
+### Platform snapshot and restore tests
+
+The ignored `platform_snapshots_` scenarios in `tests/agent_guest.rs` require a native
+library that implements template capture and clone restore. Configure the normal
+`EDGE_AGENT_TEST_*` runtime, library, and image variables and use a shell-equipped GPT
+image larger than 1 MiB. No registry access or Python interpreter is needed by these
+scenarios once the local image is available.
+
+```powershell
+cargo test --release --locked --features agent --test agent_guest platform_snapshots_ -- --ignored --test-threads=1
+```
+
+The scenarios verify both NIC/no-NIC template classes, capture metadata, clone
+generation identity, isolation of tenant files between clones, clean state after a
+stop/start restore, restoration at CPU/memory capacity with guest-visible CPU and
+memory checks, cold-boot fallback and its
+specific reason for incompatible resources/network/image size, guest-debug disabling,
+template reuse across backends and processes, new template keys after capacity
+changes, and malformed setup rejection before state creation. A helper subprocess
+restores and executes a workload to prove reuse of persisted generations.
+
+The NIC scenarios permit one TEST-NET endpoint to request a network device, but do
+not contact it. An omitted or deny-all-only network policy uses the no-NIC template.
+
+These are platform-template tests, not tenant checkpoint tests: the public lifecycle
+does not expose operations to snapshot a running tenant VM and resume its workload.
+Snapshot-capable tests fail explicitly on a library that only implements the model
+or ABI but cannot capture templates; they do not silently skip or accept cold boot
+in place of a required clone.
 
 ## Dependency on `nvx`
 

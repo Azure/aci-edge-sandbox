@@ -15,6 +15,8 @@
 //! the image tool, and `EDGE_AGENT_TEST_BUNDLE_SHA256`, the SHA-256 of its `SOURCE-MANIFEST.json`.
 //! The `image_cache_capacity_` tests also inspect persisted registrations. Their reference tests
 //! need the runtime bundle and access to the Azure Linux and CBL-Mariner public core images.
+//! The `platform_snapshots_` tests need a library that captures and restores platform templates,
+//! and a shell-equipped image larger than 1 MiB. Matching the sandbox ABI alone is not enough.
 //! Run the tests one at a time so that the check for leftover OpenVMM processes is
 //! exact, and optimized, since creating a backend hashes the runtime files and registering an
 //! image hashes and copies the image:
@@ -34,15 +36,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aci_edge_sandboxes::agent::{
-    AgentBackend, AgentConfig, BundleSource, CpuProfile, Hypervisor, ImageDigest, ImageId,
-    RegisteredImage, RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
+    AgentBackend, AgentConfig, BundleSource, CpuProfile, DisabledReason, HostInfo, Hypervisor,
+    ImageDigest, ImageId, PlatformSnapshots, PlatformSnapshotsInfo, RegisteredImage, RuntimeFiles,
+    RuntimeSource, SandboxDefaults, SetupConfig, TemplateState,
 };
 use aci_edge_sandboxes::nvx::resolve_guest_path;
 use aci_edge_sandboxes::{
-    Access, AciEdgeSandbox, EgressPolicy, Error, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
-    ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward, ImageSource, NetworkPeer,
-    NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, Result, SandboxId, SandboxSpec,
-    StdinMode, StopResult,
+    Access, AciEdgeSandbox, BootMode, ColdReason, EgressPolicy, Error, ErrorCode, ExecFailure,
+    ExecOutcome, ExecOutput, ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward,
+    ImageSource, NetworkPeer, NetworkPolicy, NetworkRule, Protocol, ProvisionRequest, Result,
+    SandboxId, SandboxSpec, StartResult, StdinMode, StopResult, TemplateClass, TemplateGeneration,
 };
 
 const HELPER_STATE: &str = "EDGE_AGENT_TEST_HELPER_STATE";
@@ -562,6 +565,571 @@ fn start_in_helper(state: &Path, id: &SandboxId) -> Child {
         .stdin(Stdio::null())
         .spawn()
         .unwrap()
+}
+
+fn platform_snapshot_config(state: &Path) -> AgentConfig {
+    adjusted(
+        native_config(state, &required("EDGE_AGENT_TEST_IMAGE")),
+        |setup| {
+            setup.platform_snapshots = Some(PlatformSnapshots::new(2, 512));
+        },
+    )
+}
+
+fn platform_snapshot_network_request() -> ProvisionRequest {
+    let mut policy = NetworkPolicy::deny_all();
+    // Deny-all alone needs no NIC; permit a TEST-NET endpoint without contacting it.
+    policy
+        .egress
+        .allow
+        .push(NetworkRule::to("192.0.2.1").on_port(Protocol::Tcp, 443));
+    ProvisionRequest::new().with_network(policy)
+}
+
+fn ready_platform_templates(backend: &AgentBackend) -> &PlatformSnapshotsInfo {
+    let info = backend
+        .info()
+        .platform_snapshots
+        .as_ref()
+        .expect("an enabled snapshot host must report its templates");
+    assert_eq!(info.disabled_reason, None, "{info:?}");
+    assert_eq!(info.templates.len(), 2, "{info:?}");
+    for class in [TemplateClass::NoNic, TemplateClass::Nic] {
+        let templates: Vec<_> = info
+            .templates
+            .iter()
+            .filter(|template| template.class == class)
+            .collect();
+        assert_eq!(templates.len(), 1, "{info:?}");
+        let template = templates[0];
+        assert_eq!(template.state, TemplateState::Ready, "{template:?}");
+        assert!(template.key.is_some(), "{template:?}");
+        assert!(
+            template.generation.is_some_and(|generation| generation > 0),
+            "{template:?}"
+        );
+        assert!(template.captured_at.is_some(), "{template:?}");
+        assert_eq!(template.last_error, None, "{template:?}");
+    }
+    assert_ne!(info.templates[0].key, info.templates[1].key);
+    info
+}
+
+#[track_caller]
+fn assert_platform_clone(
+    backend: &AgentBackend,
+    started: &StartResult,
+    class: TemplateClass,
+) -> TemplateGeneration {
+    assert_eq!(
+        started.boot_mode().unwrap(),
+        Some(BootMode::Clone),
+        "{started:?}"
+    );
+    assert_eq!(started.cold_reason().unwrap(), None, "{started:?}");
+    let generation = started
+        .template()
+        .unwrap()
+        .expect("a clone must name its template");
+    assert_eq!(generation.class, class, "{started:?}");
+    let template = ready_platform_templates(backend)
+        .templates
+        .iter()
+        .find(|template| template.class == class)
+        .unwrap();
+    assert_eq!(Some(generation.key), template.key, "{started:?}");
+    assert_eq!(
+        Some(generation.generation),
+        template.generation,
+        "{started:?}"
+    );
+    generation
+}
+
+#[track_caller]
+fn assert_platform_cold(started: &StartResult, reason: Option<ColdReason>) {
+    assert_eq!(
+        started.boot_mode().unwrap(),
+        Some(BootMode::Cold),
+        "{started:?}"
+    );
+    assert_eq!(started.cold_reason().unwrap(), reason, "{started:?}");
+    assert_eq!(started.template().unwrap(), None, "{started:?}");
+}
+
+#[track_caller]
+fn assert_snapshot_command(client: &AciEdgeSandbox, id: &SandboxId, command: &str, stdout: &[u8]) {
+    let output = exec(client, id, &ExecRequest::command_line(command));
+    assert_eq!(output.outcome, ExecOutcome::Exited(0), "{output:?}");
+    assert_eq!(output.stdout, stdout, "{output:?}");
+}
+
+fn assert_snapshot_memory(client: &AciEdgeSandbox, id: &SandboxId, memory_mib: u64) {
+    let output = exec(
+        client,
+        id,
+        &ExecRequest::command_line(
+            "while read name value unit; do \
+             if [ \"$name\" = MemTotal: ]; then printf '%s' \"$value\"; break; fi; \
+             done < /proc/meminfo",
+        ),
+    );
+    assert_eq!(output.outcome, ExecOutcome::Exited(0), "{output:?}");
+    let kib = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    // Allow Linux's reserved memory, but not a missing 128 MiB memory block.
+    assert!(
+        kib > (memory_mib - 128) * 1024 && kib <= memory_mib * 1024,
+        "restored guest exposes {kib} KiB for a {memory_mib} MiB sandbox"
+    );
+}
+
+#[test]
+#[ignore = "requires an approved native library, shell-equipped image, and a hypervisor"]
+fn platform_snapshots_omitted_or_disabled_start_cold() {
+    let before = openvmm_processes();
+    for snapshots in [None, Some(PlatformSnapshots::disabled())] {
+        let state = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            AgentBackend::new(adjusted(
+                native_config(state.path(), &required("EDGE_AGENT_TEST_IMAGE")),
+                |setup| setup.platform_snapshots = snapshots,
+            ))
+            .unwrap(),
+        );
+        assert_eq!(backend.info().platform_snapshots, None);
+        let client = AciEdgeSandbox::from_shared(backend.clone());
+        let sandbox = provision(&client, &backend);
+        assert_platform_cold(&client.start(&sandbox.id).unwrap(), None);
+        assert_prints(&client, &sandbox.id, "cold");
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+    }
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_capture_and_restore_both_network_classes() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(state.path())).unwrap());
+    ready_platform_templates(&backend);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    for (class, request, network) in [
+        (
+            TemplateClass::NoNic,
+            ProvisionRequest::new(),
+            b"".as_slice(),
+        ),
+        (
+            TemplateClass::NoNic,
+            ProvisionRequest::new().with_network(NetworkPolicy::deny_all()),
+            b"".as_slice(),
+        ),
+        (
+            TemplateClass::Nic,
+            platform_snapshot_network_request(),
+            b"nic".as_slice(),
+        ),
+    ] {
+        let sandbox = provision_with(&client, &backend, &request);
+        assert_platform_clone(&backend, &client.start(&sandbox.id).unwrap(), class);
+        assert_snapshot_command(
+            &client,
+            &sandbox.id,
+            "for device in /sys/class/net/*/device; do \
+             if [ -e \"$device\" ]; then printf nic; fi; done",
+            network,
+        );
+        assert_prints(&client, &sandbox.id, "cloned");
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+    }
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_restores_are_isolated_and_restart_without_tenant_state() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(state.path())).unwrap());
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let first = provision(&client, &backend);
+    let second = provision(&client, &backend);
+    let generation = assert_platform_clone(
+        &backend,
+        &client.start(&first.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_snapshot_command(
+        &client,
+        &first.id,
+        "printf first > /tmp/platform-snapshot-marker",
+        b"",
+    );
+    assert_platform_clone(
+        &backend,
+        &client.start(&second.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_snapshot_command(
+        &client,
+        &second.id,
+        "test ! -e /tmp/platform-snapshot-marker && printf second > /tmp/platform-snapshot-marker",
+        b"",
+    );
+    assert_snapshot_command(
+        &client,
+        &first.id,
+        "cat /tmp/platform-snapshot-marker",
+        b"first",
+    );
+    assert_graceful(client.stop(&first.id));
+    let restored = assert_platform_clone(
+        &backend,
+        &client.start(&first.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_eq!(restored, generation);
+    assert_snapshot_command(
+        &client,
+        &first.id,
+        "test ! -e /tmp/platform-snapshot-marker && printf fresh",
+        b"fresh",
+    );
+    assert_snapshot_command(
+        &client,
+        &second.id,
+        "cat /tmp/platform-snapshot-marker",
+        b"second",
+    );
+    for sandbox in [first, second] {
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+    }
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_restore_at_cpu_and_memory_capacity() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(state.path())).unwrap());
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let spec = SandboxSpec::new().with_vcpus(2).with_memory_mib(512);
+    let sandbox = provision_spec(&client, &backend, &ProvisionRequest::new(), &spec);
+    assert_platform_clone(
+        &backend,
+        &client.start(&sandbox.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_snapshot_command(
+        &client,
+        &sandbox.id,
+        "grep -c '^processor' /proc/cpuinfo",
+        b"2\n",
+    );
+    assert_snapshot_memory(&client, &sandbox.id, 512);
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_ineligible_resources_and_network_cold_boot() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(state.path())).unwrap());
+    ready_platform_templates(&backend);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    for (spec, request, reason) in [
+        (
+            SandboxSpec::new().with_vcpus(4),
+            ProvisionRequest::new(),
+            ColdReason::VcpusAboveCapacity,
+        ),
+        (
+            SandboxSpec::new().with_memory_mib(257),
+            ProvisionRequest::new(),
+            ColdReason::MemoryNotWholeBlocks,
+        ),
+        (
+            SandboxSpec::new().with_memory_mib(128),
+            ProvisionRequest::new(),
+            ColdReason::MemoryBelowTemplate,
+        ),
+        (
+            SandboxSpec::new().with_memory_mib(640),
+            ProvisionRequest::new(),
+            ColdReason::MemoryAboveCapacity,
+        ),
+        (
+            SandboxSpec::new().with_guest_network("10.1.0.2/24"),
+            platform_snapshot_network_request(),
+            ColdReason::GuestNetwork,
+        ),
+    ] {
+        let sandbox = provision_spec(&client, &backend, &request, &spec);
+        assert_platform_cold(&client.start(&sandbox.id).unwrap(), Some(reason));
+        assert_prints(&client, &sandbox.id, "fallback");
+        assert_graceful(client.stop(&sandbox.id));
+        client.deprovision(&sandbox.release()).unwrap();
+    }
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, an image larger than 1 MiB, and a hypervisor"]
+fn platform_snapshots_oversized_images_cold_boot() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let config = adjusted(platform_snapshot_config(state.path()), |setup| {
+        setup.platform_snapshots = Some(PlatformSnapshots::new(2, 512).with_max_image_mib(1));
+    });
+    let backend = Arc::new(AgentBackend::new(config).unwrap());
+    ready_platform_templates(&backend);
+    let image = backend
+        .images()
+        .unwrap()
+        .into_iter()
+        .find(|image| Some(image.id) == backend.image_id())
+        .unwrap();
+    assert!(
+        image.length > 1024 * 1024,
+        "the image must exceed the template's 1 MiB capacity"
+    );
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let sandbox = provision(&client, &backend);
+    assert_platform_cold(
+        &client.start(&sandbox.id).unwrap(),
+        Some(ColdReason::ImageTooLong),
+    );
+    assert_prints(&client, &sandbox.id, "large-image");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshots, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_guest_debug_disables_templates() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = Arc::new(
+        AgentBackend::new(adjusted(platform_snapshot_config(state.path()), |setup| {
+            setup.diagnostics.guest_debug = true;
+        }))
+        .unwrap(),
+    );
+    let info = backend.info().platform_snapshots.as_ref().unwrap();
+    assert_eq!(
+        info.disabled_reason,
+        Some(DisabledReason::GuestDebug),
+        "{info:?}"
+    );
+    assert!(info.templates.is_empty(), "{info:?}");
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let sandbox = provision(&client, &backend);
+    assert_platform_cold(
+        &client.start(&sandbox.id).unwrap(),
+        Some(ColdReason::GuestDebug),
+    );
+    assert_prints(&client, &sandbox.id, "debug-cold");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+const SNAPSHOT_HELPER_STATE: &str = "EDGE_AGENT_TEST_SNAPSHOT_HELPER_STATE";
+const SNAPSHOT_HELPER_REPORT: &str = "EDGE_AGENT_TEST_SNAPSHOT_HELPER_REPORT";
+
+#[test]
+#[ignore = "helper process for platform_snapshots_reuse_generations_across_backends_and_processes"]
+fn helper_reopens_platform_snapshot_store() {
+    let Some(state) = std::env::var_os(SNAPSHOT_HELPER_STATE) else {
+        return;
+    };
+    let backend = Arc::new(AgentBackend::new(platform_snapshot_config(Path::new(&state))).unwrap());
+    ready_platform_templates(&backend);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let sandbox = provision(&client, &backend);
+    assert_platform_clone(
+        &backend,
+        &client.start(&sandbox.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_prints(&client, &sandbox.id, "child-restored");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    std::fs::write(
+        required(SNAPSHOT_HELPER_REPORT),
+        serde_json::to_vec(backend.info()).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_reuse_generations_across_backends_and_processes() {
+    let directory = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let state = directory.path().join("state");
+    let report = directory.path().join("helper-info.json");
+    let config = platform_snapshot_config(&state);
+    let backend = Arc::new(AgentBackend::new(config.clone()).unwrap());
+    ready_platform_templates(&backend);
+    let reopened = AgentBackend::new(config).unwrap();
+    assert_eq!(
+        reopened.info().platform_snapshots,
+        backend.info().platform_snapshots
+    );
+    let mut helper = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "helper_reopens_platform_snapshot_store",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(SNAPSHOT_HELPER_STATE, &state)
+        .env(SNAPSHOT_HELPER_REPORT, &report)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = helper.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            helper.kill().unwrap();
+            helper.wait().unwrap();
+            panic!("the snapshot-store helper did not finish within 120 seconds");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "snapshot-store helper failed: {status}");
+    let info: HostInfo = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert_eq!(info.platform_snapshots, backend.info().platform_snapshots);
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let sandbox = provision(&client, &backend);
+    assert_platform_clone(
+        &backend,
+        &client.start(&sandbox.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_prints(&client, &sandbox.id, "reused");
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires platform snapshot capture/restore, a shell-equipped image, and a hypervisor"]
+fn platform_snapshots_changed_capacity_uses_new_templates() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let config = platform_snapshot_config(state.path());
+    let original = AgentBackend::new(config.clone()).unwrap();
+    let previous = ready_platform_templates(&original);
+    let changed = Arc::new(
+        AgentBackend::new(adjusted(config, |setup| {
+            setup.platform_snapshots = Some(PlatformSnapshots::new(2, 1024));
+        }))
+        .unwrap(),
+    );
+    let current = ready_platform_templates(&changed);
+    for template in &previous.templates {
+        let replacement = current
+            .templates
+            .iter()
+            .find(|other| other.class == template.class)
+            .unwrap();
+        assert_ne!(template.key, replacement.key);
+    }
+    let client = AciEdgeSandbox::from_shared(changed.clone());
+    let spec = SandboxSpec::new().with_memory_mib(768);
+    let sandbox = provision_spec(&client, &changed, &ProvisionRequest::new(), &spec);
+    assert_platform_clone(
+        &changed,
+        &client.start(&sandbox.id).unwrap(),
+        TemplateClass::NoNic,
+    );
+    assert_prints(&client, &sandbox.id, "new-capacity");
+    assert_snapshot_memory(&client, &sandbox.id, 768);
+    assert_graceful(client.stop(&sandbox.id));
+    client.deprovision(&sandbox.release()).unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires an approved native library and runtime files"]
+fn platform_snapshots_invalid_configuration_is_rejected_before_state() {
+    for (settings, memory, field) in [
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 3, "maxMemoryMib": 512}),
+            None,
+            "maxVcpus",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2, "maxMemoryMib": 300}),
+            None,
+            "maxMemoryMib",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2, "maxMemoryMib": 512, "maxImageMib": 0}),
+            None,
+            "maxImageMib",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxMemoryMib": 512}),
+            None,
+            "must set maxVcpus",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2}),
+            None,
+            "must set maxVcpus",
+        ),
+        (
+            serde_json::json!({"enabled": false, "maxMemoryMib": 100}),
+            None,
+            "maxMemoryMib",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2, "maxMemoryMib": 512}),
+            Some(257),
+            "defaults.resources.memoryMib",
+        ),
+        (
+            serde_json::json!({"enabled": true, "maxVcpus": 2, "maxMemoryMib": 512}),
+            Some(1024),
+            "defaults.resources.memoryMib",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let config = adjusted(platform_snapshot_config(&state), |setup| {
+            setup.platform_snapshots = Some(serde_json::from_value(settings).unwrap());
+            if let Some(memory) = memory {
+                setup.defaults.resources.memory_mib = Some(memory);
+            }
+        });
+        let error = AgentBackend::new(config).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::MalformedRequest, "{error}");
+        assert!(error.message().contains(field), "{error}");
+        assert!(
+            !state.exists(),
+            "invalid snapshots created state at {}",
+            state.display()
+        );
+    }
 }
 
 #[test]
