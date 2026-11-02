@@ -553,13 +553,13 @@ impl Library {
     }
 
     /// Writes up to one frame of standard input, returning how many bytes the guest accepted, or
-    /// 0 when it accepted nothing before `timeout_ms`.
+    /// `None` when it accepted nothing before `timeout_ms`.
     pub(crate) fn exec_write(
         &self,
         exec: u64,
         data: &[u8],
         timeout_ms: Option<u64>,
-    ) -> Result<usize> {
+    ) -> Result<Option<usize>> {
         let timeout = timeout_ms.map_or(-1, |timeout| i64::try_from(timeout).unwrap_or(i64::MAX));
         let mut written = 0;
         let mut buffer = ptr::null_mut();
@@ -577,8 +577,8 @@ impl Library {
         };
         let bytes = self.take(buffer, length);
         match status {
-            STATUS_OK => Ok(written),
-            STATUS_TIMEOUT => Ok(0),
+            STATUS_OK => Ok(Some(written)),
+            STATUS_TIMEOUT => Ok(None),
             STATUS_ERROR => Err(error_from_body(bytes.as_deref())),
             other => Err(status_error(other)),
         }
@@ -922,11 +922,15 @@ pub(crate) mod fake {
         handle: u64,
         _data: *const u8,
         length: usize,
-        _timeout: i64,
+        timeout: i64,
         written: *mut usize,
         _out: *mut *mut u8,
         _out_length: *mut usize,
     ) -> i32 {
+        // A negative timeout waits indefinitely, as in the library.
+        let deadline = u64::try_from(timeout)
+            .ok()
+            .map(|timeout| std::time::Instant::now() + std::time::Duration::from_millis(timeout));
         let mut executions = executions();
         loop {
             let Some(state) = executions.get(&handle) else {
@@ -941,9 +945,21 @@ pub(crate) mod fake {
                 Write::BlockUntilCancelled if state.cancelled => return STATUS_INVALID_ARGUMENT,
                 Write::BlockUntilCancelled => {}
             }
-            executions = CHANGED
-                .wait(executions)
-                .unwrap_or_else(PoisonError::into_inner);
+            executions = match deadline {
+                None => CHANGED
+                    .wait(executions)
+                    .unwrap_or_else(PoisonError::into_inner),
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return STATUS_TIMEOUT;
+                    }
+                    CHANGED
+                        .wait_timeout(executions, remaining)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
         }
     }
 

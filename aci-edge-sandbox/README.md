@@ -263,7 +263,8 @@ output that way ends as `TimedOut`.
 A cancellation that the library refuses returns its error, and does not end the workload. A
 waiter that the outcome does not reach within two seconds then fails with `backend_error`,
 saying that the outcome is unknown and the workload may still run, instead of waiting for an end
-that may never come, and the output streams end; stop or deprovision the sandbox to end the
+that may never come, and the output streams end, as does the standard input that the caller
+writes; stop or deprovision the sandbox to end the
 workload. The execution's handle stays with the library until it ends the execution, and is
 released once. A failure to release an execution's handle fails its `wait` with
 `backend_error`, naming the outcome. `AgentBackend::close` closes the host and returns the

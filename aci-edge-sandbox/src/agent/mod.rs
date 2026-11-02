@@ -64,6 +64,10 @@ use aci_edge_sandboxes_model::wire::{self, ExecEnd, ImageRegistration, Provision
 /// Largest standard-input chunk handed to the library at once.
 const INPUT_CHUNK: usize = 64 * 1024;
 
+/// How long one write of standard input waits for input credit before the input worker checks
+/// whether it was told to stop.
+const INPUT_WRITE_POLL_MS: u64 = 100;
+
 /// How long a waiter still waits for an execution's end after its cancellation failed, in case
 /// the execution was ending anyway.
 const CANCEL_FAILURE_GRACE: Duration = Duration::from_secs(2);
@@ -434,12 +438,14 @@ fn run(
         },
         deadline,
         expired: AtomicBool::new(false),
+        input_stopped: Arc::new(AtomicBool::new(false)),
     });
     let input = match stdin {
         Some(source) => {
+            let stopped = Arc::clone(&shared.input_stopped);
             match thread::Builder::new()
                 .name("agent-stdin".to_owned())
-                .spawn(move || feed(library, exec, source))
+                .spawn(move || feed(library, exec, source, &stopped))
             {
                 Ok(input) => Some(input),
                 Err(error) => {
@@ -495,15 +501,25 @@ struct ExecShared {
     deadline: Option<Instant>,
     /// Whether the timeout elapsed before the outcome arrived and closed the output streams.
     expired: AtomicBool,
+    /// Tells the input worker to stop waiting for input credit and drop the caller's source.
+    input_stopped: Arc<AtomicBool>,
 }
 
 impl ExecShared {
-    /// Releases an execution whose pump never started: stops its input worker, kills the
-    /// workload, and releases the handle.
-    fn abandon(&self, input: Option<InputWorker>) {
+    /// Stops the input worker: interrupts its read of the caller's source and ends a write that
+    /// waits for input credit, after which the worker drops the source, so that a caller still
+    /// writing the execution's standard input sees its end.
+    fn stop_input(&self) {
+        self.input_stopped.store(true, Ordering::Release);
         if let Some(stdin) = &self.closers.stdin {
             stdin.close();
         }
+    }
+
+    /// Releases an execution whose pump never started: stops its input worker, kills the
+    /// workload, and releases the handle.
+    fn abandon(&self, input: Option<InputWorker>) {
+        self.stop_input();
         let handle = self
             .handle
             .lock()
@@ -571,9 +587,7 @@ fn pump(
     drop(stdout);
     drop(stderr);
     if let Some(input) = input {
-        if let Some(stdin) = &shared.closers.stdin {
-            stdin.close();
-        }
+        shared.stop_input();
         if let Ok(Err(error)) = input.join() {
             ended = Err(
                 Error::backend_error("cannot read the execution's standard input")
@@ -616,8 +630,14 @@ fn outcome(data: &[u8]) -> Result<ExecOutcome> {
 /// Copies the caller's standard input to the workload, and closes the workload's input at
 /// end-of-file. A failed write stops it, and the execution's outcome then explains why. A failed
 /// read kills the workload, which cannot get the rest of its input, and is returned so that the
-/// execution fails with it.
-fn feed(library: &'static Library, exec: u64, mut source: InputSource) -> io::Result<()> {
+/// execution fails with it. Once `stopped` is set, a write that the guest does not accept within
+/// [`INPUT_WRITE_POLL_MS`] ends it.
+fn feed(
+    library: &'static Library,
+    exec: u64,
+    mut source: InputSource,
+    stopped: &AtomicBool,
+) -> io::Result<()> {
     let mut buffer = vec![0u8; INPUT_CHUNK];
     loop {
         let read = match source.read(&mut buffer) {
@@ -634,9 +654,11 @@ fn feed(library: &'static Library, exec: u64, mut source: InputSource) -> io::Re
         };
         let mut pending = &buffer[..read];
         while !pending.is_empty() {
-            match library.exec_write(exec, pending, None) {
-                Ok(0) | Err(_) => return Ok(()),
-                Ok(written) => pending = &pending[written.min(pending.len())..],
+            match library.exec_write(exec, pending, Some(INPUT_WRITE_POLL_MS)) {
+                Ok(None) if stopped.load(Ordering::Acquire) => return Ok(()),
+                Ok(None) => {}
+                Ok(Some(0)) | Err(_) => return Ok(()),
+                Ok(Some(written)) => pending = &pending[written.min(pending.len())..],
             }
         }
     }
@@ -724,9 +746,7 @@ impl AgentExecution {
             {
                 closer.close();
             }
-            if let Some(stdin) = &shared.closers.stdin {
-                stdin.close();
-            }
+            shared.stop_input();
         }
         outcome
     }
@@ -869,6 +889,44 @@ mod tests {
                 .expect("the output stream never ended")
                 .is_empty()
         );
+        fake::end(exec);
+        await_calls(exec, &["cancel", "release"]);
+    }
+
+    #[test]
+    fn a_failed_cancellation_stops_the_input_worker_so_a_stdin_writer_returns() {
+        use std::io::Write as _;
+        let faults = fake::Faults {
+            cancel: true,
+            ..fake::Faults::default()
+        };
+        let exec =
+            fake::execution_with(Next::ExitWhenCancelled, Write::BlockUntilCancelled, faults);
+        let (reader, mut writer) = io::pipe().unwrap();
+        let io = ExecIo {
+            stdout: Box::new(Discard),
+            stderr: Box::new(Discard),
+            stdin: Some(InputSource::from_pipe(reader).unwrap()),
+        };
+        let control = run(fake::library(), exec, io, None).unwrap();
+        // The caller keeps writing the stdin that it took, which the guest never accepts.
+        let (sender, written) = mpsc::channel();
+        thread::spawn(move || {
+            let chunk = [b'x'; 64 * 1024];
+            let kind = loop {
+                if let Err(error) = writer.write_all(&chunk) {
+                    break error.kind();
+                }
+            };
+            sender.send(kind)
+        });
+        thread::sleep(Duration::from_millis(100));
+        control.cancel().unwrap_err();
+        finish(control).unwrap_err();
+        let kind = written
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a writer of the execution's standard input never returned");
+        assert_eq!(kind, io::ErrorKind::BrokenPipe);
         fake::end(exec);
         await_calls(exec, &["cancel", "release"]);
     }
