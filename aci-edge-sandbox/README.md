@@ -260,6 +260,14 @@ to whole milliseconds, can be up to an hour, and ends the command as `TimedOut`.
 before the outcome arrives, `wait` closes the output streams, as cancellation does, so that a
 stream that the caller holds without reading cannot delay the outcome; an execution that loses
 output that way ends as `TimedOut`.
+A cancellation that the library refuses returns its error, and does not end the workload. A
+waiter that the outcome does not reach within two seconds then fails with `backend_error`,
+saying that the outcome is unknown and the workload may still run, instead of waiting for an end
+that may never come, and the output streams end; stop or deprovision the sandbox to end the
+workload. The execution's handle stays with the library until it ends the execution, and is
+released once. A failure to release an execution's handle fails its `wait` with
+`backend_error`, naming the outcome. `AgentBackend::close` closes the host and returns the
+library's failure to close it, which dropping the backend discards.
 Guest-side image pulls are not part of this profile.
 
 [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) runs one lifecycle. It needs
@@ -545,7 +553,10 @@ forwards need host-loopback access allowed.
 
 - `runtimeConfig.networkProxy` (`ProvisionRequest::with_network_proxy`) names an HTTP or HTTPS
   proxy that listens on host IPv4 loopback, such as `http://127.0.0.1:3128` or
-  `http://localhost:3128`: an explicit port, and at most a trailing `/` after it. As in the contract's
+  `http://localhost:3128`: an explicit port other than 53, and at most a trailing `/` after it.
+  Port 53 is refused on purpose: OpenVMM answers DNS at the guest's gateway over TCP as well as
+  UDP, so a proxy there would receive nothing while the guest reached the host's resolver, a way
+  out that the proxy never sees. As in the contract's
   schema, the proxy is the guest's only way out, so the network policy must deny egress without
   allow or deny rules; provision rejects other policies, and IPv6 or remote proxies, with
   `policy_validation`. The guest's only reachable destination is TCP to its gateway at the

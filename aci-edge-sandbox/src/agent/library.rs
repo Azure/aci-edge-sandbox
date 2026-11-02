@@ -289,6 +289,17 @@ fn status_error(status: i32) -> Error {
     })
 }
 
+/// The result of an export that releases a handle and answers with a status only.
+fn released(status: i32) -> Result<()> {
+    match status {
+        STATUS_OK => Ok(()),
+        STATUS_ERROR => Err(Error::backend_error(
+            "the agent library could not release the handle",
+        )),
+        other => Err(status_error(other)),
+    }
+}
+
 fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
     serde_json::to_vec(value)
         .map_err(|error| Error::malformed_request("cannot encode the request").with_source(error))
@@ -408,8 +419,9 @@ impl Library {
         Ok(host)
     }
 
-    pub(crate) fn host_close(&self, host: u64) {
-        unsafe { (self.exports.host_close)(host) };
+    /// Closes a host. The library keeps the host's sandboxes and their guest sessions.
+    pub(crate) fn host_close(&self, host: u64) -> Result<()> {
+        released(unsafe { (self.exports.host_close)(host) })
     }
 
     pub(crate) fn host_info<T: DeserializeOwned>(&self, host: u64) -> Result<T> {
@@ -580,8 +592,10 @@ impl Library {
         self.query(self.exports.exec_cancel, exec).map(drop)
     }
 
-    pub(crate) fn exec_release(&self, exec: u64) {
-        unsafe { (self.exports.exec_release)(exec) };
+    /// Releases an execution's handle. The handle is gone whatever the result, so a failure
+    /// reports what the library could not clean up, and the call must not be repeated.
+    pub(crate) fn exec_release(&self, exec: u64) -> Result<()> {
+        released(unsafe { (self.exports.exec_release)(exec) })
     }
 
     pub(crate) fn image_register<T: DeserializeOwned>(
@@ -663,8 +677,8 @@ mod tests {
         refused(library.image_list::<Value>(handle).map(drop));
         refused(library.image_verify(handle, "image"));
         refused(library.image_unregister(handle, "image").map(drop));
-        library.exec_release(handle);
-        library.host_close(handle);
+        refused(library.exec_release(handle));
+        refused(library.host_close(handle));
     }
 
     #[test]
@@ -745,9 +759,19 @@ pub(crate) mod fake {
         BlockUntilCancelled,
     }
 
+    /// Calls of an execution that fail, as a faulty library or a lost guest would make them.
+    #[derive(Clone, Copy, Default)]
+    pub(crate) struct Faults {
+        /// `exec_cancel` fails without cancelling, so no end arrives until [`end`] is called.
+        pub(crate) cancel: bool,
+        /// `exec_release` fails.
+        pub(crate) release: bool,
+    }
+
     struct State {
         next: Next,
         write: Write,
+        faults: Faults,
         cancelled: bool,
         calls: Vec<&'static str>,
         end: Vec<u8>,
@@ -768,7 +792,7 @@ pub(crate) mod fake {
         LIBRARY.get_or_init(|| Library {
             exports: Exports {
                 host_open: refuse_open,
-                host_close: refuse_release,
+                host_close,
                 host_info: refuse_query,
                 capabilities: refuse_query,
                 probe: refuse_query,
@@ -799,6 +823,11 @@ pub(crate) mod fake {
 
     /// Registers an execution that behaves as `next` and `write` say, and returns its handle.
     pub(crate) fn execution(next: Next, write: Write) -> u64 {
+        execution_with(next, write, Faults::default())
+    }
+
+    /// Registers an execution as [`execution`] does, whose calls fail as `faults` say.
+    pub(crate) fn execution_with(next: Next, write: Write, faults: Faults) -> u64 {
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
         let outcome = match next {
             Next::OutputThenExit(_) => ExecOutcome::Exited(0),
@@ -812,6 +841,7 @@ pub(crate) mod fake {
             State {
                 next,
                 write,
+                faults,
                 cancelled: false,
                 calls: Vec::new(),
                 end,
@@ -829,15 +859,29 @@ pub(crate) mod fake {
             .unwrap_or_default()
     }
 
+    /// Ends an execution on the library's own account, as the library does once a sandbox whose
+    /// cancellation failed stops.
+    pub(crate) fn end(handle: u64) {
+        if let Some(state) = executions().get_mut(&handle) {
+            state.cancelled = true;
+            CHANGED.notify_all();
+        }
+    }
+
     fn record(handle: u64, call: &'static str) -> i32 {
         let mut executions = executions();
         let Some(state) = executions.get_mut(&handle) else {
             return STATUS_INVALID_HANDLE;
         };
         state.calls.push(call);
-        if call == "cancel" {
-            state.cancelled = true;
-            CHANGED.notify_all();
+        match call {
+            "cancel" if state.faults.cancel => return STATUS_PANIC,
+            "release" if state.faults.release => return STATUS_PANIC,
+            "cancel" => {
+                state.cancelled = true;
+                CHANGED.notify_all();
+            }
+            _ => {}
         }
         STATUS_OK
     }
@@ -915,6 +959,40 @@ pub(crate) mod fake {
         record(handle, "release")
     }
 
+    /// Registers a host that closes once, and returns its handle.
+    pub(crate) fn host() -> u64 {
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        hosts().insert(handle, 0);
+        handle
+    }
+
+    /// How many times a host registered with [`host`] was closed.
+    pub(crate) fn host_closes(handle: u64) -> usize {
+        hosts().get(&handle).copied().unwrap_or_default()
+    }
+
+    static HOSTS: Mutex<BTreeMap<u64, usize>> = Mutex::new(BTreeMap::new());
+
+    fn hosts() -> MutexGuard<'static, BTreeMap<u64, usize>> {
+        HOSTS.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Closes a host registered with [`host`]: the first close succeeds, and every other close,
+    /// like that of an unknown handle, is refused.
+    unsafe extern "C" fn host_close(handle: u64) -> i32 {
+        match hosts().get_mut(&handle) {
+            Some(closes) => {
+                *closes += 1;
+                if *closes == 1 {
+                    STATUS_OK
+                } else {
+                    STATUS_INVALID_HANDLE
+                }
+            }
+            None => STATUS_INVALID_HANDLE,
+        }
+    }
+
     unsafe extern "C" fn refuse_open(
         _: *const u8,
         _: usize,
@@ -922,10 +1000,6 @@ pub(crate) mod fake {
         _: *mut *mut u8,
         _: *mut usize,
     ) -> i32 {
-        STATUS_INVALID_HANDLE
-    }
-
-    unsafe extern "C" fn refuse_release(_: u64) -> i32 {
         STATUS_INVALID_HANDLE
     }
 

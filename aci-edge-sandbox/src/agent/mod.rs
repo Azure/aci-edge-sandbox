@@ -64,6 +64,10 @@ use aci_edge_sandboxes_model::wire::{self, ExecEnd, ImageRegistration, Provision
 /// Largest standard-input chunk handed to the library at once.
 const INPUT_CHUNK: usize = 64 * 1024;
 
+/// How long a waiter still waits for an execution's end after its cancellation failed, in case
+/// the execution was ending anyway.
+const CANCEL_FAILURE_GRACE: Duration = Duration::from_secs(2);
+
 /// The library to load and the host to open.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -98,6 +102,9 @@ impl AgentConfig {
 }
 
 /// [`Backend`] that forwards the lifecycle to a separately supplied agent library, `aci_edge_agent`.
+///
+/// Dropping the backend closes its host in the library but discards a failure to close it; call
+/// [`close`](Self::close) to receive that failure.
 #[derive(Debug)]
 pub struct AgentBackend {
     config: AgentConfig,
@@ -105,6 +112,8 @@ pub struct AgentBackend {
     host: u64,
     capabilities: Capabilities,
     info: HostInfo,
+    /// Whether [`close`](Self::close) already closed the host, which `Drop` then leaves alone.
+    closed: bool,
 }
 
 /// The provision call's input: the model's [`wire::ProvisionInput`], borrowed.
@@ -154,12 +163,29 @@ impl AgentBackend {
                 host,
                 capabilities,
                 info,
+                closed: false,
             }),
             Err(error) => {
-                library.host_close(host);
+                // The open's own failure is the one to report.
+                let _ = library.host_close(host);
                 Err(error)
             }
         }
+    }
+
+    /// Closes the host in the library and returns the library's failure to close it, which
+    /// dropping the backend discards. The library keeps the host's sandboxes and their guest
+    /// sessions either way, and the host is not closed again on drop.
+    ///
+    /// A backend shared through an [`Arc`], as [`AciEdgeSandbox::from_shared`] takes it, is
+    /// closed once its other owners are gone, for example through [`Arc::into_inner`].
+    ///
+    /// [`AciEdgeSandbox::from_shared`]: crate::AciEdgeSandbox::from_shared
+    pub fn close(mut self) -> Result<()> {
+        self.closed = true;
+        self.library
+            .host_close(self.host)
+            .map_err(|error| Error::backend_error("cannot close the agent host").with_source(error))
     }
 
     /// Returns the configuration.
@@ -281,8 +307,11 @@ impl AgentBackend {
 
 impl Drop for AgentBackend {
     fn drop(&mut self) {
-        // The host, its sandboxes, and their guest sessions stay with the library.
-        self.library.host_close(self.host);
+        // The host, its sandboxes, and their guest sessions stay with the library. A failure to
+        // close cannot be returned from here; `close` returns it.
+        if !self.closed {
+            let _ = self.library.host_close(self.host);
+        }
     }
 }
 
@@ -485,7 +514,8 @@ impl ExecShared {
             if let Some(input) = input {
                 let _ = input.join();
             }
-            self.library.exec_release(exec);
+            // The caller receives the failure to start, which matters more than this one.
+            let _ = self.library.exec_release(exec);
         }
     }
 }
@@ -556,8 +586,17 @@ fn pump(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take();
-    if let Some(exec) = handle {
-        shared.library.exec_release(exec);
+    if let Some(exec) = handle
+        && let Err(error) = shared.library.exec_release(exec)
+    {
+        // An execution that failed keeps its own error, which explains more than this one.
+        ended = ended.and_then(|outcome| {
+            Err(Error::backend_error(format!(
+                "the execution {outcome}, but the agent library cannot release it, so the \
+                 library may keep its resources"
+            ))
+            .with_source(error))
+        });
     }
     shared.completion.finish(ended);
 }
@@ -613,7 +652,7 @@ impl ExecControl for AgentExecution {
         let shared = &self.shared;
         if let Some(deadline) = shared.deadline {
             if let Some(outcome) = shared.completion.wait_until(deadline) {
-                return outcome;
+                return self.collected(outcome);
             }
             // The library ends a workload that outlives its timeout, but the verdict queues
             // behind the output, where a stream that the caller retains without draining would
@@ -626,7 +665,7 @@ impl ExecControl for AgentExecution {
                 closer.close();
             }
         }
-        shared.completion.wait()
+        self.collected(shared.completion.wait())
     }
 
     fn cancel(&self) -> Result<()> {
@@ -640,7 +679,20 @@ impl ExecControl for AgentExecution {
             let Some(exec) = *handle else {
                 return Ok(());
             };
-            self.shared.library.exec_cancel(exec)?;
+            if let Err(error) = self.shared.library.exec_cancel(exec) {
+                // Without a cancellation, the end that the waiter needs may never arrive. Unless
+                // it arrives within the grace period, the waiter receives this failure instead;
+                // the workload is not known to have stopped, so it is not reported as cancelled.
+                let unresolved = Error::backend_error(
+                    "the execution could not be cancelled, so its outcome is unknown and its \
+                     workload may still be running; stop or deprovision the sandbox to end it",
+                )
+                .with_source(error.to_string());
+                self.shared
+                    .completion
+                    .unresolve(unresolved, Instant::now() + CANCEL_FAILURE_GRACE);
+                return Err(error);
+            }
         }
         let closers = &self.shared.closers;
         for closer in [&closers.stdout, &closers.stderr].into_iter().flatten() {
@@ -650,6 +702,33 @@ impl ExecControl for AgentExecution {
             stdin.close();
         }
         Ok(())
+    }
+}
+
+impl AgentExecution {
+    /// Returns `outcome` to the waiter. An outcome collected while the pump still holds the
+    /// library's handle did not come from the library, so the pump may still be copying output:
+    /// end the streams so that their readers see the end. The pump releases the handle once the
+    /// library ends the execution.
+    fn collected(&self, outcome: Result<ExecOutcome>) -> Result<ExecOutcome> {
+        let shared = &self.shared;
+        let pumping = shared
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        if pumping {
+            for closer in [&shared.closers.stdout, &shared.closers.stderr]
+                .into_iter()
+                .flatten()
+            {
+                closer.close();
+            }
+            if let Some(stdin) = &shared.closers.stdin {
+                stdin.close();
+            }
+        }
+        outcome
     }
 }
 
@@ -702,6 +781,133 @@ mod tests {
         receiver
             .recv_timeout(Duration::from_secs(30))
             .expect("the execution never ended")
+    }
+
+    /// Runs a registered fake execution without standard input or a timeout.
+    fn run_plain(exec: u64) -> Arc<dyn ExecControl> {
+        let io = ExecIo {
+            stdout: Box::new(Discard),
+            stderr: Box::new(Discard),
+            stdin: None,
+        };
+        Arc::from(run(fake::library(), exec, io, None).unwrap())
+    }
+
+    /// Waits until the fake has recorded `calls` for `exec`.
+    fn await_calls(exec: u64, calls: &[&str]) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while fake::calls(exec) != calls {
+            assert!(
+                Instant::now() < deadline,
+                "calls are {:?}, not {calls:?}",
+                fake::calls(exec)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_failed_cancellation_ends_a_waiting_caller_without_claiming_the_workload_stopped() {
+        let faults = fake::Faults {
+            cancel: true,
+            ..fake::Faults::default()
+        };
+        let exec = fake::execution_with(Next::ExitWhenCancelled, Write::Accept, faults);
+        let control = run_plain(exec);
+        let (sender, receiver) = mpsc::channel();
+        let waiting = Arc::clone(&control);
+        thread::spawn(move || sender.send(waiting.wait()));
+        thread::sleep(Duration::from_millis(100));
+
+        let refused = control.cancel().unwrap_err();
+        assert_eq!(
+            refused.message(),
+            "the agent library panicked; the operation's effect is unknown"
+        );
+        let started = Instant::now();
+        let error = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the wait never ended after the cancellation failed")
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
+        assert!(error.message().contains("may still be running"), "{error}");
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            refused.to_string()
+        );
+
+        // The library still owns the execution, so its handle stays unreleased until the
+        // library ends it, and is then released once.
+        assert_eq!(fake::calls(exec), ["cancel"]);
+        fake::end(exec);
+        await_calls(exec, &["cancel", "release"]);
+    }
+
+    #[test]
+    fn a_failed_cancellation_ends_the_output_streams_that_the_waiter_reads() {
+        let faults = fake::Faults {
+            cancel: true,
+            ..fake::Faults::default()
+        };
+        let exec = fake::execution_with(Next::ExitWhenCancelled, Write::Accept, faults);
+        let (stdout, retained) = stream::queue();
+        let io = ExecIo {
+            stdout: Box::new(stdout),
+            stderr: Box::new(Discard),
+            stdin: None,
+        };
+        let control = run(fake::library(), exec, io, None).unwrap();
+        control.cancel().unwrap_err();
+        finish(control).unwrap_err();
+        // A reader of the stream sees its end instead of waiting for output that never comes.
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(retained.read_to_end_blocking()));
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the output stream never ended")
+                .is_empty()
+        );
+        fake::end(exec);
+        await_calls(exec, &["cancel", "release"]);
+    }
+
+    #[test]
+    fn an_outcome_that_arrives_after_a_failed_cancellation_is_kept() {
+        let faults = fake::Faults {
+            cancel: true,
+            ..fake::Faults::default()
+        };
+        let exec = fake::execution_with(Next::ExitWhenCancelled, Write::Accept, faults);
+        let control = run_plain(exec);
+        control.cancel().unwrap_err();
+        fake::end(exec);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(control.wait()));
+        let outcome = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(outcome.unwrap(), ExecOutcome::Cancelled);
+        assert_eq!(fake::calls(exec), ["cancel", "release"]);
+    }
+
+    #[test]
+    fn a_failed_release_fails_the_wait_and_names_the_outcome() {
+        let faults = fake::Faults {
+            release: true,
+            ..fake::Faults::default()
+        };
+        let exec = fake::execution_with(Next::OutputThenExit(0), Write::Accept, faults);
+        let control = run_plain(exec);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(control.wait()));
+        let error = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
+        assert!(error.message().contains("cannot release"), "{error}");
+        assert!(error.message().contains("exited with status 0"), "{error}");
+        assert_eq!(fake::calls(exec), ["release"]);
     }
 
     #[test]
@@ -840,6 +1046,11 @@ mod tests {
     /// Returns a backend over the fake library, which refuses every image call as one for an
     /// unknown handle, that honors image references or not.
     fn fake_backend(image_reference: bool) -> AgentBackend {
+        fake_backend_on(image_reference, 0)
+    }
+
+    /// Returns a backend as [ake_backend] does, whose host is `host`.
+    fn fake_backend_on(image_reference: bool, host: u64) -> AgentBackend {
         let runtime = RuntimeSource::Files(RuntimeFiles {
             openvmm: PathBuf::from("openvmm"),
             kernel: PathBuf::from("vmlinux"),
@@ -856,9 +1067,10 @@ mod tests {
         AgentBackend {
             config: AgentConfig::new(SetupConfig::new("state", runtime), "library", [0; 32]),
             library: fake::library(),
-            host: 0,
+            host,
             capabilities,
             info: HostInfo::new(None, digests),
+            closed: false,
         }
     }
 
@@ -885,5 +1097,34 @@ mod tests {
             .register_reference("registry.example/a:1", ImageDigest::Compute)
             .unwrap_err();
         assert!(error.message().contains("unknown handle"), "{error}");
+    }
+
+    #[test]
+    fn close_closes_the_host_once_and_drop_does_not_close_it_again() {
+        let host = fake::host();
+        fake_backend_on(false, host).close().unwrap();
+        assert_eq!(fake::host_closes(host), 1);
+    }
+
+    #[test]
+    fn close_returns_the_failure_that_drop_discards() {
+        // A host that the library refuses to close, as a released one.
+        let host = fake::host();
+        fake_backend_on(false, host).close().unwrap();
+        let error = fake_backend_on(false, host).close().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
+        assert_eq!(error.message(), "cannot close the agent host");
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "backend_error: the agent library rejected a released or unknown handle"
+        );
+        assert_eq!(fake::host_closes(host), 2);
+    }
+
+    #[test]
+    fn a_dropped_backend_closes_its_host() {
+        let host = fake::host();
+        drop(fake_backend_on(false, host));
+        assert_eq!(fake::host_closes(host), 1);
     }
 }

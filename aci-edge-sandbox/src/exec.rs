@@ -7,7 +7,7 @@ use std::sync::Arc;
 #[cfg(any(feature = "agent", feature = "testing"))]
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
-#[cfg(feature = "agent")]
+#[cfg(any(feature = "agent", feature = "testing"))]
 use std::time::Instant;
 
 use crate::backend::ExecControl;
@@ -18,6 +18,13 @@ use crate::error::{Error, Result};
 enum CompletionState {
     #[default]
     Running,
+    /// The outcome cannot arrive as things stand, as when the execution's cancellation failed:
+    /// `error` becomes the outcome unless the real one arrives before `until`.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    Unresolved {
+        error: Error,
+        until: Instant,
+    },
     Finished(Result<ExecOutcome>),
     Collected,
 }
@@ -31,29 +38,32 @@ pub(crate) struct Completion {
 
 #[cfg(any(feature = "agent", feature = "testing"))]
 impl Completion {
+    /// Publishes the outcome. An outcome that the waiter already collected stays collected.
     pub(crate) fn finish(&self, outcome: Result<ExecOutcome>) {
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner) =
-            CompletionState::Finished(outcome);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !matches!(*state, CompletionState::Collected) {
+            *state = CompletionState::Finished(outcome);
+        }
+        drop(state);
+        self.finished.notify_all();
+    }
+
+    /// Lets a waiter collect `error` if the outcome has not arrived by `until`. Does nothing once
+    /// the outcome has arrived or another error is pending.
+    #[cfg(feature = "agent")]
+    pub(crate) fn unresolve(&self, error: Error, until: Instant) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*state, CompletionState::Running) {
+            *state = CompletionState::Unresolved { error, until };
+        }
+        drop(state);
         self.finished.notify_all();
     }
 
     pub(crate) fn wait(&self) -> Result<ExecOutcome> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            match std::mem::replace(&mut *state, CompletionState::Collected) {
-                CompletionState::Running => {
-                    *state = CompletionState::Running;
-                    state = self
-                        .finished
-                        .wait(state)
-                        .unwrap_or_else(PoisonError::into_inner);
-                }
-                CompletionState::Finished(outcome) => return outcome,
-                CompletionState::Collected => {
-                    return Err(Error::backend_error(
-                        "the execution outcome was already collected",
-                    ));
-                }
+            if let Some(outcome) = self.collect(None) {
+                return outcome;
             }
         }
     }
@@ -62,20 +72,52 @@ impl Completion {
     /// `deadline`.
     #[cfg(feature = "agent")]
     pub(crate) fn wait_until(&self, deadline: Instant) -> Option<Result<ExecOutcome>> {
+        self.collect(Some(deadline))
+    }
+
+    /// Collects the outcome, waiting for it until `deadline` if there is one.
+    fn collect(&self, deadline: Option<Instant>) -> Option<Result<ExecOutcome>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        while matches!(*state, CompletionState::Running) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            state = self
-                .finished
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+        loop {
+            let now = Instant::now();
+            let until = match &*state {
+                CompletionState::Running => deadline,
+                CompletionState::Unresolved { until, .. } if *until > now => {
+                    Some(deadline.map_or(*until, |deadline| deadline.min(*until)))
+                }
+                CompletionState::Unresolved { .. } | CompletionState::Finished(_) => {
+                    return Some(
+                        match std::mem::replace(&mut *state, CompletionState::Collected) {
+                            CompletionState::Unresolved { error, .. } => Err(error),
+                            CompletionState::Finished(outcome) => outcome,
+                            CompletionState::Running | CompletionState::Collected => {
+                                unreachable!("matched above")
+                            }
+                        },
+                    );
+                }
+                CompletionState::Collected => {
+                    return Some(Err(Error::backend_error(
+                        "the execution outcome was already collected",
+                    )));
+                }
+            };
+            state = match until {
+                None => self
+                    .finished
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner),
+                Some(until) => {
+                    if deadline.is_some_and(|deadline| deadline <= now) {
+                        return None;
+                    }
+                    self.finished
+                        .wait_timeout(state, until.saturating_duration_since(now))
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
         }
-        drop(state);
-        Some(self.wait())
     }
 }
 
@@ -107,6 +149,11 @@ impl Canceller {
     ///
     /// Backends that cannot cancel return [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported);
     /// see [`ExecCapabilities::cancel`](crate::ExecCapabilities::cancel).
+    ///
+    /// A failed cancellation returns its error and does not end the workload. With the agent
+    /// backend, a waiter that the outcome then does not reach within a short grace period fails
+    /// with [`ErrorCode::BackendError`](crate::ErrorCode::BackendError), saying that the outcome
+    /// is unknown, rather than waiting indefinitely.
     pub fn cancel(&self) -> Result<()> {
         self.control.cancel()
     }
