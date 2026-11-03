@@ -807,7 +807,7 @@ pub(crate) mod fake {
                 deprovision: refuse_call,
                 diagnostics: refuse_call,
                 guest_logs: refuse_call,
-                exec: refuse_exec,
+                exec,
                 exec_next: next,
                 exec_write: write,
                 exec_close_input: close_input,
@@ -994,6 +994,53 @@ pub(crate) mod fake {
         handle
     }
 
+    /// How the executions that a host starts behave, and the ones that it started, by host.
+    type HostExecutions = BTreeMap<u64, (Next, Write, Faults, Vec<u64>)>;
+
+    static HOST_EXECUTIONS: Mutex<HostExecutions> = Mutex::new(BTreeMap::new());
+
+    fn host_executions() -> MutexGuard<'static, HostExecutions> {
+        HOST_EXECUTIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Makes `host` start executions that behave as `next`, `write`, and `faults` say.
+    pub(crate) fn host_executes(host: u64, next: Next, write: Write, faults: Faults) {
+        host_executions().insert(host, (next, write, faults, Vec::new()));
+    }
+
+    /// The executions that `host` started, in order.
+    pub(crate) fn started(host: u64) -> Vec<u64> {
+        host_executions()
+            .get(&host)
+            .map(|(.., started)| started.clone())
+            .unwrap_or_default()
+    }
+
+    /// Starts an execution of a host set up with [`host_executes`]; refuses every other host.
+    #[allow(clippy::too_many_arguments)]
+    unsafe extern "C" fn exec(
+        host: u64,
+        _: *const u8,
+        _: usize,
+        _: *const u8,
+        _: usize,
+        handle: *mut u64,
+        _: *mut *mut u8,
+        _: *mut usize,
+    ) -> i32 {
+        let mut hosts = host_executions();
+        let Some((next, write, faults, started)) = hosts.get_mut(&host) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let exec = execution_with(*next, *write, *faults);
+        started.push(exec);
+        // SAFETY: the caller passes a writable handle.
+        unsafe { *handle = exec };
+        STATUS_OK
+    }
+
     /// How many times a host registered with [`host`] was closed.
     pub(crate) fn host_closes(handle: u64) -> usize {
         hosts().get(&handle).copied().unwrap_or_default()
@@ -1039,20 +1086,6 @@ pub(crate) mod fake {
         _: u64,
         _: *const u8,
         _: usize,
-        _: *mut *mut u8,
-        _: *mut usize,
-    ) -> i32 {
-        STATUS_INVALID_HANDLE
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe extern "C" fn refuse_exec(
-        _: u64,
-        _: *const u8,
-        _: usize,
-        _: *const u8,
-        _: usize,
-        _: *mut u64,
         _: *mut *mut u8,
         _: *mut usize,
     ) -> i32 {

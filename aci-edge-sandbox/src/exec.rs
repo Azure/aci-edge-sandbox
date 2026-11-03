@@ -38,14 +38,19 @@ pub(crate) struct Completion {
 
 #[cfg(any(feature = "agent", feature = "testing"))]
 impl Completion {
-    /// Publishes the outcome. An outcome that the waiter already collected stays collected.
-    pub(crate) fn finish(&self, outcome: Result<ExecOutcome>) {
+    /// Publishes the outcome. An outcome that the waiter already collected stays collected, and
+    /// `outcome` is returned instead, so that the caller can report it another way.
+    pub(crate) fn finish(&self, outcome: Result<ExecOutcome>) -> Option<Result<ExecOutcome>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if !matches!(*state, CompletionState::Collected) {
+        let unpublished = if matches!(*state, CompletionState::Collected) {
+            Some(outcome)
+        } else {
             *state = CompletionState::Finished(outcome);
-        }
+            None
+        };
         drop(state);
         self.finished.notify_all();
+        unpublished
     }
 
     /// Lets a waiter collect `error` if the outcome has not arrived by `until`. Does nothing once
