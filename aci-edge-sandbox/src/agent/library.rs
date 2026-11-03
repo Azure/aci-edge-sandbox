@@ -289,6 +289,17 @@ fn status_error(status: i32) -> Error {
     })
 }
 
+/// The result of an export that releases a handle and answers with a status only.
+fn released(status: i32) -> Result<()> {
+    match status {
+        STATUS_OK => Ok(()),
+        STATUS_ERROR => Err(Error::backend_error(
+            "the agent library could not release the handle",
+        )),
+        other => Err(status_error(other)),
+    }
+}
+
 fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
     serde_json::to_vec(value)
         .map_err(|error| Error::malformed_request("cannot encode the request").with_source(error))
@@ -408,8 +419,9 @@ impl Library {
         Ok(host)
     }
 
-    pub(crate) fn host_close(&self, host: u64) {
-        unsafe { (self.exports.host_close)(host) };
+    /// Closes a host. The library keeps the host's sandboxes and their guest sessions.
+    pub(crate) fn host_close(&self, host: u64) -> Result<()> {
+        released(unsafe { (self.exports.host_close)(host) })
     }
 
     pub(crate) fn host_info<T: DeserializeOwned>(&self, host: u64) -> Result<T> {
@@ -541,13 +553,13 @@ impl Library {
     }
 
     /// Writes up to one frame of standard input, returning how many bytes the guest accepted, or
-    /// 0 when it accepted nothing before `timeout_ms`.
+    /// `None` when it accepted nothing before `timeout_ms`.
     pub(crate) fn exec_write(
         &self,
         exec: u64,
         data: &[u8],
         timeout_ms: Option<u64>,
-    ) -> Result<usize> {
+    ) -> Result<Option<usize>> {
         let timeout = timeout_ms.map_or(-1, |timeout| i64::try_from(timeout).unwrap_or(i64::MAX));
         let mut written = 0;
         let mut buffer = ptr::null_mut();
@@ -565,8 +577,8 @@ impl Library {
         };
         let bytes = self.take(buffer, length);
         match status {
-            STATUS_OK => Ok(written),
-            STATUS_TIMEOUT => Ok(0),
+            STATUS_OK => Ok(Some(written)),
+            STATUS_TIMEOUT => Ok(None),
             STATUS_ERROR => Err(error_from_body(bytes.as_deref())),
             other => Err(status_error(other)),
         }
@@ -580,8 +592,10 @@ impl Library {
         self.query(self.exports.exec_cancel, exec).map(drop)
     }
 
-    pub(crate) fn exec_release(&self, exec: u64) {
-        unsafe { (self.exports.exec_release)(exec) };
+    /// Releases an execution's handle. The handle is gone whatever the result, so a failure
+    /// reports what the library could not clean up, and the call must not be repeated.
+    pub(crate) fn exec_release(&self, exec: u64) -> Result<()> {
+        released(unsafe { (self.exports.exec_release)(exec) })
     }
 
     pub(crate) fn image_register<T: DeserializeOwned>(
@@ -663,8 +677,8 @@ mod tests {
         refused(library.image_list::<Value>(handle).map(drop));
         refused(library.image_verify(handle, "image"));
         refused(library.image_unregister(handle, "image").map(drop));
-        library.exec_release(handle);
-        library.host_close(handle);
+        refused(library.exec_release(handle));
+        refused(library.host_close(handle));
     }
 
     #[test]
@@ -743,11 +757,24 @@ pub(crate) mod fake {
         Accept,
         /// Waits for input credit that never comes, and fails once the execution is cancelled.
         BlockUntilCancelled,
+        /// Accepts one byte per call, after a pause shorter than the input worker's write bound,
+        /// as a guest that grants credit slowly but steadily.
+        Trickle,
+    }
+
+    /// Calls of an execution that fail, as a faulty library or a lost guest would make them.
+    #[derive(Clone, Copy, Default)]
+    pub(crate) struct Faults {
+        /// `exec_cancel` fails without cancelling, so no end arrives until [`end`] is called.
+        pub(crate) cancel: bool,
+        /// `exec_release` fails.
+        pub(crate) release: bool,
     }
 
     struct State {
         next: Next,
         write: Write,
+        faults: Faults,
         cancelled: bool,
         calls: Vec<&'static str>,
         end: Vec<u8>,
@@ -768,7 +795,7 @@ pub(crate) mod fake {
         LIBRARY.get_or_init(|| Library {
             exports: Exports {
                 host_open: refuse_open,
-                host_close: refuse_release,
+                host_close,
                 host_info: refuse_query,
                 capabilities: refuse_query,
                 probe: refuse_query,
@@ -799,6 +826,11 @@ pub(crate) mod fake {
 
     /// Registers an execution that behaves as `next` and `write` say, and returns its handle.
     pub(crate) fn execution(next: Next, write: Write) -> u64 {
+        execution_with(next, write, Faults::default())
+    }
+
+    /// Registers an execution as [`execution`] does, whose calls fail as `faults` say.
+    pub(crate) fn execution_with(next: Next, write: Write, faults: Faults) -> u64 {
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
         let outcome = match next {
             Next::OutputThenExit(_) => ExecOutcome::Exited(0),
@@ -812,6 +844,7 @@ pub(crate) mod fake {
             State {
                 next,
                 write,
+                faults,
                 cancelled: false,
                 calls: Vec::new(),
                 end,
@@ -829,15 +862,29 @@ pub(crate) mod fake {
             .unwrap_or_default()
     }
 
+    /// Ends an execution on the library's own account, as the library does once a sandbox whose
+    /// cancellation failed stops.
+    pub(crate) fn end(handle: u64) {
+        if let Some(state) = executions().get_mut(&handle) {
+            state.cancelled = true;
+            CHANGED.notify_all();
+        }
+    }
+
     fn record(handle: u64, call: &'static str) -> i32 {
         let mut executions = executions();
         let Some(state) = executions.get_mut(&handle) else {
             return STATUS_INVALID_HANDLE;
         };
         state.calls.push(call);
-        if call == "cancel" {
-            state.cancelled = true;
-            CHANGED.notify_all();
+        match call {
+            "cancel" if state.faults.cancel => return STATUS_PANIC,
+            "release" if state.faults.release => return STATUS_PANIC,
+            "cancel" => {
+                state.cancelled = true;
+                CHANGED.notify_all();
+            }
+            _ => {}
         }
         STATUS_OK
     }
@@ -878,11 +925,24 @@ pub(crate) mod fake {
         handle: u64,
         _data: *const u8,
         length: usize,
-        _timeout: i64,
+        timeout: i64,
         written: *mut usize,
         _out: *mut *mut u8,
         _out_length: *mut usize,
     ) -> i32 {
+        // A negative timeout waits indefinitely, as in the library.
+        let deadline = u64::try_from(timeout)
+            .ok()
+            .map(|timeout| std::time::Instant::now() + std::time::Duration::from_millis(timeout));
+        let trickle = executions()
+            .get(&handle)
+            .is_some_and(|state| matches!(state.write, Write::Trickle));
+        if trickle {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // SAFETY: the caller passes a writable count.
+            unsafe { *written = length.min(1) };
+            return STATUS_OK;
+        }
         let mut executions = executions();
         loop {
             let Some(state) = executions.get(&handle) else {
@@ -895,11 +955,23 @@ pub(crate) mod fake {
                     return STATUS_OK;
                 }
                 Write::BlockUntilCancelled if state.cancelled => return STATUS_INVALID_ARGUMENT,
-                Write::BlockUntilCancelled => {}
+                Write::BlockUntilCancelled | Write::Trickle => {}
             }
-            executions = CHANGED
-                .wait(executions)
-                .unwrap_or_else(PoisonError::into_inner);
+            executions = match deadline {
+                None => CHANGED
+                    .wait(executions)
+                    .unwrap_or_else(PoisonError::into_inner),
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return STATUS_TIMEOUT;
+                    }
+                    CHANGED
+                        .wait_timeout(executions, remaining)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
         }
     }
 
@@ -915,6 +987,40 @@ pub(crate) mod fake {
         record(handle, "release")
     }
 
+    /// Registers a host that closes once, and returns its handle.
+    pub(crate) fn host() -> u64 {
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        hosts().insert(handle, 0);
+        handle
+    }
+
+    /// How many times a host registered with [`host`] was closed.
+    pub(crate) fn host_closes(handle: u64) -> usize {
+        hosts().get(&handle).copied().unwrap_or_default()
+    }
+
+    static HOSTS: Mutex<BTreeMap<u64, usize>> = Mutex::new(BTreeMap::new());
+
+    fn hosts() -> MutexGuard<'static, BTreeMap<u64, usize>> {
+        HOSTS.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Closes a host registered with [`host`]: the first close succeeds, and every other close,
+    /// like that of an unknown handle, is refused.
+    unsafe extern "C" fn host_close(handle: u64) -> i32 {
+        match hosts().get_mut(&handle) {
+            Some(closes) => {
+                *closes += 1;
+                if *closes == 1 {
+                    STATUS_OK
+                } else {
+                    STATUS_INVALID_HANDLE
+                }
+            }
+            None => STATUS_INVALID_HANDLE,
+        }
+    }
+
     unsafe extern "C" fn refuse_open(
         _: *const u8,
         _: usize,
@@ -922,10 +1028,6 @@ pub(crate) mod fake {
         _: *mut *mut u8,
         _: *mut usize,
     ) -> i32 {
-        STATUS_INVALID_HANDLE
-    }
-
-    unsafe extern "C" fn refuse_release(_: u64) -> i32 {
         STATUS_INVALID_HANDLE
     }
 
