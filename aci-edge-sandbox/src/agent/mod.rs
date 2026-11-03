@@ -654,6 +654,11 @@ fn feed(
         };
         let mut pending = &buffer[..read];
         while !pending.is_empty() {
+            // A guest that keeps granting a little credit never lets a write time out, so check
+            // before each write too.
+            if stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
             match library.exec_write(exec, pending, Some(INPUT_WRITE_POLL_MS)) {
                 Ok(None) if stopped.load(Ordering::Acquire) => return Ok(()),
                 Ok(None) => {}
@@ -895,13 +900,20 @@ mod tests {
 
     #[test]
     fn a_failed_cancellation_stops_the_input_worker_so_a_stdin_writer_returns() {
+        for write in [Write::BlockUntilCancelled, Write::Trickle] {
+            assert_a_stopped_input_worker_releases_the_stdin_writer(write);
+        }
+    }
+
+    /// Checks that, after a failed cancellation ends the wait, a caller writing the stdin that it
+    /// took returns, whether the guest grants no input credit or keeps granting a little.
+    fn assert_a_stopped_input_worker_releases_the_stdin_writer(write: Write) {
         use std::io::Write as _;
         let faults = fake::Faults {
             cancel: true,
             ..fake::Faults::default()
         };
-        let exec =
-            fake::execution_with(Next::ExitWhenCancelled, Write::BlockUntilCancelled, faults);
+        let exec = fake::execution_with(Next::ExitWhenCancelled, write, faults);
         let (reader, mut writer) = io::pipe().unwrap();
         let io = ExecIo {
             stdout: Box::new(Discard),

@@ -757,6 +757,9 @@ pub(crate) mod fake {
         Accept,
         /// Waits for input credit that never comes, and fails once the execution is cancelled.
         BlockUntilCancelled,
+        /// Accepts one byte per call, after a pause shorter than the input worker's write bound,
+        /// as a guest that grants credit slowly but steadily.
+        Trickle,
     }
 
     /// Calls of an execution that fail, as a faulty library or a lost guest would make them.
@@ -931,6 +934,15 @@ pub(crate) mod fake {
         let deadline = u64::try_from(timeout)
             .ok()
             .map(|timeout| std::time::Instant::now() + std::time::Duration::from_millis(timeout));
+        let trickle = executions()
+            .get(&handle)
+            .is_some_and(|state| matches!(state.write, Write::Trickle));
+        if trickle {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // SAFETY: the caller passes a writable count.
+            unsafe { *written = length.min(1) };
+            return STATUS_OK;
+        }
         let mut executions = executions();
         loop {
             let Some(state) = executions.get(&handle) else {
@@ -943,7 +955,7 @@ pub(crate) mod fake {
                     return STATUS_OK;
                 }
                 Write::BlockUntilCancelled if state.cancelled => return STATUS_INVALID_ARGUMENT,
-                Write::BlockUntilCancelled => {}
+                Write::BlockUntilCancelled | Write::Trickle => {}
             }
             executions = match deadline {
                 None => CHANGED
