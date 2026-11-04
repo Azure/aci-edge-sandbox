@@ -1147,6 +1147,79 @@ fn exec_streams_output_and_input_while_the_workload_runs() {
 
 #[test]
 #[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
+fn a_cancel_releases_a_blocked_stdin_writer_and_the_backend_closes() {
+    let state = tempfile::tempdir().unwrap();
+    let before = openvmm_processes();
+    let backend = backend(state.path());
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let id = provision(&client, &backend).release();
+    client.start(&id).unwrap();
+
+    // A caller that keeps writing to a workload that never reads stalls on guest credit; a cancel
+    // ends the execution and the caller's write instead of leaving it blocked.
+    let mut execution = client
+        .exec(
+            &id,
+            &ExecRequest::command_line("sleep 600").with_stdin(StdinMode::Piped),
+        )
+        .unwrap();
+    let mut stdin = execution.take_stdin().unwrap();
+    let (sender, written) = std::sync::mpsc::channel();
+    let writer = thread::spawn(move || {
+        let chunk = [b'x'; 64 << 10];
+        let ended = loop {
+            if let Err(error) = stdin.write_all(&chunk) {
+                break error.kind();
+            }
+        };
+        sender.send(ended).unwrap();
+    });
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        written.try_recv().is_err(),
+        "the writer ended before the cancel"
+    );
+    let cancelled = Instant::now();
+    execution.canceller().cancel().unwrap();
+    assert_eq!(execution.wait().unwrap(), ExecOutcome::Cancelled);
+    assert!(
+        cancelled.elapsed() < Duration::from_secs(5),
+        "cancel took {:?}",
+        cancelled.elapsed()
+    );
+    let ended = written
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the stdin writer never returned after the cancel");
+    assert_eq!(ended, ErrorKind::BrokenPipe);
+    writer.join().unwrap();
+
+    // The sandbox keeps running workloads after the cancel.
+    let output = exec(
+        &client,
+        &id,
+        &ExecRequest::command_line("echo after-cancel"),
+    );
+    assert_eq!(
+        (
+            output.outcome,
+            String::from_utf8_lossy(&output.stdout).trim()
+        ),
+        (ExecOutcome::Exited(0), "after-cancel")
+    );
+
+    // An explicit close reports the host's close status, which dropping the backend discards.
+    assert_graceful(client.stop(&id));
+    client.deprovision(&id).unwrap();
+    drop(client);
+    Arc::into_inner(backend)
+        .expect("the test holds the only backend")
+        .close()
+        .unwrap();
+    assert_no_new_openvmm(&before);
+}
+
+#[test]
+#[ignore = "requires an approved private library, edge initramfs, GPT image, and a hypervisor host"]
 fn cancelled_timed_out_and_finished_executions_leave_nothing_running() {
     let state = tempfile::tempdir().unwrap();
     let before = openvmm_processes();
