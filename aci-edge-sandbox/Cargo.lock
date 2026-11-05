@@ -200,9 +200,9 @@ dependencies = [
 
 [[package]]
 name = "nvx"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9d7438b1556fc07c3d9c3cb8f31358c56ba234c0d023c7ed17c2de7adfe06a3"
+checksum = "ccf8d7df72aff05b55ad9f56da689afdbc1c6e6e83f429e35341022f91e8467d"
 dependencies = [
  "getrandom",
  "nix",

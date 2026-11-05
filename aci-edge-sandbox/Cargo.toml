@@ -49,7 +49,7 @@ testing = []
 # The model and this crate are released together at the same version, and `nvx`, whose API this
 # crate re-exports, is a preview whose API can change in any release: both are pinned exactly.
 aci_edge_sandboxes_model = { path = "model", version = "=0.1.1" }
-nvx = { version = "=0.1.0-alpha.6", default-features = false }
+nvx = { version = "=0.1.0-alpha.11", default-features = false }
 libloading = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }
 serde = { version = "1.0.200", features = ["derive"] }
