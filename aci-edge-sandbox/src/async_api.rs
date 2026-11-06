@@ -271,6 +271,12 @@ impl AsyncExecution {
     }
 }
 
+impl Drop for AsyncExecution {
+    fn drop(&mut self) {
+        self.control.abandon();
+    }
+}
+
 type OutputCollector = Option<thread::JoinHandle<Vec<u8>>>;
 
 fn spawn_output_collector(stream: Option<OutputStream>) -> Result<OutputCollector> {
@@ -369,5 +375,44 @@ impl fmt::Debug for InputStream {
             .debug_struct("InputStream")
             .field("open", &self.writer.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::*;
+
+    struct AbandonmentReporter(mpsc::Sender<()>);
+
+    impl ExecControl for AbandonmentReporter {
+        fn wait(&self) -> Result<ExecOutcome> {
+            panic!("this execution is dropped without waiting")
+        }
+
+        fn cancel(&self) -> Result<()> {
+            panic!("dropping an execution must not cancel it")
+        }
+
+        fn abandon(&self) {
+            self.0.send(()).unwrap();
+        }
+    }
+
+    #[test]
+    fn dropping_an_async_execution_notifies_the_backend_despite_a_retained_canceller() {
+        let (sender, receiver) = mpsc::channel();
+        let execution = AsyncExecution {
+            stdout: None,
+            stderr: None,
+            stdin: None,
+            control: Arc::new(AbandonmentReporter(sender)),
+        };
+        let canceller = execution.canceller();
+        drop(execution);
+        receiver.try_recv().expect("the backend was not notified");
+        assert!(receiver.try_recv().is_err());
+        drop(canceller);
     }
 }

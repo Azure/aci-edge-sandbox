@@ -779,6 +779,7 @@ pub(crate) mod fake {
         calls: Vec<&'static str>,
         end: Vec<u8>,
         sent: usize,
+        release_held: bool,
     }
 
     static EXECUTIONS: Mutex<BTreeMap<u64, State>> = Mutex::new(BTreeMap::new());
@@ -849,6 +850,7 @@ pub(crate) mod fake {
                 calls: Vec::new(),
                 end,
                 sent: 0,
+                release_held: false,
             },
         );
         handle
@@ -869,6 +871,12 @@ pub(crate) mod fake {
             state.cancelled = true;
             CHANGED.notify_all();
         }
+    }
+
+    /// Blocks or unblocks release independently of the execution's terminal event.
+    pub(crate) fn hold_release(handle: u64, held: bool) {
+        executions().get_mut(&handle).unwrap().release_held = held;
+        CHANGED.notify_all();
     }
 
     fn record(handle: u64, call: &'static str) -> i32 {
@@ -984,7 +992,17 @@ pub(crate) mod fake {
     }
 
     unsafe extern "C" fn release(handle: u64) -> i32 {
-        record(handle, "release")
+        let status = record(handle, "release");
+        let mut executions = executions();
+        while executions
+            .get(&handle)
+            .is_some_and(|state| state.release_held)
+        {
+            executions = CHANGED
+                .wait(executions)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        status
     }
 
     /// Registers a host that closes once, and returns its handle.

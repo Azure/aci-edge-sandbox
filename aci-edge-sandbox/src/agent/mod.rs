@@ -579,7 +579,7 @@ fn run(
         deadline,
         expired: AtomicBool::new(false),
         input_stopped: Arc::new(AtomicBool::new(false)),
-        unattended: AtomicBool::new(false),
+        settlement: Mutex::new(Settlement::default()),
         cleanup,
     });
     let input = match stdin {
@@ -645,11 +645,18 @@ struct ExecShared {
     expired: AtomicBool,
     /// Tells the input worker to stop waiting for input credit and drop the caller's source.
     input_stopped: Arc<AtomicBool>,
-    /// Whether no caller waits for the execution any more while the library holds its handle;
-    /// set under the handle's lock, so it does not change once the pump took the handle.
-    unattended: AtomicBool,
+    /// Serializes abandonment with release accounting and result publication, including while
+    /// the pump is releasing a handle that it already took.
+    settlement: Mutex<Settlement>,
     /// Where a release failure that the waiter cannot receive goes.
     cleanup: Cleanup,
+}
+
+#[derive(Default)]
+struct Settlement {
+    unattended: bool,
+    released: bool,
+    release_failure_pending: bool,
 }
 
 impl ExecShared {
@@ -686,8 +693,17 @@ impl ExecShared {
     /// Records that the handle was released, with a release failure that the waiter cannot
     /// receive, if any.
     fn released(&self, failure: Option<Error>) {
+        let mut state = self
+            .settlement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.record_release(&state, failure);
+        state.released = true;
+    }
+
+    fn record_release(&self, state: &Settlement, failure: Option<Error>) {
         self.cleanup.log.released(
-            self.unattended.load(Ordering::Acquire),
+            state.unattended,
             failure.map(|error| CleanupFailure {
                 sandbox_id: self.cleanup.sandbox_id.clone(),
                 error,
@@ -695,15 +711,31 @@ impl ExecShared {
         );
     }
 
-    /// Records that no caller waits for the execution any more, which matters only while the
-    /// library still holds its handle: [`AgentBackend::close`] then waits for its release.
-    /// Returns whether the library still holds it.
+    /// Records that no caller waits any more. Until release and publication finish, close must
+    /// settle this execution. Afterwards, an uncollected release failure goes to the backend.
+    /// Returns whether release and publication are still pending.
     fn leave(&self) -> bool {
-        let handle = self.handle.lock().unwrap_or_else(PoisonError::into_inner);
-        if handle.is_some() && !self.unattended.swap(true, Ordering::AcqRel) {
-            self.cleanup.log.leave();
+        let mut state = self
+            .settlement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !state.unattended {
+            state.unattended = true;
+            if !state.released {
+                self.cleanup.log.leave();
+            } else if state.release_failure_pending {
+                let failure = self.completion.discard().and_then(Result::err);
+                self.cleanup.log.released(
+                    false,
+                    failure.map(|error| CleanupFailure {
+                        sandbox_id: self.cleanup.sandbox_id.clone(),
+                        error,
+                    }),
+                );
+                state.release_failure_pending = false;
+            }
         }
-        handle.is_some()
+        !state.released
     }
 }
 
@@ -785,9 +817,14 @@ fn pump(
     };
     // A failure that the waiter cannot receive is recorded before the outcome is published, so
     // that a caller whose wait returned finds it.
-    match (shared.library.exec_release(exec), ended) {
+    let released = shared.library.exec_release(exec);
+    let mut state = shared
+        .settlement
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    match (released, ended) {
         (Ok(()), ended) => {
-            shared.released(None);
+            shared.record_release(&state, None);
             // An outcome that arrives after the waiter got another one has nowhere to go; the
             // waiter was told that the outcome is unknown.
             let _ = shared.completion.finish(ended);
@@ -800,24 +837,26 @@ fn pump(
                  library may keep its resources"
             ))
             .with_source(error);
-            if shared.unattended.load(Ordering::Acquire) {
-                shared.released(Some(reported));
+            if state.unattended {
+                shared.record_release(&state, Some(reported));
                 let _ = shared.completion.finish(Ok(outcome));
             } else {
                 let unpublished = shared
                     .completion
                     .finish(Err(reported))
                     .and_then(Result::err);
-                shared.released(unpublished);
+                state.release_failure_pending = unpublished.is_none();
+                shared.record_release(&state, unpublished);
             }
         }
         // A failed execution keeps its own failure, and the failure to release it goes to the
         // backend, whether or not the waiter receives the execution's.
         (Err(error), Err(failure)) => {
-            shared.released(Some(release_failure(error)));
+            shared.record_release(&state, Some(release_failure(error)));
             let _ = shared.completion.finish(Err(failure));
         }
     }
+    state.released = true;
 }
 
 /// The outcome in an execution's exit event.
@@ -880,6 +919,10 @@ struct AgentExecution {
 }
 
 impl ExecControl for AgentExecution {
+    fn abandon(&self) {
+        self.shared.leave();
+    }
+
     fn wait(&self) -> Result<ExecOutcome> {
         let shared = &self.shared;
         if let Some(deadline) = shared.deadline {
@@ -1620,6 +1663,122 @@ mod tests {
         assert!(chain.contains("cancelled"), "{chain}");
         assert!(!chain.contains("still held"), "{chain}");
         ender.join().unwrap();
+        assert_eq!(fake::calls(exec), ["release"]);
+    }
+
+    #[test]
+    fn dropping_the_control_during_release_keeps_close_waiting_for_settlement() {
+        for release_fails in [false, true] {
+            let host = fake::host();
+            let backend = fake_backend_on(false, host);
+            let faults = fake::Faults {
+                release: release_fails,
+                ..fake::Faults::default()
+            };
+            let (control, exec) = exec_on(&backend, host, Next::ExitWhenCancelled, faults);
+            fake::hold_release(exec, true);
+            fake::end(exec);
+            await_calls(exec, &["release"]);
+            drop(control);
+            assert_eq!(backend.cleanup.lock().unattended, 1);
+            let log = Arc::clone(&backend.cleanup);
+            let started = Instant::now();
+            let releaser = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                fake::hold_release(exec, false);
+            });
+            let closed = backend.close();
+            assert!(started.elapsed() >= Duration::from_millis(200));
+            assert!(started.elapsed() < RELEASE_SETTLE);
+            if release_fails {
+                let chain = chain(&closed.unwrap_err());
+                assert!(chain.contains("cannot release"), "{chain}");
+                assert!(!chain.contains("still held"), "{chain}");
+            } else {
+                closed.unwrap();
+            }
+            releaser.join().unwrap();
+            assert!(log.take().is_empty());
+            assert_eq!(log.lock().unattended, 0);
+            assert_eq!(fake::calls(exec), ["release"]);
+            assert_eq!(fake::host_closes(host), 1);
+        }
+    }
+
+    #[test]
+    fn dropping_an_execution_with_a_retained_canceller_reports_its_failed_release() {
+        let host = fake::host();
+        let backend = fake_backend_on(false, host);
+        let faults = fake::Faults {
+            release: true,
+            ..fake::Faults::default()
+        };
+        let (control, exec) = exec_on(&backend, host, Next::ExitWhenCancelled, faults);
+        let (stdout, _) = io::pipe().unwrap();
+        let (stderr, _) = io::pipe().unwrap();
+        let execution = crate::Execution::new(stdout, stderr, None, Arc::from(control));
+        let canceller = execution.canceller();
+        drop(execution);
+        assert_eq!(backend.cleanup.lock().unattended, 1);
+        assert!(fake::calls(exec).is_empty(), "drop must not cancel");
+        // A retained cancellation handle still works, but is no longer treated as a waiter.
+        canceller.cancel().unwrap();
+        let error = backend.close().unwrap_err();
+        assert!(chain(&error).contains("cannot release"), "{error}");
+        assert_eq!(fake::calls(exec), ["cancel", "release"]);
+        drop(canceller);
+    }
+
+    #[test]
+    fn dropping_after_release_reports_an_uncollected_release_failure_once() {
+        let host = fake::host();
+        let backend = fake_backend_on(false, host);
+        let sandbox_id = SandboxId::generate().unwrap();
+        let exec = fake::execution_with(
+            Next::OutputThenExit(0),
+            Write::Accept,
+            fake::Faults {
+                release: true,
+                ..fake::Faults::default()
+            },
+        );
+        let shared = Arc::new(ExecShared {
+            library: fake::library(),
+            handle: Mutex::new(Some(exec)),
+            completion: Completion::default(),
+            closers: Closers {
+                stdout: None,
+                stderr: None,
+                stdin: None,
+            },
+            deadline: None,
+            expired: AtomicBool::new(false),
+            input_stopped: Arc::new(AtomicBool::new(false)),
+            settlement: Mutex::default(),
+            cleanup: Cleanup {
+                sandbox_id: sandbox_id.clone(),
+                log: Arc::clone(&backend.cleanup),
+            },
+        });
+        // Run the pump inline so release and publication have both finished before dropping.
+        pump(
+            Arc::clone(&shared),
+            exec,
+            Box::new(Discard),
+            Box::new(Discard),
+            None,
+        );
+        assert!(backend.take_cleanup_failures().is_empty());
+        drop(AgentExecution { shared });
+        let failures = backend.take_cleanup_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].sandbox_id, sandbox_id);
+        let chain = chain(&failures[0].error);
+        assert!(chain.contains("cannot release"), "{chain}");
+        assert!(chain.contains("exited with status 0"), "{chain}");
+        assert!(chain.contains("panicked"), "{chain}");
+        assert!(backend.take_cleanup_failures().is_empty());
+        backend.close().unwrap();
         assert_eq!(fake::calls(exec), ["release"]);
     }
 }

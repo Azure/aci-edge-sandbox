@@ -230,4 +230,11 @@ pub trait ExecControl: Send + Sync {
 
     /// Requests cancellation. A cancelled execution reports [`ExecOutcome::Cancelled`].
     fn cancel(&self) -> Result<()>;
+
+    /// Records that the execution's owner can no longer receive its outcome, even if cancellation
+    /// handles still retain this control. Does not request cancellation and may be called again
+    /// after [`wait`](Self::wait) or an earlier abandonment.
+    ///
+    /// Backends that do not track unreported cleanup failures need not implement this hook.
+    fn abandon(&self) {}
 }
