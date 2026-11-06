@@ -395,7 +395,7 @@ mod tests {
     #[cfg(feature = "agent")]
     struct WaitReporter {
         control: Arc<dyn ExecControl>,
-        returned: mpsc::Sender<()>,
+        returned: mpsc::SyncSender<()>,
     }
 
     #[cfg(feature = "agent")]
@@ -436,7 +436,8 @@ mod tests {
         for with_output in [false, true] {
             runtime.block_on(async {
                 let (backend, control) = crate::agent::tests::failed_release_for_async_test();
-                let (returned, collected) = mpsc::channel();
+                // The worker cannot return until the first poll has completed.
+                let (returned, collected) = mpsc::sync_channel(0);
                 let execution = AsyncExecution {
                     stdout: None,
                     stderr: None,
