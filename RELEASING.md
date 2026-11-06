@@ -130,6 +130,22 @@ checksum in crates.io's index, then publishes the client. A partial failure is n
 rerunning the same approved release skips only versions whose checksums already match. Revoke
 the short-lived token after the release and replace the environment secret before another release.
 
+After a successful publish job, CI automatically runs
+[`Test-PublishedRelease.ps1`](scripts/release/Test-PublishedRelease.ps1) on a self-hosted Windows
+x64 WHP runner. It takes the version and `nvx` requirement from the approved crate artifact and
+the expected backend-library digest from the successful pre-publication acceptance summary.
+The workflow requires both artifacts to name the same commit and bundle ZIP hash.
+
+This final job validates the published crates.io packages and their GitHub bundle download, then
+runs the published lifecycle example for cold startup and snapshot capture/clone startup. It uses
+a fresh work directory and requires the runner's temporary directory to be on NTFS, not a ReFS
+Dev Drive. No publishing credentials are supplied to this read-only job. It uploads logs and
+`summary.json` as `crate-post-publish-validation`, including available logs after a failure.
+
+Failed, cancelled or skipped publication skips this final job. A failed post-publication check
+fails CI but cannot undo versions already published. Pushes, pull requests and manual dry runs
+do not perform post-publication validation because their publish job is skipped.
+
 ### Manual publication by an owner
 
 [`scripts/release/Invoke-CratePublish.ps1`](scripts/release/Invoke-CratePublish.ps1) is the
@@ -289,6 +305,18 @@ pipeline also supports resumption on the same tag and digests. If the crate itse
 release both crates at the next patch version; yank a version only when it is harmful to use.
 
 ## Verify after publication
+
+CI runs the full published-release check automatically after successful publication. To run the
+same check manually on a Windows x64 WHP host, with its state directory on NTFS:
+
+```powershell
+pwsh scripts/release/Test-PublishedRelease.ps1 -Version <version> -NvxVersion <nvx-version> -ExpectedLibrarySha256 <approved-backend-library-sha256>
+```
+
+The backend-library digest must come from the approved bundle or its successful functional
+acceptance summary; it is not the bundle ZIP digest.
+
+For a lighter consumer/package check without booting sandbox VMs:
 
 On a Windows x64 machine (the only target with a published bundle), with no `[patch]`, path, or
 Git source, and a new `CARGO_HOME`:
