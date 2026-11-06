@@ -282,6 +282,14 @@ deadline. `--hypervisor`, `--cpu-profile auto|host`, and `--guest-debug` adjust 
 `--platform-snapshots MAX_VCPUS,MAX_MEMORY_MIB[,MAX_IMAGE_MIB]` enables
 [platform snapshots](#platform-snapshots) in it. `--vcpus N` and `--memory-mib N` size the
 sandbox, and the example prints its start's `bootMode` and any `coldReason` on standard error.
+After a successful start it also prints a single-line JSON record prefixed with
+`startup-metrics:`, containing `start_ms`, `boot_mode`, and `cold_reason`. The duration uses a
+monotonic clock around `client.start()` only; it excludes backend initialization (including
+snapshot preparation), image pulls during provisioning, command execution, and cleanup.
+Missing boot metadata is recorded as `null`, not assumed to be a cold or clone start.
+Compare `start_ms` for otherwise identical runs reporting `boot_mode: "cold"` and
+`boot_mode: "clone"`; a snapshot-enabled run can fall back to cold boot. One pair of samples is
+diagnostic, not a statistically reliable performance result or an enforced latency threshold.
 The repeatable `--readonly`,
 `--readwrite`, and `--denied` options map host paths, and `--egress allow|deny` with the
 repeatable `--egress-allow` and `--egress-deny` options, each taking `CIDR` or

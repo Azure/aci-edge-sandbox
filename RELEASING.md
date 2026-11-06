@@ -316,6 +316,14 @@ pwsh scripts/release/Test-PublishedRelease.ps1 -Version <version> -NvxVersion <n
 The backend-library digest must come from the approved bundle or its successful functional
 acceptance summary; it is not the bundle ZIP digest.
 
+For releases whose lifecycle example includes startup metrics, `lifecycle.log` and
+`snapshots.log` also contain a `startup-metrics:` JSON record with the measured `client.start()`
+duration in milliseconds and the actual boot mode. Compare the cold and clone records to
+inspect restore latency. Snapshot preparation is outside this timing, and a single pair of
+measurements does not establish a performance guarantee. These records are already included in
+the uploaded logs; no CI input or extra artifact is required. Older published examples retain
+their existing output and checks.
+
 For a lighter consumer/package check without booting sandbox VMs:
 
 On a Windows x64 machine (the only target with a published bundle), with no `[patch]`, path, or
