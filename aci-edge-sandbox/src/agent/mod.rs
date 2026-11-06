@@ -656,7 +656,24 @@ struct ExecShared {
 struct Settlement {
     unattended: bool,
     released: bool,
-    release_failure_pending: bool,
+    /// Retained until the result reaches the caller, not just its blocking worker.
+    release_failure: Option<ReleaseFailure>,
+}
+
+struct ReleaseFailure {
+    outcome: ExecOutcome,
+    cause: Arc<Error>,
+}
+
+impl ReleaseFailure {
+    fn error(&self) -> Error {
+        Error::backend_error(format!(
+            "the execution {}, but the agent library cannot release it, so the \
+             library may keep its resources",
+            self.outcome
+        ))
+        .with_source(Arc::clone(&self.cause))
+    }
 }
 
 impl ExecShared {
@@ -723,16 +740,14 @@ impl ExecShared {
             state.unattended = true;
             if !state.released {
                 self.cleanup.log.leave();
-            } else if state.release_failure_pending {
-                let failure = self.completion.discard().and_then(Result::err);
+            } else if let Some(failure) = state.release_failure.take() {
                 self.cleanup.log.released(
                     false,
-                    failure.map(|error| CleanupFailure {
+                    Some(CleanupFailure {
                         sandbox_id: self.cleanup.sandbox_id.clone(),
-                        error,
+                        error: failure.error(),
                     }),
                 );
-                state.release_failure_pending = false;
             }
         }
         !state.released
@@ -832,20 +847,23 @@ fn pump(
         // A successful execution reports the failure to release it through its wait, naming
         // the outcome, unless no caller waits for it any more.
         (Err(error), Ok(outcome)) => {
-            let reported = Error::backend_error(format!(
-                "the execution {outcome}, but the agent library cannot release it, so the \
-                 library may keep its resources"
-            ))
-            .with_source(error);
+            let failure = ReleaseFailure {
+                outcome,
+                cause: Arc::new(error),
+            };
             if state.unattended {
-                shared.record_release(&state, Some(reported));
+                shared.record_release(&state, Some(failure.error()));
                 let _ = shared.completion.finish(Ok(outcome));
             } else {
-                let unpublished = shared
-                    .completion
-                    .finish(Err(reported))
-                    .and_then(Result::err);
-                state.release_failure_pending = unpublished.is_none();
+                let reported = failure.error();
+                state.release_failure = Some(failure);
+                let unpublished = shared.completion.finish(Err(reported)).map(|_| {
+                    state
+                        .release_failure
+                        .take()
+                        .expect("the release failure was retained under this lock")
+                        .error()
+                });
                 shared.record_release(&state, unpublished);
             }
         }
@@ -924,6 +942,21 @@ impl ExecControl for AgentExecution {
     }
 
     fn wait(&self) -> Result<ExecOutcome> {
+        let outcome = self.wait_unacknowledged();
+        self.acknowledge_wait();
+        outcome
+    }
+
+    fn acknowledge_wait(&self) {
+        self.shared
+            .settlement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release_failure = None;
+        self.shared.leave();
+    }
+
+    fn wait_unacknowledged(&self) -> Result<ExecOutcome> {
         let shared = &self.shared;
         if let Some(deadline) = shared.deadline {
             if let Some(outcome) = shared.completion.wait_until(deadline) {
@@ -987,9 +1020,15 @@ impl AgentExecution {
     /// library ends the execution.
     fn collected(&self, outcome: Result<ExecOutcome>) -> Result<ExecOutcome> {
         let shared = &self.shared;
-        // The waiter now has an outcome, so a later release failure has to go to the backend.
-        let pumping = shared.leave();
+        let pumping = !shared
+            .settlement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .released;
         if pumping {
+            // This result precedes native release, as after a failed cancellation. Any later
+            // release failure belongs to cleanup, whether or not an async caller receives it.
+            shared.leave();
             for closer in [&shared.closers.stdout, &shared.closers.stderr]
                 .into_iter()
                 .flatten()
@@ -1010,7 +1049,7 @@ impl Drop for AgentExecution {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1489,6 +1528,22 @@ mod tests {
             .unwrap();
         let exec = *fake::started(host).last().unwrap();
         (control, exec)
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn failed_release_for_async_test() -> (AgentBackend, Arc<dyn ExecControl>) {
+        let host = fake::host();
+        let backend = fake_backend_on(false, host);
+        let (control, _) = exec_on(
+            &backend,
+            host,
+            Next::OutputThenExit(0),
+            fake::Faults {
+                release: true,
+                ..fake::Faults::default()
+            },
+        );
+        (backend, Arc::from(control))
     }
 
     /// The messages of `error` and its causes.

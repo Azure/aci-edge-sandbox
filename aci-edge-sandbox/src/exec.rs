@@ -38,16 +38,6 @@ pub(crate) struct Completion {
 
 #[cfg(any(feature = "agent", feature = "testing"))]
 impl Completion {
-    /// Discards an uncollected outcome, returning it so its owner can report it elsewhere.
-    #[cfg(feature = "agent")]
-    pub(crate) fn discard(&self) -> Option<Result<ExecOutcome>> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        match std::mem::replace(&mut *state, CompletionState::Collected) {
-            CompletionState::Finished(outcome) => Some(outcome),
-            _ => None,
-        }
-    }
-
     /// Publishes the outcome. An outcome that the waiter already collected stays collected, and
     /// `outcome` is returned instead, so that the caller can report it another way.
     pub(crate) fn finish(&self, outcome: Result<ExecOutcome>) -> Option<Result<ExecOutcome>> {

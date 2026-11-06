@@ -228,6 +228,19 @@ pub trait ExecControl: Send + Sync {
     /// example because the connection to the sandbox was lost.
     fn wait(&self) -> Result<ExecOutcome>;
 
+    /// Waits without acknowledging that the caller received the result. Async adapters use this
+    /// when a blocking worker can finish after its awaiting future was dropped.
+    ///
+    /// Call [`acknowledge_wait`](Self::acknowledge_wait) only when handing the result to the
+    /// caller, or [`abandon`](Self::abandon) if it cannot be delivered. Backends that do not track
+    /// unreported cleanup failures can use the default implementation.
+    fn wait_unacknowledged(&self) -> Result<ExecOutcome> {
+        self.wait()
+    }
+
+    /// Acknowledges delivery of the result from [`wait_unacknowledged`](Self::wait_unacknowledged).
+    fn acknowledge_wait(&self) {}
+
     /// Requests cancellation. A cancelled execution reports [`ExecOutcome::Cancelled`].
     fn cancel(&self) -> Result<()>;
 

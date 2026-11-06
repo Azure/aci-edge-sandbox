@@ -273,7 +273,10 @@ more (its waiter already received an outcome, as after a failed cancellation, or
 dropped it), becomes a `CleanupFailure` with the sandbox's ID. Dropping either an `Execution` or
 an `AsyncExecution` stops treating it as having a waiter even if a `Canceller` is retained; this
 does not cancel the workload. This also applies when release is already in progress, or a release
-failure is waiting in an outcome that was never collected. `AgentBackend::take_cleanup_failures`
+failure is waiting in an outcome that was never collected. An async wait acknowledges delivery only
+when its awaiting future receives the result: dropping `wait()` or `wait_with_output()` still
+reports a release failure through cleanup if the blocking worker already collected it.
+`AgentBackend::take_cleanup_failures`
 returns those recorded so far, as soon as `wait` returns, and `AgentBackend::close` returns the
 rest. `close` first waits up to five seconds for the library to release the executions that no
 caller waits for and fails if any remain; it does not wait for an execution that a caller still
