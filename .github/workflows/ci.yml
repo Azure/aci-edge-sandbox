@@ -50,8 +50,16 @@ jobs:
           ACI_EDGE_SANDBOXES_AGENT_BUNDLE: ''
         run: ./scripts/test-agent-bundling.ps1 -Toolchain $env:RUST_TOOLCHAIN -WorkDir $env:RUNNER_TEMP/agent-bundling
 
+  bundle-pre-packaging-validation:
+    name: Bundle pre-packaging validation
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/edge-functional.yml
+
   package:
     name: Package for crates.io
+    needs: bundle-pre-packaging-validation
+    # Automatic CI skips bundle validation; a manual run must pass it before producing crate archives.
+    if: ${{ !cancelled() && (needs.bundle-pre-packaging-validation.result == 'success' || (github.event_name != 'workflow_dispatch' && needs.bundle-pre-packaging-validation.result == 'skipped')) }}
     runs-on: windows-latest
     defaults:
       run:
