@@ -8,6 +8,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      dryRun:
+        description: validate via guest test and package only; uncheck to publish after approval
+        type: boolean
+        required: true
+        default: true
 
 permissions:
   contents: read
@@ -50,8 +56,16 @@ jobs:
           ACI_EDGE_SANDBOXES_AGENT_BUNDLE: ''
         run: ./scripts/test-agent-bundling.ps1 -Toolchain $env:RUST_TOOLCHAIN -WorkDir $env:RUNNER_TEMP/agent-bundling
 
+  bundle-pre-packaging-validation:
+    name: Bundle pre-packaging validation
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/edge-functional.yml
+
   package:
     name: Package for crates.io
+    needs: bundle-pre-packaging-validation
+    # Pull requests skip bundle validation; main pushes and manual runs must pass it before packaging.
+    if: ${{ !cancelled() && (needs.bundle-pre-packaging-validation.result == 'success' || (github.event_name == 'pull_request' && needs.bundle-pre-packaging-validation.result == 'skipped')) }}
     runs-on: windows-latest
     defaults:
       run:
@@ -69,3 +83,106 @@ jobs:
         with:
           name: crates
           path: ${{ runner.temp }}/crates
+
+  publish:
+    name: Publish to crates.io
+    needs: [check, bundle-pre-packaging-validation, package]
+    if: github.event_name == 'workflow_dispatch' && !inputs.dryRun
+    runs-on: windows-latest
+    environment: crates-io
+    timeout-minutes: 120
+    concurrency:
+      group: crates-io-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Download the reviewed crate artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: crates
+          path: ${{ runner.temp }}/approved-crates
+      - name: Install Rust
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup failed with exit $LASTEXITCODE" }
+      - name: Publish the approved crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+          if ([string]::IsNullOrWhiteSpace($env:CARGO_REGISTRY_TOKEN)) {
+            throw 'Configure CARGO_REGISTRY_TOKEN in the crates-io environment before publishing.'
+          }
+          $approvalDir = Join-Path $env:RUNNER_TEMP 'approved-crates'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          & .\scripts\release\Invoke-CratePublish.ps1 `
+            -ApprovedManifest (Join-Path $approvalDir 'release-manifest.json') `
+            -ApprovedSha256Sums (Join-Path $approvalDir 'SHA256SUMS') `
+            -ExpectedCommit $env:GITHUB_SHA `
+            -Toolchain $env:RUST_TOOLCHAIN `
+            -Repository $env:GITHUB_WORKSPACE `
+            -WorkDir (Join-Path $env:RUNNER_TEMP "crate-publish-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT")
+
+  crate-post-publish-validation:
+    name: Crate post-publish validation / Windows x64 WHP
+    needs: publish
+    runs-on: [self-hosted, windows, whp, virtual-machine, general]
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download the approved crate artifact release-manifest.json
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: crates
+          path: ${{ runner.temp }}/published-validation-inputs/crates
+      - name: Download pre-packaging bundle validation results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: edge-functional-acceptance
+          path: ${{ runner.temp }}/published-validation-inputs/acceptance
+      - name: Install Rust
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup failed with exit $LASTEXITCODE" }
+      - name: run published crate and lifecycle tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $inputsDir = Join-Path $env:RUNNER_TEMP 'published-validation-inputs'
+          $release = Get-Content -Raw -LiteralPath (Join-Path $inputsDir 'crates\release-manifest.json') | ConvertFrom-Json
+          $acceptance = Get-Content -Raw -LiteralPath (Join-Path $inputsDir 'acceptance\summary.json') | ConvertFrom-Json
+          if ($release.commit -cne $env:GITHUB_SHA -or $acceptance.client -cne $release.commit -or
+              $acceptance.bundle.zipSha256 -ne $release.agentBundle.sha256) {
+            throw 'Published validation requires approval and acceptance evidence for this commit and bundle.'
+          }
+          if ($acceptance.bundle.backendLibrarySha256 -notmatch '^[0-9a-fA-F]{64}$') {
+            throw 'The successful acceptance summary must contain the expected backend library SHA-256.'
+          }
+          & .\scripts\release\Test-PublishedRelease.ps1 `
+            -Version $release.version `
+            -NvxVersion $release.nvx.Substring(1) `
+            -ExpectedLibrarySha256 $acceptance.bundle.backendLibrarySha256 `
+            -Toolchain $env:RUST_TOOLCHAIN `
+            -WorkDir (Join-Path $env:RUNNER_TEMP "published-release-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: crate-post-publish-validation
+          path: |
+            ${{ runner.temp }}/published-release-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            ${{ runner.temp }}/published-release-${{ github.run_id }}-${{ github.run_attempt }}/summary.json

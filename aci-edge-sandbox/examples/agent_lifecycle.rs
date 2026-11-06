@@ -11,6 +11,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "agent-bundled")]
 use aci_edge_sandboxes::agent::BundledAgent;
@@ -264,10 +265,16 @@ fn run() -> Result<(), String> {
         .provision_with(&request, &spec)
         .map_err(describe)?
         .sandbox_id;
+    let start_at = Instant::now();
     let started = client.start(&id);
+    let start_elapsed = start_at.elapsed();
     let succeeded = started.is_ok();
     let executed = started.and_then(|started| {
         eprintln!("{}", describe_start(&started)?);
+        eprintln!(
+            "startup-metrics: {}",
+            startup_metrics(&started, start_elapsed)?
+        );
         let output = client.exec(&id, &exec)?.wait_with_output()?;
         let logs = backend.guest_logs(&id)?;
         if !logs.windows(5).any(|window| window == b"exec:") {
@@ -503,6 +510,17 @@ fn describe_start(started: &StartResult) -> aci_edge_sandboxes::Result<String> {
     })
 }
 
+fn startup_metrics(
+    started: &StartResult,
+    elapsed: Duration,
+) -> aci_edge_sandboxes::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "start_ms": elapsed.as_secs_f64() * 1_000.0,
+        "boot_mode": started.boot_mode()?.map(|mode| mode.to_string()),
+        "cold_reason": started.cold_reason()?.map(|reason| reason.to_string()),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +635,66 @@ mod tests {
         let malformed: StartResult =
             serde_json::from_str(r#"{"metadata": {"bootMode": "warm"}}"#).unwrap();
         assert!(describe_start(&malformed).is_err());
+    }
+
+    #[test]
+    fn startup_metrics_record_fractional_milliseconds_and_actual_boot_mode() {
+        use aci_edge_sandboxes::{BootMode, ColdReason};
+
+        for mode in [BootMode::Cold, BootMode::Clone] {
+            let started = StartResult::default().with_boot_mode(mode);
+            let metrics = startup_metrics(&started, Duration::from_micros(1_500)).unwrap();
+            assert_eq!(
+                metrics,
+                serde_json::json!({
+                    "start_ms": 1.5,
+                    "boot_mode": mode.to_string(),
+                    "cold_reason": null,
+                })
+            );
+            let serialized = serde_json::to_string(&metrics).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&serialized).unwrap(),
+                metrics
+            );
+        }
+
+        let fallback = StartResult::default()
+            .with_boot_mode(BootMode::Cold)
+            .with_cold_reason(ColdReason::MemoryAboveCapacity);
+        assert_eq!(
+            startup_metrics(&fallback, Duration::from_millis(250)).unwrap(),
+            serde_json::json!({
+                "start_ms": 250.0,
+                "boot_mode": "cold",
+                "cold_reason": "memory-above-capacity",
+            })
+        );
+    }
+
+    #[test]
+    fn startup_metrics_preserve_missing_metadata_and_reject_malformed_metadata() {
+        assert_eq!(
+            startup_metrics(&StartResult::default(), Duration::ZERO).unwrap(),
+            serde_json::json!({
+                "start_ms": 0.0,
+                "boot_mode": null,
+                "cold_reason": null,
+            })
+        );
+        for metadata in [
+            r#"{"bootMode":"warm"}"#,
+            r#"{"bootMode":42}"#,
+            r#"{"bootMode":"cold","coldReason":"unknown"}"#,
+            r#"{"bootMode":"cold","coldReason":42}"#,
+        ] {
+            let started: StartResult =
+                serde_json::from_str(&format!(r#"{{"metadata":{metadata}}}"#)).unwrap();
+            assert!(
+                startup_metrics(&started, Duration::from_millis(1)).is_err(),
+                "{metadata}"
+            );
+        }
     }
 
     #[test]
