@@ -76,15 +76,16 @@ test of `tests/agent_guest.rs` against the bundle's library, OpenVMM, kernel, an
 [Edge functional acceptance](.github/workflows/edge-functional.yml) workflow runs the same script
 on a self-hosted WHP runner when dispatched, and is reusable by other workflows.
 
-Manually dispatching [CI](.github/workflows/ci.yml) on the release commit calls this workflow with
-the bundle pinned in `agent-bundle.json`. Functional acceptance must pass before the package job
-can run and upload the crate archives; a failed or cancelled acceptance check blocks packaging.
-The WHP job does not run on pushes or pull requests, which retain their existing CI checks and
+[CI](.github/workflows/ci.yml) calls this workflow on pushes to `main` and manual runs, using the
+bundle pinned in `agent-bundle.json`. Functional acceptance must pass before the package job can
+run and upload the crate archives; a failed, cancelled, or skipped acceptance check blocks
+packaging on those runs. Pull requests skip the WHP job and retain their existing CI checks and
 packaging. An available self-hosted runner with all of the workflow's labels is required.
 
-CI still performs a publication dry run only; it does not publish crates. Use a successful manual
-CI run on the exact release commit as the pre-publication functional evidence, alongside the
-other release gates. Keep its `summary.json` and logs with the release's compatibility record.
+CI still performs a publication dry run only; it does not publish crates. Use a successful main
+push or manual CI run on the exact release commit as the pre-publication functional evidence,
+alongside the other release gates. Keep its `summary.json` and logs with the release's
+compatibility record.
 
 ## Publish
 
