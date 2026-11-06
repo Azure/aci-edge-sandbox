@@ -1152,14 +1152,15 @@ fn a_cancel_releases_a_blocked_stdin_writer_and_the_backend_closes() {
     let before = openvmm_processes();
     let backend = backend(state.path());
     let client = AciEdgeSandbox::from_shared(backend.clone());
-    let id = provision(&client, &backend).release();
-    client.start(&id).unwrap();
+    let sandbox = provision(&client, &backend);
+    let id = &sandbox.id;
+    client.start(id).unwrap();
 
     // A caller that keeps writing to a workload that never reads stalls on guest credit; a cancel
     // ends the execution and the caller's write instead of leaving it blocked.
     let mut execution = client
         .exec(
-            &id,
+            id,
             &ExecRequest::command_line("sleep 600").with_stdin(StdinMode::Piped),
         )
         .unwrap();
@@ -1179,14 +1180,22 @@ fn a_cancel_releases_a_blocked_stdin_writer_and_the_backend_closes() {
         written.try_recv().is_err(),
         "the writer ended before the cancel"
     );
-    let cancelled = Instant::now();
-    execution.canceller().cancel().unwrap();
-    assert_eq!(execution.wait().unwrap(), ExecOutcome::Cancelled);
-    assert!(
-        cancelled.elapsed() < Duration::from_secs(5),
-        "cancel took {:?}",
-        cancelled.elapsed()
+    let (sender, completed) = std::sync::mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let outcome = execution
+            .canceller()
+            .cancel()
+            .and_then(|()| execution.wait());
+        sender.send(outcome).unwrap();
+    });
+    assert_eq!(
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation and waiting did not finish within five seconds")
+            .unwrap(),
+        ExecOutcome::Cancelled
     );
+    waiter.join().unwrap();
     let ended = written
         .recv_timeout(Duration::from_secs(30))
         .expect("the stdin writer never returned after the cancel");
@@ -1194,11 +1203,7 @@ fn a_cancel_releases_a_blocked_stdin_writer_and_the_backend_closes() {
     writer.join().unwrap();
 
     // The sandbox keeps running workloads after the cancel.
-    let output = exec(
-        &client,
-        &id,
-        &ExecRequest::command_line("echo after-cancel"),
-    );
+    let output = exec(&client, id, &ExecRequest::command_line("echo after-cancel"));
     assert_eq!(
         (
             output.outcome,
@@ -1208,8 +1213,9 @@ fn a_cancel_releases_a_blocked_stdin_writer_and_the_backend_closes() {
     );
 
     // An explicit close reports the host's close status, which dropping the backend discards.
-    assert_graceful(client.stop(&id));
-    client.deprovision(&id).unwrap();
+    assert_graceful(client.stop(id));
+    client.deprovision(id).unwrap();
+    sandbox.release();
     drop(client);
     Arc::into_inner(backend)
         .expect("the test holds the only backend")
