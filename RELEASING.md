@@ -32,16 +32,19 @@ Publish only when every gate holds:
 
 ## Prepare
 
-Tag the release commit `aci_edge_sandboxes-v<version>`; the version is the one in both
-`Cargo.toml` files. Then, from a clean checkout of the tag, with network access to crates.io:
+From a clean checkout of the release commit, with network access to crates.io, prepare both
+archives. The version must be the same in both `Cargo.toml` files. Keep output outside the checkout
+so that generated files do not dirty it:
 
 ```powershell
-pwsh scripts/release/Invoke-CratePackage.ps1 -OutDir out/crates -ExpectedTag aci_edge_sandboxes-v<version>
+pwsh scripts/release/Invoke-CratePackage.ps1 -OutDir ..\release-approval -Toolchain <toolchain>
 ```
 
 The script checks the release metadata and exact version pins, runs one
 `cargo publish --dry-run --registry crates-io` for both crates, packages them again, requires the
-same bytes, and writes `out/crates/SHA256SUMS` and `out/crates/release-manifest.json`. The dry run
+same bytes, and writes `SHA256SUMS` and `release-manifest.json` in the output directory. Review and
+approve both files independently of the publishing run. If the release tag already exists, add
+`-ExpectedTag aci_edge_sandboxes-v<version>` to require that it names HEAD. The dry run
 resolves the unpublished model from a temporary local registry: it shows that the archives build,
 not that crates.io resolves them.
 
@@ -50,7 +53,7 @@ not that crates.io resolves them.
 ```powershell
 pwsh scripts/test-agent-bundling.ps1             # bundle staging with synthetic bundles
 pwsh scripts/test-agent-bundling.ps1 -Pinned     # the pinned bundle, from the checkout and an export
-pwsh scripts/release/Test-CrateConsumer.ps1 -ArchiveDir out/crates   # an SDK-like consumer of the archives
+pwsh scripts/release/Test-CrateConsumer.ps1 -ArchiveDir ..\release-approval   # an SDK-like consumer of the archives
 ```
 
 `Test-CrateConsumer.ps1` builds a consumer outside the repository that depends on
@@ -82,25 +85,87 @@ checks this before uploading.
 
 The owners of both crates decide the route.
 
-### First release by an owner
+### Manual publication by an owner
 
-crates.io creates a crate when its first version is published, so the first upload of each crate
-uses an owner's API token:
+[`scripts/release/Invoke-CratePublish.ps1`](scripts/release/Invoke-CratePublish.ps1) is the
+reusable version of the standalone script used for the manual publication. CI packages the
+crates; it does not publish them. This script is an operator-invoked alternative, not CI automation.
 
-1. The initial owner signs in to crates.io with GitHub, verifies an email address, and creates a
-   token scoped to `publish-new` and `publish-update` for `aci_edge_sandboxes*`, with a short
-   expiry.
-2. `cargo publish` cannot upload a prepared archive; it packages the source again. Packaging is
-   reproducible for a given commit and Cargo version (`Prepare` packaged twice and compared), so
-   on a clean checkout of the release tag, immediately before uploading, run
-   `Invoke-CratePackage.ps1 -ExpectedTag <tag> -ApprovedSha256Sums <approved SHA256SUMS> -Toolchain <toolchain>`
-   with the toolchain that will publish. Continue only if it passes: it proves that this Cargo
-   packages exactly the approved archives. Then run
-   `cargo +<toolchain> publish --locked --registry crates-io --package <crate>` for each crate in
-   order, with the same toolchain. Afterwards, confirm that the `cksum` from
-   `https://crates.io/api/v1/crates/<crate>/<version>` equals `SHA256SUMS`.
-3. The owner revokes the token and adds the long-term owners (`cargo owner --add`), such as a
-   Microsoft GitHub team.
+Prerequisites: PowerShell 7.3 or later, Git, Rust/Cargo with the exact toolchain used for
+approval already installed, the platform's Rust linker/build tools, `tar`, network access to
+GitHub and crates.io, and all release gates above. Use a clean checkout of the approved full
+40-character commit, reachable from `origin/main`, with `origin` set to the canonical
+`Azure/aci-edge-sandbox` HTTPS or SSH URL. A release must have a new version; never reuse an
+already published version for different source or package bytes.
+
+Use the reviewed `release-manifest.json` and `SHA256SUMS`, not newly generated values that bypass
+approval. The manifest binds the version, commit, Cargo version, exact `nvx` requirement and
+bundle pin; the sums file supplies both full package hashes in model-first order. The tag is
+`aci_edge_sandboxes-v<version>`; `-Tag` may be supplied explicitly but must match that convention.
+Both local and remote tags, if present, must already name the approved commit.
+
+Run the new tooling from its own checkout when publishing an older source checkout that does not
+contain it. `-Repository` selects that clean source checkout; it defaults to the tooling checkout.
+Every `-WorkDir` must be a **new directory outside the release checkout**. Previous runs and
+approved files are never overwritten.
+
+First run the dry run; no authentication is required. Replace the paths and toolchain below with
+the approved inputs. The toolchain must match the `cargo` field in the reviewed manifest:
+
+```powershell
+$approvalDir = Resolve-Path ..\release-approval
+$approval = Get-Content -Raw (Join-Path $approvalDir 'release-manifest.json') | ConvertFrom-Json
+$publish = @{
+    Version = $approval.version
+    Commit = $approval.commit
+    Tag = "aci_edge_sandboxes-v$($approval.version)"
+    Toolchain = '<approved-toolchain>'
+    ApprovedSha256Sums = (Join-Path $approvalDir 'SHA256SUMS')
+    ExpectedNvxVersion = $approval.nvx.TrimStart('=')
+    ExpectedBundleSha256 = $approval.agentBundle.sha256
+    Repository = (Resolve-Path ..\release-source).Path
+}
+.\scripts\release\Invoke-CratePublish.ps1 @publish -WorkDir ..\release-dry-run -DryRun
+```
+
+The dry run verifies source, pins, local/remote tag targets and registry checksums, and reruns the
+full packaging/digest gate even if either version is already published. It fetches `origin/main`
+and writes only local working artifacts; it creates no tags, pushes nothing, and publishes nothing.
+
+For actual publication, a crate owner must sign in to crates.io, verify their email address,
+and create a short-lived token scoped to `publish-update` for the two crates (also `publish-new`
+for a first publication). Authenticate **interactively outside the script**:
+
+```powershell
+cargo "+$($publish.Toolchain)" login --registry crates-io
+# Paste the token only at Cargo's prompt, never into a command argument or this script.
+.\scripts\release\Invoke-CratePublish.ps1 @publish -WorkDir ..\release-publish
+```
+
+Only the command without `-DryRun` can create/push the release tag or upload crates. After the
+full approval gate passes, it creates and pushes a missing tag without force, publishes the
+model first, waits for its approved checksum in the registry index, and then publishes the client.
+`cargo publish` repackages rather than uploading a prepared archive, so each standalone package
+is hash-checked again immediately before publication with the same toolchain and clean source.
+Every failed command, wrong pin, tag conflict, yanked version or checksum mismatch stops the run.
+Existing published versions are skipped only when their checksums match.
+
+After publication, or if you abandon an attempt, **revoke the token on crates.io** and remove the
+locally stored credential:
+
+```powershell
+cargo "+$($publish.Toolchain)" logout --registry crates-io
+```
+
+The script does not read credential files, print tokens or run login/logout. For a first
+publication, the owner can subsequently add the long-term owners with `cargo owner --add`.
+
+The offline control-flow checks substitute git, cargo and registry responses; they cannot
+publish crates or push tags:
+
+```powershell
+pwsh -NoProfile -File scripts/release/Test-CratePublish.ps1
+```
 
 ### Later releases: trusted publishing
 
@@ -153,9 +218,10 @@ version needs functional acceptance again before `agent-bundle.json` or the mani
 
 If the model is published and the crate is not, do not yank the model. Fix the cause outside the
 crates (credentials, approvals, the index), then publish the crate from the same approved
-archives. The ESRP pipeline, queued again on the same tag with the same digests, skips the
-published model. If the crate itself must change, release both crates at the next patch
-version; yank a version only when it is harmful to use.
+archives. Rerun the manual script with the same approved inputs and a new `-WorkDir`; it verifies
+the existing tag and skips the published model only after checking its checksum. The ESRP
+pipeline also supports resumption on the same tag and digests. If the crate itself must change,
+release both crates at the next patch version; yank a version only when it is harmful to use.
 
 ## Verify after publication
 

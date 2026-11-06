@@ -36,7 +36,9 @@ param
     # Packages a working tree with uncommitted changes; never for a release.
     [switch] $AllowDirty,
     # Rust toolchain, such as 1.95.0; the active one when omitted.
-    [string] $Toolchain
+    [string] $Toolchain,
+    # Defaults to this script's checkout; permits tooling to validate an older release checkout.
+    [string] $Repository = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,7 +52,7 @@ $requiredFiles = @{
         'build.rs', 'build/agent_bundle.rs', 'src/agent/bundle_contract.rs', 'agent-bundle.json', 'src/lib.rs'
 }
 
-$repository = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$repository = (Resolve-Path -LiteralPath $Repository).Path
 $manifest = Join-Path $repository 'aci-edge-sandbox/Cargo.toml'
 $toolchainArgs = @()
 if ($Toolchain) { $toolchainArgs += "+$Toolchain" }
@@ -159,7 +161,7 @@ foreach ($name in $crates)
 }
 [System.IO.File]::WriteAllText((Join-Path $OutDir 'SHA256SUMS'), (($sums -join "`n") + "`n"))
 $pin = Get-Content -Raw (Join-Path $repository 'aci-edge-sandbox/agent-bundle.json') | ConvertFrom-Json
-$cargoVersion = (& cargo @toolchainArgs --version).Trim()
+$cargoVersion = (Invoke-Native 'cargo --version' { cargo @toolchainArgs --version }).Trim()
 $record = [ordered]@{
     version = $version
     commit = $commit
