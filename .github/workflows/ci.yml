@@ -8,6 +8,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      dryRun:
+        description: validate via guest test and package only; uncheck to publish after approval
+        type: boolean
+        required: true
+        default: true
 
 permissions:
   contents: read
@@ -77,3 +83,52 @@ jobs:
         with:
           name: crates
           path: ${{ runner.temp }}/crates
+
+  publish:
+    name: Publish to crates.io
+    needs: [check, bundle-pre-packaging-validation, package]
+    if: github.event_name == 'workflow_dispatch' && !inputs.dryRun
+    runs-on: windows-latest
+    environment: crates-io
+    timeout-minutes: 120
+    concurrency:
+      group: crates-io-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Download the reviewed crate artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: crates
+          path: ${{ runner.temp }}/approved-crates
+      - name: Install Rust
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup failed with exit $LASTEXITCODE" }
+      - name: Publish the approved crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
+          if ([string]::IsNullOrWhiteSpace($env:CARGO_REGISTRY_TOKEN)) {
+            throw 'Configure CARGO_REGISTRY_TOKEN in the crates-io environment before publishing.'
+          }
+          $approvalDir = Join-Path $env:RUNNER_TEMP 'approved-crates'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          & .\scripts\release\Invoke-CratePublish.ps1 `
+            -ApprovedManifest (Join-Path $approvalDir 'release-manifest.json') `
+            -ApprovedSha256Sums (Join-Path $approvalDir 'SHA256SUMS') `
+            -ExpectedCommit $env:GITHUB_SHA `
+            -Toolchain $env:RUST_TOOLCHAIN `
+            -Repository $env:GITHUB_WORKSPACE `
+            -WorkDir (Join-Path $env:RUNNER_TEMP "crate-publish-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT")

@@ -162,6 +162,44 @@ $cases = @(
     @{ Name = 'tag push failure stops uploads'; DryRun = $false; Error = 'exit 17'; Change = { $global:CratePublishTest.NativeFailure = 'push' } }
 )
 
+$cases = @(
+    foreach ($case in $cases)
+    {
+        foreach ($mode in 'Explicit', 'Manifest')
+        {
+            $copy = $case.Clone()
+            $copy.Mode = $mode
+            $copy
+        }
+    }
+    @{ Name = 'matching expected commit'; Mode = 'Manifest'; ExpectedCommit = '1' * 40 },
+    @{ Name = 'explicit matching tag'; Mode = 'Manifest'; Tag = 'aci_edge_sandboxes-v1.2.3' },
+    @{ Name = 'wrong expected commit'; Mode = 'Manifest'; ExpectedCommit = 'b' * 40; Error = 'expected commit' },
+    @{ Name = 'dirty manifest'; Mode = 'Manifest'; Error = 'dirty: false'; ManifestChange = { $record.dirty = $true } },
+    @{ Name = 'non-boolean dirty flag'; Mode = 'Manifest'; Error = 'dirty: false'; ManifestChange = { $record.dirty = 'false' } },
+    @{ Name = 'missing manifest commit'; Mode = 'Manifest'; Error = "string 'commit'"; ManifestChange = { $record.Remove('commit') } },
+    @{ Name = 'invalid manifest version'; Mode = 'Manifest'; Error = 'Version'; ManifestChange = { $record.version = 'invalid' } },
+    @{ Name = 'invalid manifest commit'; Mode = 'Manifest'; Error = 'Commit'; ManifestChange = { $record.commit = 'invalid' } },
+    @{ Name = 'non-string manifest version'; Mode = 'Manifest'; Error = "string 'version'"; ManifestChange = { $record.version = @('1.2.3') } },
+    @{ Name = 'blank manifest Cargo'; Mode = 'Manifest'; Error = "string 'cargo'"; ManifestChange = { $record.cargo = ' ' } },
+    @{ Name = 'wrong manifest Cargo'; Mode = 'Manifest'; Error = 'ApprovedManifest used'; ManifestChange = { $record.cargo = 'cargo 1.95.0 (other)' } },
+    @{ Name = 'non-exact manifest nvx'; Mode = 'Manifest'; Error = 'exact nvx'; ManifestChange = { $record.nvx = '0.2.0' } },
+    @{ Name = 'empty manifest nvx'; Mode = 'Manifest'; Error = 'exact nvx'; ManifestChange = { $record.nvx = '=' } },
+    @{ Name = 'invalid manifest bundle digest'; Mode = 'Manifest'; Error = 'ExpectedBundleSha256'; ManifestChange = { $record.agentBundle.sha256 = 'invalid' } },
+    @{ Name = 'missing manifest bundle asset'; Mode = 'Manifest'; Error = 'agentBundle.asset'; ManifestChange = { $record.agentBundle.Remove('asset') } },
+    @{ Name = 'wrong manifest bundle release'; Mode = 'Manifest'; Error = 'full bundle pin'; ManifestChange = { $record.agentBundle.release = 'other-release' } },
+    @{ Name = 'wrong manifest bundle asset'; Mode = 'Manifest'; Error = 'full bundle pin'; ManifestChange = { $record.agentBundle.asset = 'other.zip' } },
+    @{ Name = 'non-object manifest'; Mode = 'Manifest'; Error = 'JSON object'; ManifestJson = '[]' },
+    @{ Name = 'single-element array manifest'; Mode = 'Manifest'; Error = 'JSON object'; ManifestArray = $true },
+    @{ Name = 'malformed manifest JSON'; Mode = 'Manifest'; Error = 'JSON'; ManifestJson = '{' },
+    @{ Name = 'wrong manifest publication order'; Mode = 'Manifest'; Error = 'publication order'; ManifestChange = { [array]::Reverse($record.publicationOrder) } },
+    @{ Name = 'wrong manifest archive count'; Mode = 'Manifest'; Error = 'two archives'; ManifestChange = { $record.archives = @($record.archives[0]) } },
+    @{ Name = 'manifest digest differs from sums'; Mode = 'Manifest'; Error = 'do not match ApprovedSha256Sums'; ManifestChange = { $record.archives[0].sha256 = 'f' * 64 } },
+    @{ Name = 'wrong manifest archive path'; Mode = 'Manifest'; Error = 'publication order'; ManifestChange = { $record.archives[0].file = 'wrong.crate' } },
+    @{ Name = 'wrong manifest tag'; Mode = 'Manifest'; Error = 'manifest tag'; ManifestChange = { $record.tag = 'aci_edge_sandboxes-v1.2.4' } },
+    @{ Name = 'mixed parameter sets'; Mode = 'Manifest'; Error = 'Parameter set'; ConflictingInputs = $true }
+)
+
 $oldTarget = $env:CARGO_TARGET_DIR
 $oldBundle = $env:ACI_EDGE_SANDBOXES_AGENT_BUNDLE
 try
@@ -171,7 +209,8 @@ try
     foreach ($case in $cases)
     {
         foreach ($key in 'Published', 'MatchingTags', 'Change', 'WrongHash', 'BundleMismatch', 'DryRun', 'Error',
-            'LockMismatch', 'ExistingWorkDir', 'InsideWorkDir', 'MalformedApproval')
+            'LockMismatch', 'ExistingWorkDir', 'InsideWorkDir', 'MalformedApproval', 'ManifestChange',
+            'ManifestJson', 'ExpectedCommit', 'ConflictingInputs', 'ManifestArray')
         {
             if (-not $case.ContainsKey($key)) { $case[$key] = $null }
         }
@@ -225,6 +264,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         }
         if ($case.ExistingWorkDir) { $parameters.WorkDir = $root }
         if ($case.InsideWorkDir) { $parameters.WorkDir = Join-Path $root 'source/output' }
+        if ($case.ContainsKey('Tag')) { $parameters.Tag = $case.Tag }
+        if ($case.Mode -eq 'Manifest')
+        {
+            $names = 'aci_edge_sandboxes_model', 'aci_edge_sandboxes'
+            $record = @{
+                version = $parameters.Version; commit = $parameters.Commit; tag = $null; dirty = $false
+                cargo = 'cargo 1.95.0 (test)'; nvx = "=$($parameters.ExpectedNvxVersion)"
+                agentBundle = @{ release = 'bundle-test'; asset = 'bundle.zip'; sha256 = $parameters.ExpectedBundleSha256 }
+                publicationOrder = $names
+                archives = @(
+                    foreach ($name in $names)
+                    {
+                        $hash = if ($case.WrongHash) { '0' * 64 } else { $global:CratePublishTest.Hashes[$name] }
+                        @{ crate = $name; file = "$name/$name-1.2.3.crate"; sha256 = $hash }
+                    }
+                )
+            }
+            if ($case.ManifestChange) { & $case.ManifestChange }
+            $manifestPath = Join-Path $root 'release-manifest.json'
+            $json = if ($null -ne $case.ManifestJson) { $case.ManifestJson }
+                elseif ($case.ManifestArray) { ConvertTo-Json -InputObject @($record) -Depth 5 }
+                else { $record | ConvertTo-Json -Depth 5 }
+            [IO.File]::WriteAllText($manifestPath, $json)
+            foreach ($key in 'Version', 'Commit', 'ExpectedNvxVersion', 'ExpectedBundleSha256') { $parameters.Remove($key) }
+            $parameters.ApprovedManifest = $manifestPath
+            if ($case.ExpectedCommit) { $parameters.ExpectedCommit = $case.ExpectedCommit }
+            if ($case.ConflictingInputs) { $parameters.Version = '1.2.3' }
+        }
         $caught = $null
         try { & (Join-Path $root 'scripts/release/Invoke-CratePublish.ps1') @parameters | Out-Null }
         catch { $caught = $_.Exception.Message }
@@ -278,9 +345,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         {
             throw "$($case.Name): wrote before the full approval gate"
         }
-        Write-Host "PASS: $($case.Name)"
+        Write-Host "PASS: $($case.Mode): $($case.Name)"
     }
-    Write-Host "$($cases.Count) manual publishing cases passed; all external operations were simulated."
+    Write-Host "$($cases.Count) publishing cases passed; all external operations were simulated."
     $global:LASTEXITCODE = 0
 }
 finally

@@ -82,8 +82,9 @@ run and upload the crate archives; a failed, cancelled, or skipped acceptance ch
 packaging on those runs. Pull requests skip the WHP job and retain their existing CI checks and
 packaging. An available self-hosted runner with all of the workflow's labels is required.
 
-CI still performs a publication dry run only; it does not publish crates. Use a successful main
-push or manual CI run on the exact release commit as the pre-publication functional evidence,
+Push and pull-request CI runs only validate and package; they never publish crates. Manual CI
+defaults to `dryRun: true`, which also only validates and packages. Use a successful main push
+or manual CI run on the exact release commit as the pre-publication functional evidence,
 alongside the other release gates. Keep its `summary.json` and logs with the release's
 compatibility record.
 
@@ -95,11 +96,46 @@ checks this before uploading.
 
 The owners of both crates decide the route.
 
+### CI publication
+
+Manually dispatch [CI](.github/workflows/ci.yml) on the approved release commit and uncheck
+`dryRun` to request actual publication. The publish job runs only after the source checks,
+functional acceptance and packaging all succeed. It calls
+[`Invoke-CratePublish.ps1`](scripts/release/Invoke-CratePublish.ps1) without `-DryRun`, using the
+current run's `crates` artifact as its approval input. Package preparation still performs its
+dry run; the checkbox controls whether the separate publish job runs.
+
+Before enabling publication, configure the repository:
+
+1. Create the `crates-io` GitHub environment with required reviewers and deployment restrictions
+   for `main` and approved release tags. The release commit must be reachable from `origin/main`.
+2. Store a short-lived crates.io token in that environment's `CARGO_REGISTRY_TOKEN` secret. Its
+   owner must be allowed to publish both crates; scope it to `publish-update`, and `publish-new`
+   if this is their first publication. Cargo reads the token from the publishing step's
+   environment; the workflow does not run login or write a Cargo credential file.
+3. Ensure repository rules allow the publishing job's `GITHUB_TOKEN` to create a missing
+   `aci_edge_sandboxes-v<version>` tag. Only the publish job receives `contents: write`; existing
+   tags are never moved.
+
+Before approving the `crates-io` deployment, independently review the `crates` artifact's
+`release-manifest.json` and `SHA256SUMS`, and the current run's source and functional results.
+Approval covers that exact version, commit, bundle pin and package digests. CI passes the manifest
+and `SHA256SUMS` directly to the publisher, with `-ExpectedCommit` bound to the workflow commit.
+The script centrally validates the manifest's clean-source status, exact Cargo version, full
+bundle pin, publication order and archive digests, then runs the source, registry and tag gates.
+Missing credentials or any failed gate stops publication.
+
+Publishing jobs are serialized. The script publishes the model first, waits for its approved
+checksum in crates.io's index, then publishes the client. A partial failure is not rolled back;
+rerunning the same approved release skips only versions whose checksums already match. Revoke
+the short-lived token after the release and replace the environment secret before another release.
+
 ### Manual publication by an owner
 
 [`scripts/release/Invoke-CratePublish.ps1`](scripts/release/Invoke-CratePublish.ps1) is the
 reusable version of the standalone script used for the manual publication. CI packages the
-crates; it does not publish them. This script is an operator-invoked alternative, not CI automation.
+crates and invokes the same script for explicitly requested, approved publication. The invocation
+below is the operator-run alternative to CI.
 
 Prerequisites: PowerShell 7.3 or later, Git, Rust/Cargo with the exact toolchain used for
 approval already installed, the platform's Rust linker/build tools, `tar`, network access to
@@ -114,6 +150,13 @@ bundle pin; the sums file supplies both full package hashes in model-first order
 `aci_edge_sandboxes-v<version>`; `-Tag` may be supplied explicitly but must match that convention.
 Both local and remote tags, if present, must already name the approved commit.
 
+The publisher accepts two invocation styles: the existing individual parameters, or
+`-ApprovedManifest` with `-ApprovedSha256Sums`. They cannot be mixed. Manifest mode reads the
+version, commit, exact `nvx` requirement and bundle pin from the approved file and verifies its
+recorded Cargo version and archive digests. An optional `-ExpectedCommit` additionally binds the
+manifest to a caller-supplied commit; otherwise the approved commit must still match checkout HEAD.
+`-Tag` remains optional and must follow the same release-tag convention.
+
 Run the new tooling from its own checkout when publishing an older source checkout that does not
 contain it. `-Repository` selects that clean source checkout; it defaults to the tooling checkout.
 Every `-WorkDir` must be a **new directory outside the release checkout**. Previous runs and
@@ -124,6 +167,18 @@ the approved inputs. The toolchain must match the `cargo` field in the reviewed 
 
 ```powershell
 $approvalDir = Resolve-Path ..\release-approval
+$publish = @{
+    ApprovedManifest = (Join-Path $approvalDir 'release-manifest.json')
+    ApprovedSha256Sums = (Join-Path $approvalDir 'SHA256SUMS')
+    Toolchain = '<approved-toolchain>'
+    Repository = (Resolve-Path ..\release-source).Path
+}
+.\scripts\release\Invoke-CratePublish.ps1 @publish -WorkDir ..\release-dry-run -DryRun
+```
+
+Existing callers can continue supplying the individual approval values instead:
+
+```powershell
 $approval = Get-Content -Raw (Join-Path $approvalDir 'release-manifest.json') | ConvertFrom-Json
 $publish = @{
     Version = $approval.version
