@@ -236,3 +236,32 @@ Its lock file must name crates.io as the source of `aci_edge_sandboxes`,
 `aci_edge_sandboxes_model`, and `nvx`. On a Windows x64 host with the Windows Hypervisor
 Platform, add `-Open` to load the agent library through the relocated bundle, and run the
 `agent_lifecycle` example from the published crate.
+
+## Reproducing the functional evidence
+
+Every check below runs on a Windows x64 host with the Windows Hypervisor Platform enabled, Rust
+1.95.0, PowerShell 7.4 or later, and network access to `mcr.microsoft.com`, crates.io, and GitHub.
+Keep sandbox state on NTFS: platform-snapshot capture fails on a ReFS Dev Drive, so point `TEMP`
+at an NTFS directory (`$env:TEMP = "$env:LOCALAPPDATA\Temp"`) and pass an NTFS `-StateDir` to
+`Test-PublishedRelease.ps1`. The network tests listen on the host, so Windows Firewall asks once
+per test executable; set `CARGO_TARGET_DIR` to reuse an executable that it already allows.
+
+Against a bundle ZIP before publication, from a checkout of the candidate commit:
+
+```powershell
+# The lifecycle example (image pull and conversion, provision, start, exec, stop, deprovision),
+# then every ignored test of tests/agent_guest.rs, one at a time.
+pwsh scripts/test-agent-guest.ps1 -BundleZip <zip> -BundleZipSha256 <sha256> -Toolchain 1.95.0 -WorkDir <dir>
+# One test, such as the cancellation, stdin, and close checks of the published API.
+pwsh scripts/test-agent-guest.ps1 -BundleZip <zip> -BundleZipSha256 <sha256> -Filter a_cancel_releases_a_blocked_stdin_writer
+```
+
+`<dir>\summary.json` records the client commit and the bundle's ZIP, library, and runtime-manifest
+digests. The commands run only the tests present in the candidate checkout.
+
+After publication, from crates.io and the GitHub release only:
+
+```powershell
+pwsh scripts/release/Test-PublishedRelease.ps1 -Version <version> -NvxVersion <nvx version> `
+    -ExpectedLibrarySha256 <backendLibrarySha256> -StateDir <NTFS directory> -WorkDir <dir>
+```
