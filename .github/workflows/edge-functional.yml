@@ -7,11 +7,28 @@
 # works; RELEASING.md requires these checks for every bundle that agent-bundle.json pins.
 #
 # It boots VMs, so it runs only on a self-hosted Windows x64 runner with the Windows Hypervisor
-# Platform, labeled as NVX labels its WHP runners, and only when dispatched.
+# Platform, labeled as NVX labels its WHP runners. It can be dispatched directly or called by CI.
 
 name: Edge functional acceptance
 
 on:
+  workflow_call:
+    inputs:
+      release:
+        description: Release tag of the bundle; the one that agent-bundle.json pins when empty
+        type: string
+        required: false
+        default: ''
+      asset:
+        description: Bundle ZIP asset of that release; required with release
+        type: string
+        required: false
+        default: ''
+      sha256:
+        description: SHA-256 of that asset; required with release
+        type: string
+        required: false
+        default: ''
   workflow_dispatch:
     inputs:
       release:
