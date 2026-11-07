@@ -1530,8 +1530,7 @@ pub(crate) mod tests {
         (control, exec)
     }
 
-    #[cfg(feature = "async")]
-    pub(crate) fn failed_release_for_async_test() -> (AgentBackend, Arc<dyn ExecControl>) {
+    pub(crate) fn failed_release_for_test() -> (AgentBackend, Arc<dyn ExecControl>) {
         let host = fake::host();
         let backend = fake_backend_on(false, host);
         let (control, _) = exec_on(

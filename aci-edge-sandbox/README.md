@@ -276,6 +276,9 @@ does not cancel the workload. This also applies when release is already in progr
 failure is waiting in an outcome that was never collected. An async wait acknowledges delivery only
 when its awaiting future receives the result: dropping `wait()` or `wait_with_output()` still
 reports a release failure through cleanup if the blocking worker already collected it.
+Both synchronous and async `wait_with_output()` also defer acknowledgement until output
+collection succeeds. If a collector fails, the caller receives the collection error and cleanup
+reports the separate release failure instead of losing it.
 `AgentBackend::take_cleanup_failures`
 returns those recorded so far, as soon as `wait` returns, and `AgentBackend::close` returns the
 rest. `close` first waits up to five seconds for the library to release the executions that no
