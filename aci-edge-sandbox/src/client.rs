@@ -68,7 +68,8 @@ impl AciEdgeSandbox {
     }
 
     /// Allocates a sandbox with creation settings outside the request, such as its image and
-    /// resources, without starting it.
+    /// resources, without starting it. A backend that registers images, such as the agent
+    /// backend, provisions only a registered image; see [`ImageSource`](crate::ImageSource).
     pub fn provision_with(
         &self,
         request: &ProvisionRequest,
