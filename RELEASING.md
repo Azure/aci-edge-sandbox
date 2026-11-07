@@ -193,15 +193,6 @@ pwsh scripts/test-agent-guest.ps1 -BundleZip <zip> -BundleZipSha256 <sha256> -Fi
 `<dir>\summary.json` records the client commit and the bundle's ZIP, library, and runtime-manifest
 digests. The commands run only the tests present in the candidate checkout.
 
-The additional platform-snapshot tests in the separate, unmerged
-[PR #14](https://github.com/Azure/aci-edge-sandbox/pull/14) branch are not in this checkout.
-To reproduce that branch's evidence, check out its candidate commit and run the script there,
-recording a separate summary. On that branch, two tests report `SKIPPED` unless
-`EDGE_AGENT_TEST_CRASH_LIBRARY` and `EDGE_AGENT_TEST_CRASH_SHA256` name a library built with its
-clone-crash test feature, and `EDGE_AGENT_TEST_COLD_ONLY_INITRD` names an initramfs without a
-template mode; neither test-only artifact ships. Supplying these variables to this checkout
-does not add those tests or produce their skip messages.
-
 After publication, from crates.io and the GitHub release only:
 
 ```powershell
