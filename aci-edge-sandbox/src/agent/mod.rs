@@ -280,9 +280,16 @@ impl AgentBackend {
         let closed = self.library.host_close(self.host);
         let mut problems = Vec::new();
         for failure in &failures {
+            // `Error` displays only its own message, and these failures are consumed here.
+            let mut description = failure.error.to_string();
+            let mut source = std::error::Error::source(&failure.error);
+            while let Some(cause) = source {
+                description = format!("{description}: {cause}");
+                source = cause.source();
+            }
             problems.push(format!(
-                "an execution of sandbox {} failed to release: {}",
-                failure.sandbox_id, failure.error
+                "an execution of sandbox {} failed to release: {description}",
+                failure.sandbox_id
             ));
         }
         if unattended > 0 {
@@ -1575,6 +1582,60 @@ pub(crate) mod tests {
         assert!(chain.contains("cannot release"), "{chain}");
         assert!(chain.contains("panicked"), "{chain}");
         assert_eq!(fake::host_closes(host), 1);
+    }
+
+    #[test]
+    fn close_keeps_the_cause_of_every_failed_release() {
+        let faults = fake::Faults {
+            release: true,
+            ..fake::Faults::default()
+        };
+        for host_close_fails in [false, true] {
+            let host = fake::host();
+            if host_close_fails {
+                // The host is already closed, so this backend's close is refused.
+                fake_backend_on(false, host).close().unwrap();
+            }
+            let backend = fake_backend_on(false, host);
+            let mut sandboxes = Vec::new();
+            for _ in 0..2 {
+                let (control, _) = exec_on(&backend, host, Next::Fail, faults);
+                finish(control).unwrap_err();
+            }
+            for failure in backend.cleanup.lock().failures.iter() {
+                sandboxes.push(failure.sandbox_id.to_string());
+            }
+            assert_eq!(sandboxes.len(), 2);
+            let error = backend.close().unwrap_err();
+            let message = error.message();
+            for sandbox in &sandboxes {
+                let start = message.find(sandbox.as_str()).expect(message);
+                let described = &message[start..];
+                let end = described.find("; ").unwrap_or(described.len());
+                let described = &described[..end];
+                assert!(described.contains("cannot release"), "{message}");
+                assert!(described.contains("panicked"), "{message}");
+            }
+            if host_close_fails {
+                assert!(
+                    message.starts_with("cannot close the agent host; also "),
+                    "{message}"
+                );
+                assert!(
+                    std::error::Error::source(&error)
+                        .unwrap()
+                        .to_string()
+                        .contains("released or unknown handle"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    message.starts_with("the agent host closed, but "),
+                    "{message}"
+                );
+                assert!(chain(&error).contains("panicked"), "{error}");
+            }
+        }
     }
 
     #[test]
