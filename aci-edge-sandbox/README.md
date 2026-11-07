@@ -266,9 +266,25 @@ saying that the outcome is unknown and the workload may still run, instead of wa
 that may never come, and the output streams end, as does the standard input that the caller
 writes; stop or deprovision the sandbox to end the
 workload. The execution's handle stays with the library until it ends the execution, and is
-released once. A failure to release an execution's handle fails its `wait` with
-`backend_error`, naming the outcome. `AgentBackend::close` closes the host and returns the
-library's failure to close it, which dropping the backend discards.
+released once. A failure to release a successful execution's handle fails its `wait` with
+`backend_error`, naming the outcome. A failure that `wait` cannot report, because the
+execution failed and reports its own failure, or because no caller waits for the execution any
+more (its waiter already received an outcome, as after a failed cancellation, or the caller
+dropped it), becomes a `CleanupFailure` with the sandbox's ID. Dropping either an `Execution` or
+an `AsyncExecution` stops treating it as having a waiter even if a `Canceller` is retained; this
+does not cancel the workload. This also applies when release is already in progress, or a release
+failure is waiting in an outcome that was never collected. An async wait acknowledges delivery only
+when its awaiting future receives the result: dropping `wait()` or `wait_with_output()` still
+reports a release failure through cleanup if the blocking worker already collected it.
+Both synchronous and async `wait_with_output()` also defer acknowledgement until output
+collection succeeds. If a collector fails, the caller receives the collection error and cleanup
+reports the separate release failure instead of losing it.
+`AgentBackend::take_cleanup_failures`
+returns those recorded so far, as soon as `wait` returns, and `AgentBackend::close` returns the
+rest. `close` first waits up to five seconds for the library to release the executions that no
+caller waits for and fails if any remain; it does not wait for an execution that a caller still
+waits for. It then closes the host and returns the library's failure to close it. Dropping the
+backend instead discards both.
 Guest-side image pulls are not part of this profile.
 
 [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) runs one lifecycle. It needs

@@ -779,6 +779,7 @@ pub(crate) mod fake {
         calls: Vec<&'static str>,
         end: Vec<u8>,
         sent: usize,
+        release_held: bool,
     }
 
     static EXECUTIONS: Mutex<BTreeMap<u64, State>> = Mutex::new(BTreeMap::new());
@@ -807,7 +808,7 @@ pub(crate) mod fake {
                 deprovision: refuse_call,
                 diagnostics: refuse_call,
                 guest_logs: refuse_call,
-                exec: refuse_exec,
+                exec,
                 exec_next: next,
                 exec_write: write,
                 exec_close_input: close_input,
@@ -849,6 +850,7 @@ pub(crate) mod fake {
                 calls: Vec::new(),
                 end,
                 sent: 0,
+                release_held: false,
             },
         );
         handle
@@ -869,6 +871,12 @@ pub(crate) mod fake {
             state.cancelled = true;
             CHANGED.notify_all();
         }
+    }
+
+    /// Blocks or unblocks release independently of the execution's terminal event.
+    pub(crate) fn hold_release(handle: u64, held: bool) {
+        executions().get_mut(&handle).unwrap().release_held = held;
+        CHANGED.notify_all();
     }
 
     fn record(handle: u64, call: &'static str) -> i32 {
@@ -984,7 +992,17 @@ pub(crate) mod fake {
     }
 
     unsafe extern "C" fn release(handle: u64) -> i32 {
-        record(handle, "release")
+        let status = record(handle, "release");
+        let mut executions = executions();
+        while executions
+            .get(&handle)
+            .is_some_and(|state| state.release_held)
+        {
+            executions = CHANGED
+                .wait(executions)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        status
     }
 
     /// Registers a host that closes once, and returns its handle.
@@ -992,6 +1010,53 @@ pub(crate) mod fake {
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
         hosts().insert(handle, 0);
         handle
+    }
+
+    /// How the executions that a host starts behave, and the ones that it started, by host.
+    type HostExecutions = BTreeMap<u64, (Next, Write, Faults, Vec<u64>)>;
+
+    static HOST_EXECUTIONS: Mutex<HostExecutions> = Mutex::new(BTreeMap::new());
+
+    fn host_executions() -> MutexGuard<'static, HostExecutions> {
+        HOST_EXECUTIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Makes `host` start executions that behave as `next`, `write`, and `faults` say.
+    pub(crate) fn host_executes(host: u64, next: Next, write: Write, faults: Faults) {
+        host_executions().insert(host, (next, write, faults, Vec::new()));
+    }
+
+    /// The executions that `host` started, in order.
+    pub(crate) fn started(host: u64) -> Vec<u64> {
+        host_executions()
+            .get(&host)
+            .map(|(.., started)| started.clone())
+            .unwrap_or_default()
+    }
+
+    /// Starts an execution of a host set up with [`host_executes`]; refuses every other host.
+    #[allow(clippy::too_many_arguments)]
+    unsafe extern "C" fn exec(
+        host: u64,
+        _: *const u8,
+        _: usize,
+        _: *const u8,
+        _: usize,
+        handle: *mut u64,
+        _: *mut *mut u8,
+        _: *mut usize,
+    ) -> i32 {
+        let mut hosts = host_executions();
+        let Some((next, write, faults, started)) = hosts.get_mut(&host) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let exec = execution_with(*next, *write, *faults);
+        started.push(exec);
+        // SAFETY: the caller passes a writable handle.
+        unsafe { *handle = exec };
+        STATUS_OK
     }
 
     /// How many times a host registered with [`host`] was closed.
@@ -1039,20 +1104,6 @@ pub(crate) mod fake {
         _: u64,
         _: *const u8,
         _: usize,
-        _: *mut *mut u8,
-        _: *mut usize,
-    ) -> i32 {
-        STATUS_INVALID_HANDLE
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe extern "C" fn refuse_exec(
-        _: u64,
-        _: *const u8,
-        _: usize,
-        _: *const u8,
-        _: usize,
-        _: *mut u64,
         _: *mut *mut u8,
         _: *mut usize,
     ) -> i32 {

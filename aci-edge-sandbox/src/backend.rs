@@ -221,6 +221,13 @@ impl fmt::Debug for ExecIo {
 }
 
 /// Control surface of a live execution.
+///
+/// A control that wraps another, as a backend that decorates `agent::AgentBackend` does, must
+/// forward [`wait_unacknowledged`](Self::wait_unacknowledged),
+/// [`acknowledge_wait`](Self::acknowledge_wait), and [`abandon`](Self::abandon) to the wrapped
+/// control as well as [`wait`](Self::wait) and [`cancel`](Self::cancel). Their defaults do not
+/// forward, so a wrapper that relies on them keeps the wrapped control from reporting release
+/// failures that a dropped or undelivered result leaves behind.
 pub trait ExecControl: Send + Sync {
     /// Blocks until the execution reaches its terminal outcome.
     ///
@@ -228,6 +235,26 @@ pub trait ExecControl: Send + Sync {
     /// example because the connection to the sandbox was lost.
     fn wait(&self) -> Result<ExecOutcome>;
 
+    /// Waits without acknowledging that the caller received the result. Output collection can
+    /// still fail, and an async worker can finish after its awaiting future was dropped.
+    ///
+    /// Call [`acknowledge_wait`](Self::acknowledge_wait) only when handing the result to the
+    /// caller, or [`abandon`](Self::abandon) if it cannot be delivered. Backends that do not track
+    /// unreported cleanup failures can use the default implementation.
+    fn wait_unacknowledged(&self) -> Result<ExecOutcome> {
+        self.wait()
+    }
+
+    /// Acknowledges delivery of the result from [`wait_unacknowledged`](Self::wait_unacknowledged).
+    fn acknowledge_wait(&self) {}
+
     /// Requests cancellation. A cancelled execution reports [`ExecOutcome::Cancelled`].
     fn cancel(&self) -> Result<()>;
+
+    /// Records that the execution's owner can no longer receive its outcome, even if cancellation
+    /// handles still retain this control. Does not request cancellation and may be called again
+    /// after [`wait`](Self::wait) or an earlier abandonment.
+    ///
+    /// Backends that do not track unreported cleanup failures need not implement this hook.
+    fn abandon(&self) {}
 }

@@ -38,14 +38,19 @@ pub(crate) struct Completion {
 
 #[cfg(any(feature = "agent", feature = "testing"))]
 impl Completion {
-    /// Publishes the outcome. An outcome that the waiter already collected stays collected.
-    pub(crate) fn finish(&self, outcome: Result<ExecOutcome>) {
+    /// Publishes the outcome. An outcome that the waiter already collected stays collected, and
+    /// `outcome` is returned instead, so that the caller can report it another way.
+    pub(crate) fn finish(&self, outcome: Result<ExecOutcome>) -> Option<Result<ExecOutcome>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if !matches!(*state, CompletionState::Collected) {
+        let unpublished = if matches!(*state, CompletionState::Collected) {
+            Some(outcome)
+        } else {
             *state = CompletionState::Finished(outcome);
-        }
+            None
+        };
         drop(state);
         self.finished.notify_all();
+        unpublished
     }
 
     /// Lets a waiter collect `error` if the outcome has not arrived by `until`. Does nothing once
@@ -228,9 +233,14 @@ impl Execution {
         self.stdin = None;
         let stdout = spawn_collector(self.stdout.take())?;
         let stderr = spawn_collector(self.stderr.take())?;
-        let outcome = self.control.wait();
+        self.collect_output(stdout, stderr)
+    }
+
+    fn collect_output(self, stdout: Collector, stderr: Collector) -> Result<ExecOutput> {
+        let outcome = self.control.wait_unacknowledged();
         let stdout = join_collector(stdout)?;
         let stderr = join_collector(stderr)?;
+        self.control.acknowledge_wait();
         Ok(ExecOutput {
             outcome: outcome?,
             stdout,
@@ -247,6 +257,12 @@ impl fmt::Debug for Execution {
             .field("stderr", &self.stderr.is_some())
             .field("stdin", &self.stdin.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Execution {
+    fn drop(&mut self) {
+        self.control.abandon();
     }
 }
 
@@ -279,5 +295,146 @@ fn join_collector(collector: Collector) -> Result<Vec<u8>> {
             Err(Error::backend_error("failed to read execution output").with_source(error))
         }
         Err(_) => Err(Error::backend_error("output collector thread panicked")),
+    }
+}
+
+#[cfg(all(test, feature = "agent"))]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    struct SuccessfulControl;
+
+    impl ExecControl for SuccessfulControl {
+        fn wait(&self) -> Result<ExecOutcome> {
+            Ok(ExecOutcome::Exited(0))
+        }
+
+        fn cancel(&self) -> Result<()> {
+            unreachable!("waiting must not cancel the execution")
+        }
+    }
+
+    #[test]
+    fn collecting_output_preserves_bytes_and_supports_default_control_hooks() {
+        for take_stdout in [false, true] {
+            let (stdout, mut stdout_writer) = io::pipe().unwrap();
+            let (stderr, mut stderr_writer) = io::pipe().unwrap();
+            stdout_writer.write_all(b"out\0\xff").unwrap();
+            stderr_writer.write_all(b"err\0\xfe").unwrap();
+            drop((stdout_writer, stderr_writer));
+            let mut execution = Execution::new(stdout, stderr, None, Arc::new(SuccessfulControl));
+            let taken = take_stdout.then(|| execution.take_stdout().unwrap());
+            let output = execution.wait_with_output().unwrap();
+            assert_eq!(output.outcome, ExecOutcome::Exited(0));
+            assert_eq!(
+                output.stdout,
+                if take_stdout {
+                    b"".as_slice()
+                } else {
+                    b"out\0\xff"
+                }
+            );
+            assert_eq!(output.stderr, b"err\0\xfe");
+            if let Some(mut taken) = taken {
+                let mut bytes = Vec::new();
+                taken.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"out\0\xff");
+            }
+        }
+    }
+
+    fn failed_release() -> (crate::agent::AgentBackend, Execution) {
+        let (backend, control) = crate::agent::tests::failed_release_for_test();
+        let execution = Execution {
+            stdout: None,
+            stderr: None,
+            stdin: None,
+            control,
+        };
+        (backend, execution)
+    }
+
+    fn failing_collector(panics: bool) -> Collector {
+        Some(thread::spawn(move || {
+            assert!(!panics, "injected output collector panic");
+            Err(io::Error::other("injected output read failure"))
+        }))
+    }
+
+    #[test]
+    fn output_collection_failure_preserves_release_failure_for_cleanup_once() {
+        for stderr_fails in [false, true] {
+            for panics in [false, true] {
+                let (backend, execution) = failed_release();
+                let canceller = execution.canceller();
+                let collector = failing_collector(panics);
+                let (stdout, stderr) = if stderr_fails {
+                    (None, collector)
+                } else {
+                    (collector, None)
+                };
+                let error = execution.collect_output(stdout, stderr).unwrap_err();
+                assert_eq!(
+                    error.message(),
+                    if panics {
+                        "output collector thread panicked"
+                    } else {
+                        "failed to read execution output"
+                    }
+                );
+                if !panics {
+                    assert_eq!(
+                        std::error::Error::source(&error).unwrap().to_string(),
+                        "injected output read failure"
+                    );
+                }
+                let failures = backend.take_cleanup_failures();
+                assert_eq!(failures.len(), 1);
+                let error = &failures[0].error;
+                assert!(error.message().contains("cannot release"), "{error}");
+                assert!(error.message().contains("exited with status 0"), "{error}");
+                assert!(
+                    std::error::Error::source(error)
+                        .unwrap()
+                        .to_string()
+                        .contains("panicked"),
+                    "{error}"
+                );
+                assert!(backend.take_cleanup_failures().is_empty());
+                drop(canceller);
+                assert!(backend.take_cleanup_failures().is_empty());
+                backend.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn close_reports_release_failure_hidden_by_output_collection_failure() {
+        let (backend, execution) = failed_release();
+        execution
+            .collect_output(None, failing_collector(false))
+            .unwrap_err();
+        let error = backend.close().unwrap_err();
+        assert!(error.message().contains("cannot release"), "{error}");
+    }
+
+    #[test]
+    fn delivered_sync_wait_results_do_not_report_release_failures_again() {
+        for with_output in [false, true] {
+            let (backend, execution) = failed_release();
+            let canceller = execution.canceller();
+            let error = if with_output {
+                execution.wait_with_output().unwrap_err()
+            } else {
+                execution.wait().unwrap_err()
+            };
+            assert!(error.message().contains("cannot release"), "{error}");
+            assert!(backend.take_cleanup_failures().is_empty());
+            drop(canceller);
+            assert!(backend.take_cleanup_failures().is_empty());
+            backend.close().unwrap();
+        }
     }
 }

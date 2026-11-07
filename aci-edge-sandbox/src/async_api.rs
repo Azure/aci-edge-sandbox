@@ -234,7 +234,9 @@ impl AsyncExecution {
         self.stdout = None;
         self.stderr = None;
         let control = Arc::clone(&self.control);
-        blocking(move || control.wait()).await
+        let outcome = blocking(move || Ok(control.wait_unacknowledged())).await?;
+        self.control.acknowledge_wait();
+        outcome
     }
 
     /// Collects every untaken output stream and waits for the terminal outcome.
@@ -243,7 +245,7 @@ impl AsyncExecution {
         let stdout = self.stdout.take();
         let stderr = self.stderr.take();
         let control = Arc::clone(&self.control);
-        blocking(move || {
+        let (outcome, stdout, stderr) = blocking(move || {
             // Both streams drain while the outcome is awaited, so a timeout that closes
             // retained output can end either collector instead of waiting for end-of-stream.
             let stdout = spawn_output_collector(stdout)?;
@@ -253,21 +255,31 @@ impl AsyncExecution {
                     // Cancelling ends the workload's output, so the stdout collector can finish
                     // rather than block on a stream that nothing else will drain.
                     let _ = control.cancel();
-                    let _ = control.wait();
+                    let _ = control.wait_unacknowledged();
                     let _ = join_output_collector(stdout);
                     return Err(error);
                 }
             };
-            let outcome = control.wait();
-            let stdout = join_output_collector(stdout)?;
-            let stderr = join_output_collector(stderr)?;
-            Ok(ExecOutput {
-                outcome: outcome?,
-                stdout,
-                stderr,
-            })
+            let outcome = control.wait_unacknowledged();
+            let stdout = join_output_collector(stdout);
+            let stderr = join_output_collector(stderr);
+            Ok((outcome, stdout, stderr))
         })
-        .await
+        .await?;
+        let stdout = stdout?;
+        let stderr = stderr?;
+        self.control.acknowledge_wait();
+        Ok(ExecOutput {
+            outcome: outcome?,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+impl Drop for AsyncExecution {
+    fn drop(&mut self) {
+        self.control.abandon();
     }
 }
 
@@ -369,5 +381,161 @@ impl fmt::Debug for InputStream {
             .debug_struct("InputStream")
             .field("open", &self.writer.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::*;
+
+    struct AbandonmentReporter(mpsc::Sender<()>);
+
+    #[cfg(feature = "agent")]
+    struct WaitReporter {
+        control: Arc<dyn ExecControl>,
+        returned: mpsc::SyncSender<()>,
+    }
+
+    #[cfg(feature = "agent")]
+    impl ExecControl for WaitReporter {
+        fn wait(&self) -> Result<ExecOutcome> {
+            self.control.wait()
+        }
+
+        fn wait_unacknowledged(&self) -> Result<ExecOutcome> {
+            let outcome = self.control.wait_unacknowledged();
+            self.returned.send(()).unwrap();
+            outcome
+        }
+
+        fn acknowledge_wait(&self) {
+            self.control.acknowledge_wait();
+        }
+
+        fn cancel(&self) -> Result<()> {
+            self.control.cancel()
+        }
+
+        fn abandon(&self) {
+            self.control.abandon();
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn dropping_an_async_wait_after_its_worker_returns_reports_release_failure_once() {
+        use std::future::Future;
+        use std::task::Waker;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for with_output in [false, true] {
+            runtime.block_on(async {
+                let (backend, control) = crate::agent::tests::failed_release_for_test();
+                // The worker cannot return until the first poll has completed.
+                let (returned, collected) = mpsc::sync_channel(0);
+                let execution = AsyncExecution {
+                    stdout: None,
+                    stderr: None,
+                    stdin: None,
+                    control: Arc::new(WaitReporter { control, returned }),
+                };
+                let canceller = execution.canceller();
+                let mut waiting: Pin<Box<dyn Future<Output = Result<ExecOutcome>>>> = if with_output
+                {
+                    Box::pin(async move {
+                        execution
+                            .wait_with_output()
+                            .await
+                            .map(|output| output.outcome)
+                    })
+                } else {
+                    Box::pin(execution.wait())
+                };
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(waiting.as_mut().poll(&mut context).is_pending());
+                collected.recv_timeout(Duration::from_secs(30)).unwrap();
+                assert!(backend.take_cleanup_failures().is_empty());
+                // The worker has the error, but the awaiting caller has never received it.
+                drop(waiting);
+                let failures = backend.take_cleanup_failures();
+                assert_eq!(failures.len(), 1);
+                let error = &failures[0].error;
+                assert!(error.message().contains("cannot release"), "{error}");
+                assert!(error.message().contains("exited with status 0"), "{error}");
+                assert!(
+                    std::error::Error::source(error)
+                        .unwrap()
+                        .to_string()
+                        .contains("panicked"),
+                    "{error}"
+                );
+                assert!(backend.take_cleanup_failures().is_empty());
+                drop(canceller);
+                assert!(backend.take_cleanup_failures().is_empty());
+                backend.close().unwrap();
+            });
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn delivered_async_wait_results_do_not_report_release_failures_again() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for with_output in [false, true] {
+            runtime.block_on(async {
+                let (backend, control) = crate::agent::tests::failed_release_for_test();
+                let execution = AsyncExecution {
+                    stdout: None,
+                    stderr: None,
+                    stdin: None,
+                    control,
+                };
+                let error = if with_output {
+                    execution.wait_with_output().await.unwrap_err()
+                } else {
+                    execution.wait().await.unwrap_err()
+                };
+                assert!(error.message().contains("cannot release"), "{error}");
+                assert!(backend.take_cleanup_failures().is_empty());
+                backend.close().unwrap();
+            });
+        }
+    }
+
+    impl ExecControl for AbandonmentReporter {
+        fn wait(&self) -> Result<ExecOutcome> {
+            panic!("this execution is dropped without waiting")
+        }
+
+        fn cancel(&self) -> Result<()> {
+            panic!("dropping an execution must not cancel it")
+        }
+
+        fn abandon(&self) {
+            self.0.send(()).unwrap();
+        }
+    }
+
+    #[test]
+    fn dropping_an_async_execution_notifies_the_backend_despite_a_retained_canceller() {
+        let (sender, receiver) = mpsc::channel();
+        let execution = AsyncExecution {
+            stdout: None,
+            stderr: None,
+            stdin: None,
+            control: Arc::new(AbandonmentReporter(sender)),
+        };
+        let canceller = execution.canceller();
+        drop(execution);
+        receiver.try_recv().expect("the backend was not notified");
+        assert!(receiver.try_recv().is_err());
+        drop(canceller);
     }
 }
