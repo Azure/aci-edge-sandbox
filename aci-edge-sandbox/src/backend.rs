@@ -221,6 +221,13 @@ impl fmt::Debug for ExecIo {
 }
 
 /// Control surface of a live execution.
+///
+/// A control that wraps another, as a backend that decorates `agent::AgentBackend` does, must
+/// forward [`wait_unacknowledged`](Self::wait_unacknowledged),
+/// [`acknowledge_wait`](Self::acknowledge_wait), and [`abandon`](Self::abandon) to the wrapped
+/// control as well as [`wait`](Self::wait) and [`cancel`](Self::cancel). Their defaults do not
+/// forward, so a wrapper that relies on them keeps the wrapped control from reporting release
+/// failures that a dropped or undelivered result leaves behind.
 pub trait ExecControl: Send + Sync {
     /// Blocks until the execution reaches its terminal outcome.
     ///
