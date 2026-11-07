@@ -669,17 +669,24 @@ struct Settlement {
 
 struct ReleaseFailure {
     outcome: ExecOutcome,
-    cause: Arc<Error>,
+    cause: Error,
 }
 
 impl ReleaseFailure {
+    fn new(outcome: ExecOutcome, cause: Error) -> Self {
+        // `error` copies the cause by code and message, which is all a release failure has.
+        debug_assert!(std::error::Error::source(&cause).is_none() && cause.nvx_code().is_none());
+        Self { outcome, cause }
+    }
+
+    /// The failure as wait reports it, whose source is the library's [`Error`], as in 0.1.1.
     fn error(&self) -> Error {
         Error::backend_error(format!(
             "the execution {}, but the agent library cannot release it, so the \
              library may keep its resources",
             self.outcome
         ))
-        .with_source(Arc::clone(&self.cause))
+        .with_source(Error::new(self.cause.code(), self.cause.message()))
     }
 }
 
@@ -854,10 +861,7 @@ fn pump(
         // A successful execution reports the failure to release it through its wait, naming
         // the outcome, unless no caller waits for it any more.
         (Err(error), Ok(outcome)) => {
-            let failure = ReleaseFailure {
-                outcome,
-                cause: Arc::new(error),
-            };
+            let failure = ReleaseFailure::new(outcome, error);
             if state.unattended {
                 shared.record_release(&state, Some(failure.error()));
                 let _ = shared.completion.finish(Ok(outcome));
@@ -1291,6 +1295,46 @@ pub(crate) mod tests {
         assert!(error.message().contains("cannot release"), "{error}");
         assert!(error.message().contains("exited with status 0"), "{error}");
         assert_eq!(fake::calls(exec), ["release"]);
+    }
+
+    /// The library's error stays this crate's [`Error`], as in 0.1.1, wherever a successful
+    /// execution's release failure is reported.
+    #[test]
+    fn a_release_failure_keeps_the_library_error_as_its_source() {
+        fn assert_library_cause(error: &Error) {
+            let cause = std::error::Error::source(error)
+                .and_then(|cause| cause.downcast_ref::<Error>())
+                .unwrap_or_else(|| panic!("the cause is not an Error: {error:?}"));
+            assert_eq!(cause.code(), ErrorCode::BackendError);
+            assert_eq!(
+                cause.message(),
+                "the agent library panicked; the operation's effect is unknown"
+            );
+        }
+        // Delivered through wait.
+        let (backend, control) = failed_release_for_test();
+        let error = control.wait().unwrap_err();
+        assert!(error.message().contains("cannot release"), "{error}");
+        assert_library_cause(&error);
+        drop(control);
+        assert!(backend.take_cleanup_failures().is_empty());
+        backend.close().unwrap();
+        // Recovered by cleanup after the waiter dropped the execution without collecting it.
+        let (backend, control) = failed_release_for_test();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let failures = loop {
+            control.abandon();
+            let failures = backend.take_cleanup_failures();
+            if !failures.is_empty() || Instant::now() > deadline {
+                break failures;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].error.message().contains("cannot release"));
+        assert_library_cause(&failures[0].error);
+        drop(control);
+        backend.close().unwrap();
     }
 
     #[test]
