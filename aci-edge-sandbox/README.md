@@ -40,7 +40,7 @@ milliseconds, about 49.7 days, and refuse a negative or larger one. The wire
 envelope (`version`, `phase`, and `containment`) belongs to the caller.
 
 ## Architecture
-- The NVX mechanics live in the [`nvx` crate](https://github.com/microsoft/nvx/blob/580786a002eaefe2b4e8e782197ab9835970125b/nvx-rs/README.md),
+- The NVX mechanics live in the [`nvx` crate](https://github.com/microsoft/nvx/blob/a221e745cc177996a768a97194872c0c36ead339/nvx-rs/README.md),
   which this crate re-exports as `aci_edge_sandboxes::nvx`. This crate keeps the ACI Edge
   Sandboxes contract: the facade, `Backend`, the data model and its validation, the error
   codes, `SandboxId`, the execution and stream plumbing, and the asynchronous
