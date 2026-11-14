@@ -675,7 +675,7 @@ struct ReleaseFailure {
 impl ReleaseFailure {
     fn new(outcome: ExecOutcome, cause: Error) -> Self {
         // `error` copies the cause by code and message, which is all a release failure has.
-        debug_assert!(std::error::Error::source(&cause).is_none() && cause.nvx_code().is_none());
+        debug_assert!(std::error::Error::source(&cause).is_none());
         Self { outcome, cause }
     }
 

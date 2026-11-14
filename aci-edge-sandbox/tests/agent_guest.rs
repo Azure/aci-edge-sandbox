@@ -35,7 +35,7 @@ use aci_edge_sandboxes::agent::{
     AgentBackend, AgentConfig, BundleSource, CpuProfile, Hypervisor, ImageDigest, ImageId,
     RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
 };
-use aci_edge_sandboxes::nvx::resolve_guest_path;
+use aci_edge_sandboxes::nvx::guest_path;
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, Error, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
     ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward, ImageSource, NetworkPeer,
@@ -483,7 +483,61 @@ fn python(client: &AciEdgeSandbox, id: &SandboxId, program: &str, args: &[&str])
 
 /// The guest path of an existing host path, which mappings derive from the resolved path.
 fn guest(path: &Path) -> String {
-    resolve_guest_path(path).unwrap()
+    resolved_guest_path(path).unwrap()
+}
+
+/// Resolves existing paths before translation; missing paths are translated as written.
+fn resolved_guest_path(path: &Path) -> Option<String> {
+    match path.canonicalize() {
+        Ok(canonical) => guest_path(&canonical),
+        Err(_) => guest_path(path),
+    }
+}
+
+#[test]
+fn mapped_guest_paths_resolve_existing_relative_paths() {
+    let current = std::env::current_dir().unwrap();
+    let directory = tempfile::tempdir_in(&current).unwrap();
+    let child = directory.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let relative = child.strip_prefix(&current).unwrap().join("..");
+    assert_eq!(
+        resolved_guest_path(&relative),
+        guest_path(&directory.path().canonicalize().unwrap())
+    );
+    assert!(resolved_guest_path(&relative).is_some());
+}
+
+#[test]
+fn mapped_guest_paths_preserve_missing_and_invalid_path_results() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing");
+    assert_eq!(resolved_guest_path(&missing), guest_path(&missing));
+    assert!(resolved_guest_path(&missing).is_some());
+    assert_eq!(resolved_guest_path(&missing.join("child").join("..")), None);
+    let relative = Path::new(directory.path().file_name().unwrap()).join("missing");
+    assert_eq!(resolved_guest_path(&relative), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn mapped_guest_paths_reject_non_utf8_names() {
+    use std::os::unix::ffi::OsStrExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"bad-\xff"));
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(resolved_guest_path(&path), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn mapped_guest_paths_reject_network_paths() {
+    assert_eq!(
+        resolved_guest_path(Path::new(r"\\localhost\invalid-share\missing")),
+        None
+    );
 }
 
 fn forced(stopped: &StopResult) -> Option<bool> {

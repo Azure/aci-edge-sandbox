@@ -75,6 +75,14 @@ impl ErrorCode {
             other => other,
         }
     }
+
+    fn from_nvx_kind(kind: nvx::ErrorKind) -> Self {
+        match kind {
+            nvx::ErrorKind::Unavailable => Self::BackendUnavailable,
+            nvx::ErrorKind::Unsupported => Self::PolicyValidation,
+            _ => Self::BackendError,
+        }
+    }
 }
 
 impl fmt::Display for ErrorCode {
@@ -91,8 +99,6 @@ pub struct Error {
     message: String,
     #[source]
     source: Option<BoxedSource>,
-    /// The code of the NVX error that this error converts, if it converts one.
-    nvx_code: Option<nvx::ErrorCode>,
 }
 
 impl Error {
@@ -102,21 +108,18 @@ impl Error {
             code,
             message: message.into(),
             source: None,
-            nvx_code: None,
         }
     }
 
     /// Converts an NVX error as [`From`] does, but with `code`, for a backend that classifies a
     /// failure by the operation that met it, as an exec that finds the sandbox's VM gone. The
-    /// message, the cause, and the NVX code stay the same.
+    /// message and the cause stay the same.
     pub fn from_nvx(code: ErrorCode, error: nvx::Error) -> Self {
-        let nvx_code = error.code();
         let (_, message, source) = error.into_parts();
         Self {
             code,
             message,
             source,
-            nvx_code: Some(nvx_code),
         }
     }
 
@@ -130,14 +133,6 @@ impl Error {
     /// Returns the stable classification of this error.
     pub fn code(&self) -> ErrorCode {
         self.code
-    }
-
-    /// Returns the stable code of the NVX error that this error converts, if it converts one,
-    /// which tells apart failures that share this error's [`code`](Self::code), such as a
-    /// runtime record of another format and a VM of another runtime identity. The wire body does
-    /// not carry it.
-    pub fn nvx_code(&self) -> Option<nvx::ErrorCode> {
-        self.nvx_code
     }
 
     /// Returns the human-readable description of this error.
@@ -213,14 +208,10 @@ impl Error {
 /// Classifies an error of NVX: [`nvx::ErrorKind::Unavailable`] becomes
 /// [`ErrorCode::BackendUnavailable`], [`nvx::ErrorKind::Unsupported`] becomes
 /// [`ErrorCode::PolicyValidation`], and every other kind becomes [`ErrorCode::BackendError`]. The
-/// message and the cause stay the same, and [`Error::nvx_code`] keeps the NVX error's code.
+/// message and the cause stay the same, without adding a level to the source chain.
 impl From<nvx::Error> for Error {
     fn from(error: nvx::Error) -> Self {
-        let code = match error.kind() {
-            nvx::ErrorKind::Unavailable => ErrorCode::BackendUnavailable,
-            nvx::ErrorKind::Unsupported => ErrorCode::PolicyValidation,
-            _ => ErrorCode::BackendError,
-        };
+        let code = ErrorCode::from_nvx_kind(error.kind());
         Self::from_nvx(code, error)
     }
 }
@@ -269,50 +260,65 @@ mod tests {
     }
 
     #[test]
-    fn nvx_errors_keep_their_message_and_cause() {
+    fn nvx_kinds_keep_their_public_classification() {
         for (kind, code) in [
             (nvx::ErrorKind::Unavailable, ErrorCode::BackendUnavailable),
             (nvx::ErrorKind::Unsupported, ErrorCode::PolicyValidation),
             (nvx::ErrorKind::Exited, ErrorCode::BackendError),
+            (nvx::ErrorKind::StillRunning, ErrorCode::BackendError),
             (nvx::ErrorKind::Io, ErrorCode::BackendError),
+            (nvx::ErrorKind::NotFound, ErrorCode::BackendError),
             (nvx::ErrorKind::Protocol, ErrorCode::BackendError),
             (nvx::ErrorKind::TimedOut, ErrorCode::BackendError),
+            (nvx::ErrorKind::RuntimeMismatch, ErrorCode::BackendError),
             (nvx::ErrorKind::Other, ErrorCode::BackendError),
         ] {
-            let cause = std::io::Error::other("disk full");
-            let error = Error::from(nvx::Error::new(kind, "cannot write state").with_source(cause));
-            assert_eq!(error.code(), code, "{kind}");
-            assert_eq!(error.nvx_code(), Some(nvx::ErrorCode::from(kind)));
-            assert_eq!(error.message(), "cannot write state");
-            let source = std::error::Error::source(&error).unwrap();
-            assert_eq!(source.to_string(), "disk full");
+            assert_eq!(ErrorCode::from_nvx_kind(kind), code, "{kind}");
         }
-        assert_eq!(Error::backend_error("x").nvx_code(), None);
     }
 
     #[test]
-    fn nvx_errors_keep_their_code_through_their_kind_and_any_classification() {
-        // The kind classifies the error, and the finer code tells apart failures that share it.
-        let error = Error::from(nvx::Error::new(
-            nvx::ErrorCode::FormatUnsupported,
-            "the sandbox runtime record has the unsupported format 3",
-        ));
-        assert_eq!(error.code(), ErrorCode::BackendError);
-        assert_eq!(error.nvx_code(), Some(nvx::ErrorCode::FormatUnsupported));
-        let gone = Error::from_nvx(
-            ErrorCode::NotStarted,
-            nvx::Error::new(
-                nvx::ErrorCode::SandboxExited,
-                "sandbox x stopped unexpectedly",
-            ),
-        );
-        assert_eq!(gone.code(), ErrorCode::NotStarted);
-        assert_eq!(gone.nvx_code(), Some(nvx::ErrorCode::SandboxExited));
-        assert_eq!(gone.message(), "sandbox x stopped unexpectedly");
-        // The wire body carries the classification alone.
+    fn nvx_errors_keep_their_message_and_wire_body() {
+        let original = "unknown".parse::<nvx::Hypervisor>().unwrap_err();
+        let message = original.message().to_owned();
+        let error = Error::from(original);
+        assert_eq!(error.code(), ErrorCode::BackendUnavailable);
+        assert_eq!(error.message(), message);
+        assert!(std::error::Error::source(&error).is_none());
         assert_eq!(
-            serde_json::to_string(&gone.body()).unwrap(),
-            r#"{"code":"not_started","message":"sandbox x stopped unexpectedly"}"#
+            serde_json::to_value(error.body()).unwrap(),
+            serde_json::json!({"code": "backend_unavailable", "message": message})
+        );
+    }
+
+    #[test]
+    fn nvx_errors_allow_operation_specific_classification() {
+        let original = "unknown".parse::<nvx::Hypervisor>().unwrap_err();
+        let message = original.message().to_owned();
+        let gone = Error::from_nvx(ErrorCode::NotStarted, original);
+        assert_eq!(gone.code(), ErrorCode::NotStarted);
+        assert_eq!(gone.message(), message);
+        assert_eq!(
+            serde_json::to_value(gone.body()).unwrap(),
+            serde_json::json!({"code": "not_started", "message": message})
+        );
+    }
+
+    #[test]
+    fn owned_errors_keep_their_source_chain() {
+        let cause = Error::backend_error("cannot write state")
+            .with_source(std::io::Error::other("disk full"));
+        let error = Error::backend_error("cannot provision").with_source(cause);
+        let source = std::error::Error::source(&error).unwrap();
+        assert_eq!(source.to_string(), "backend_error: cannot write state");
+        assert_eq!(
+            source
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .to_string(),
+            "disk full"
         );
     }
 

@@ -345,7 +345,7 @@ cargo run --release --locked --no-default-features --features agent --example ag
 To map `C:\work\src` read-only and `C:\work\out` read-write, and let the guest reach only
 `192.0.2.10` on TCP port 443, add
 `--readonly C:\work\src --readwrite C:\work\out --egress deny --egress-allow 192.0.2.10:tcp:443`
-before `--`; `nvx::resolve_guest_path` gives the guest paths, here `/mnt/c/work/src` and
+before `--`; `nvx::guest_path` of each canonicalized host path gives the guest paths, here `/mnt/c/work/src` and
 `/mnt/c/work/out`. To let the guest out only through a proxy that listens on host port 3128, add
 `--egress deny --network-proxy http://127.0.0.1:3128` instead; to reach a guest service on port
 8080 at host `127.0.0.1:18080`, add
@@ -610,7 +610,7 @@ case, fails with `policy_validation`, with or without a proxy.
 ### Native working directories and environments
 
 `process.cwd` must be an absolute guest path without `..` of at most 4095 bytes;
-`nvx::resolve_guest_path` gives the guest path of a mapped host path. A
+`nvx::guest_path` of its canonicalized host path gives the guest path of a mapping. A
 directory that the workload cannot enter ends the command with exit code 126 and an
 `NVX-EDGE-STAGE-ERROR` line on standard error. The guest's default environment holds only
 `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) and the proxy
@@ -633,9 +633,10 @@ path appears at the same path. Host paths may contain commas, as the contract's
 `readonlyPaths` and `readwritePaths` allow, so `C:\reports\2026, final` appears
 at `/mnt/c/reports/2026, final`. Guest paths derive from the resolved host path,
 so links, letter case, and Windows short names do not create second guest
-paths for one object. `nvx::resolve_guest_path` performs the same
-translation, for example to turn a host working directory into a
-`process.cwd`; `nvx::guest_path` translates a path as written.
+paths for one object. Canonicalize an existing path, then pass it to
+`nvx::guest_path`, for example to turn a host working directory into a
+`process.cwd`. `nvx::guest_path` translates a path as written and returns
+`None` for paths without a guest equivalent.
 
 ### Network rules
 
@@ -669,10 +670,11 @@ TCP and UDP on those ports.
 
 Any `nvx::Error` converts into an `Error` with the same message: `Unavailable`
 becomes `backend_unavailable`, `Unsupported` becomes `policy_validation`, and
-every other kind becomes `backend_error`. `Error::nvx_code` keeps the error's
-[`nvx::ErrorCode`](https://github.com/microsoft/nvx/blob/580786a002eaefe2b4e8e782197ab9835970125b/nvx-rs/README.md#error-codes), which tells apart the
-failures that share an `ErrorCode`. Callers match these codes rather than messages, whose
-wording may change. The wire body carries the `ErrorCode` alone.
+every other kind becomes `backend_error`. The model owns its classification,
+message, and optional source; conversion preserves the source chain without an
+extra wrapper. `Error::from_nvx` lets a backend select an operation-specific
+classification. Callers match `ErrorCode` rather than messages, whose wording
+may change. The wire body carries the `ErrorCode` and message alone.
 
 ## Testing
 
@@ -699,11 +701,13 @@ download the edge agent bundle.
 `aci_edge_sandboxes` and `aci_edge_sandboxes_model` are released to crates.io together, at the
 same version; see
 [`RELEASING.md`](https://github.com/Azure/aci-edge-sandbox/blob/main/RELEASING.md). Both depend
-on exactly version 0.1.0-alpha.11 of the
-[`nvx` crate](https://github.com/microsoft/nvx/blob/580786a002eaefe2b4e8e782197ab9835970125b/nvx-rs/README.md)
-from crates.io, which was published from commit `580786a0` of the public `microsoft/nvx`
-repository. The pin is exact because `nvx` is a preview whose API can change in any release, and
-this crate re-exports it.
+on exactly version 0.2.0-alpha.1 of the
+[`nvx` crate](https://github.com/microsoft/nvx/blob/a221e745cc177996a768a97194872c0c36ead339/nvx-rs/README.md).
+The workspace patches that dependency to the immutable development commit
+`a221e745cc177996a768a97194872c0c36ead339`; it is not a registry release.
+The pin is exact because `nvx` is a preview whose API can change in any release,
+and this crate re-exports it. A native agent library has its own dependencies
+and communicates with this client through the sandbox ABI and JSON, not Rust types.
 
 ## Breaking changes
 
@@ -717,7 +721,10 @@ changes affect Rust callers and builds:
 - The `openvmm` module (`OpenVmmConfig`, `OpenVmmBackend`) and `AciEdgeSandbox::openvmm` are
   gone.
 - The `openvmm` and `bundled` features are gone, and the default features are now `agent`. The
-  `agent` feature enables the host side of `nvx`, so `nvx::resolve_guest_path` stays available.
+  `agent` feature enables the host side of `nvx`, including `nvx::guest_path`.
+- `Error::nvx_code` is removed; errors expose the model's `ErrorCode`, message, and source
+  chain without dependency-specific detail. Canonicalize host paths before passing them to
+  `nvx::guest_path` instead of using the removed `nvx::resolve_guest_path`.
 - The `testing` feature no longer builds the `aci-edge-sandboxes-fake-openvmm` binary.
 - The build script no longer passes on `DEP_ACI_EDGE_SANDBOXES_ARTIFACTS_DIR`;
   `agent-bundled` still exports `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`.
