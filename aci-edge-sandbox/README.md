@@ -705,6 +705,8 @@ on exactly version 0.2.0-alpha.1 of the
 [`nvx` crate](https://github.com/microsoft/nvx/blob/a221e745cc177996a768a97194872c0c36ead339/nvx-rs/README.md).
 The workspace patches that dependency to the immutable development commit
 `a221e745cc177996a768a97194872c0c36ead339`; it is not a registry release.
+Downstream workspaces must apply the same `[patch.crates-io]` selection at
+their root, because dependency patches are not inherited.
 The pin is exact because `nvx` is a preview whose API can change in any release,
 and this crate re-exports it. A native agent library has its own dependencies
 and communicates with this client through the sandbox ABI and JSON, not Rust types.
@@ -713,7 +715,7 @@ and communicates with this client through the sandbox ABI and JSON, not Rust typ
 
 The crate now speaks sandbox ABI 3: the setup gained `platformSnapshots`, and the host info a
 `platformSnapshots` field. `AgentBackend::new` refuses an agent library of ABI 2 with
-`backend_unavailable`, so use a library of ABI 3. The Rust API only gains items.
+`backend_unavailable`, so use a library of ABI 3.
 
 The direct OpenVMM backend of earlier versions has been removed; use the agent backend. These
 changes affect Rust callers and builds:
