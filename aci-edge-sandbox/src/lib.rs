@@ -55,7 +55,8 @@ pub(crate) use aci_edge_sandboxes_model::{
     capabilities, error, id, model, snapshot, spec, validate,
 };
 /// The NVX crate: the data model takes its hypervisors, CIDRs, and hostname and guest-network rules
-/// from it, and its `resolve_guest_path` gives the guest paths of mapped host paths.
+/// from it. Its `guest_path` gives the guest path of a mapped host path; canonicalize the host path
+/// first to resolve links and native path aliases.
 pub use nvx;
 
 mod backend;
