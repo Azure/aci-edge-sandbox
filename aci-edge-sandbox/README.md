@@ -547,9 +547,9 @@ provisioned again to accept the change.
   itself, and each lookup of a denied path fails with `EACCES`; an absolute Windows symbolic
   link or a junction cannot be followed at all (`EPERM`). OpenVMM recognizes only the denied
   objects themselves: a host hard link that already joins a file inside a denied directory to a
-  name outside it stays readable through that name. A directory that holds a host hard link to
-  a denied file may list the link's name, and a listing that also looks its entries up, as the
-  guest's first read of a directory does, fails with `EACCES`.
+  name outside it stays readable through that name. When listing a directory that contains a
+  hard link to a denied file, the guest may see the name, see it omitted, or get `EACCES` if the
+  listing also looks the name up. Opening that hard link still fails with `EACCES`.
 - Workloads run as the guest's root with only the default container capabilities (`CHOWN`,
   `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`, `SETUID`, `NET_BIND_SERVICE`, and
   `AUDIT_WRITE`), with `no_new_privs`, and without user namespaces, so they cannot remount or

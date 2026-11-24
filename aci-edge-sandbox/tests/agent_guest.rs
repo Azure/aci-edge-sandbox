@@ -1988,6 +1988,7 @@ report = {
     "host link to denied directory": attempt(lambda: listing(at("links", "secret"))),
     "host absolute link": attempt(lambda: read(at("links", "absolute"))),
     "host hard link": attempt(lambda: read(at("hard", "secret.txt"))),
+    "allowed file beside hard link": attempt(lambda: read(at("hard", "allowed.txt"))),
     "host hard link listing": attempt(lambda: listing(at("hard"))),
     "host hard link into denied directory": attempt(lambda: read(at("links", "hard-token"))),
 }
@@ -2045,6 +2046,7 @@ fn denied_paths_stay_hidden_through_aliases() {
     }
     for (file, content) in [
         ("allowed.txt", "allowed"),
+        ("hard/allowed.txt", "allowed"),
         ("secret/token", "token"),
         ("secret.txt", "secret"),
     ] {
@@ -2113,6 +2115,7 @@ fn denied_paths_stay_hidden_through_aliases() {
         "host link to denied directory": "EACCES",
         "host absolute link": absolute,
         "host hard link": "EACCES",
+        "allowed file beside hard link": "ok:allowed",
         "host hard link into denied directory": "ok:token",
         "guest link": "EACCES",
         "guest directory link": "EACCES",
@@ -2127,9 +2130,8 @@ fn denied_paths_stay_hidden_through_aliases() {
         expected["host junction"] = serde_json::json!("EPERM");
     }
     let mut report = serde_json::from_str::<serde_json::Value>(&printed).unwrap();
-    // A directory that holds a host hard link to a denied file lists the link's name when the
-    // guest reads only names, and fails when it also looks the entries up, as its first read of
-    // a directory does.
+    // Enumeration may omit the denied alias, list its name, or fail when it looks the alias up.
+    // If it succeeds, it must still list the allowed sibling.
     let listing = report
         .as_object_mut()
         .unwrap()
@@ -2137,7 +2139,7 @@ fn denied_paths_stay_hidden_through_aliases() {
     assert!(
         matches!(
             listing.as_ref().and_then(serde_json::Value::as_str),
-            Some("EACCES" | "ok:secret.txt")
+            Some("EACCES" | "ok:allowed.txt" | "ok:allowed.txt,secret.txt")
         ),
         "host hard link listing: {listing:?}"
     );
