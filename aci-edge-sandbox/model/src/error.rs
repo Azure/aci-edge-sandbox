@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn nvx_errors_keep_their_message_and_wire_body() {
-        let original = "unknown".parse::<nvx::Hypervisor>().unwrap_err();
+        let original = "unknown".parse::<crate::Hypervisor>().unwrap_err();
         let message = original.message().to_owned();
         let error = Error::from(original);
         assert_eq!(error.code(), ErrorCode::BackendUnavailable);
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn nvx_errors_allow_operation_specific_classification() {
-        let original = "unknown".parse::<nvx::Hypervisor>().unwrap_err();
+        let original = "unknown".parse::<crate::Hypervisor>().unwrap_err();
         let message = original.message().to_owned();
         let gone = Error::from_nvx(ErrorCode::NotStarted, original);
         assert_eq!(gone.code(), ErrorCode::NotStarted);

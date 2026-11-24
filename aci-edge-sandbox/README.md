@@ -40,7 +40,7 @@ milliseconds, about 49.7 days, and refuse a negative or larger one. The wire
 envelope (`version`, `phase`, and `containment`) belongs to the caller.
 
 ## Architecture
-- The NVX mechanics live in the [`nvx` crate](https://github.com/microsoft/nvx/blob/a221e745cc177996a768a97194872c0c36ead339/nvx-rs/README.md),
+- The NVX mechanics live in the [`nvx` crate](https://crates.io/crates/nvx/0.2.0-alpha.6),
   which this crate re-exports as `aci_edge_sandboxes::nvx`. This crate keeps the ACI Edge
   Sandboxes contract: the facade, `Backend`, the data model and its validation, the error
   codes, `SandboxId`, the execution and stream plumbing, and the asynchronous
@@ -701,12 +701,8 @@ download the edge agent bundle.
 `aci_edge_sandboxes` and `aci_edge_sandboxes_model` are released to crates.io together, at the
 same version; see
 [`RELEASING.md`](https://github.com/Azure/aci-edge-sandbox/blob/main/RELEASING.md). Both depend
-on exactly version 0.2.0-alpha.1 of the
-[`nvx` crate](https://github.com/microsoft/nvx/blob/a221e745cc177996a768a97194872c0c36ead339/nvx-rs/README.md).
-The workspace patches that dependency to the immutable development commit
-`a221e745cc177996a768a97194872c0c36ead339`; it is not a registry release.
-Downstream workspaces must apply the same `[patch.crates-io]` selection at
-their root, because dependency patches are not inherited.
+on exactly version 0.2.0-alpha.6 of the
+[`nvx` crate](https://crates.io/crates/nvx/0.2.0-alpha.6) from crates.io.
 The pin is exact because `nvx` is a preview whose API can change in any release,
 and this crate re-exports it. A native agent library has its own dependencies
 and communicates with this client through the sandbox ABI and JSON, not Rust types.
