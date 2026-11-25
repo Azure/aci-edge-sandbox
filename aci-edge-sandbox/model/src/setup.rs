@@ -17,7 +17,7 @@ use crate::image::ImageDigest;
 use crate::spec::{ImageSource, Resources};
 
 /// Hypervisor that runs the sandbox VMs: NVX's, whose serde form is its OpenVMM spelling.
-pub use nvx::Hypervisor;
+pub use nvx::host::runtime::Hypervisor;
 
 /// Configuration that a native host takes once, when it opens.
 ///

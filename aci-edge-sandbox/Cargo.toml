@@ -28,8 +28,7 @@ default = ["agent"]
 # Tokio-based asynchronous wrappers around the synchronous core.
 async = ["dep:tokio"]
 # A thin client of an explicitly supplied native agent library that owns the sandbox lifecycle.
-# It enables the host side of `nvx`, whose `resolve_guest_path` gives the guest paths of mapped
-# host paths.
+# Uses NVX's host-side `guest_path` to map host paths into the guest.
 agent = ["dep:libloading", "dep:sha2", "nvx/host"]
 # Downloads and verifies the edge agent bundle at build time and stages it beside the
 # executables, so that `agent::AgentConfig::bundled` needs no paths or digests. The build script
@@ -49,7 +48,7 @@ testing = []
 # The model and this crate are released together at the same version, and `nvx`, whose API this
 # crate re-exports, is a preview whose API can change in any release: both are pinned exactly.
 aci_edge_sandboxes_model = { path = "model", version = "=0.1.2" }
-nvx = { version = "=0.1.0-alpha.11", default-features = false }
+nvx = { version = "=0.2.0-alpha.6", default-features = false }
 libloading = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }
 serde = { version = "1.0.200", features = ["derive"] }
