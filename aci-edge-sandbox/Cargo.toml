@@ -28,8 +28,7 @@ default = ["agent"]
 # Tokio-based asynchronous wrappers around the synchronous core.
 async = ["dep:tokio"]
 # A thin client of an explicitly supplied native agent library that owns the sandbox lifecycle.
-# It enables the host side of `nvx`, whose `guest_path` gives the guest paths of mapped
-# host paths.
+# Uses NVX's host-side `guest_path` to map host paths into the guest.
 agent = ["dep:libloading", "dep:sha2", "nvx/host"]
 # Downloads and verifies the edge agent bundle at build time and stages it beside the
 # executables, so that `agent::AgentConfig::bundled` needs no paths or digests. The build script

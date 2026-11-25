@@ -707,6 +707,11 @@ The pin is exact because `nvx` is a preview whose API can change in any release,
 and this crate re-exports it. A native agent library has its own dependencies
 and communicates with this client through the sandbox ABI and JSON, not Rust types.
 
+The model re-exports NVX's `Hypervisor` type, which alpha.6 exposes only with `nvx/host`.
+That feature is enabled even in standalone model builds and client builds with
+`--no-default-features`. It makes NVX's host APIs available but does not enable the client's
+`agent` or `agent-bundled` features.
+
 ## Breaking changes
 
 The crate now speaks sandbox ABI 3: the setup gained `platformSnapshots`, and the host info a
@@ -718,8 +723,7 @@ changes affect Rust callers and builds:
 
 - The `openvmm` module (`OpenVmmConfig`, `OpenVmmBackend`) and `AciEdgeSandbox::openvmm` are
   gone.
-- The `openvmm` and `bundled` features are gone, and the default features are now `agent`. The
-  `agent` feature enables the host side of `nvx`, including `nvx::guest_path`.
+- The `openvmm` and `bundled` features are gone, and the default features are now `agent`.
 - `Error::nvx_code` is removed; errors expose the model's `ErrorCode`, message, and source
   chain without dependency-specific detail. Canonicalize host paths before passing them to
   `nvx::guest_path` instead of using the removed `nvx::resolve_guest_path`.
